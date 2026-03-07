@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="clipGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#e8f4fd"/>
+      <stop offset="100%" style="stop-color:#cde8f9"/>
+    </linearGradient>
+    <linearGradient id="foldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#a8d5f0"/>
+      <stop offset="100%" style="stop-color:#7bbfe8"/>
+    </linearGradient>
+    <linearGradient id="badgeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4fc3f7"/>
+      <stop offset="100%" style="stop-color:#0288d1"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+    <filter id="badgeShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#0288d1" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- App icon background -->
+  <rect width="128" height="128" rx="24" ry="24" fill="url(#bgGrad)"/>
+
+  <!-- Clipboard body (with dog-eared corner) -->
+  <path d="M28 30 L28 102 Q28 108 34 108 L87 108 Q93 108 93 102 L93 56 L71 34 L71 30 Q71 24 65 24 L34 24 Q28 24 28 30 Z"
+        fill="url(#clipGrad)" filter="url(#shadow)"/>
+
+  <!-- Folded corner triangle -->
+  <path d="M71 34 L93 56 L71 56 Z" fill="url(#foldGrad)"/>
+  <!-- Corner fold shadow line -->
+  <path d="M71 34 L71 56 L93 56" fill="none" stroke="#7bbfe8" stroke-width="1"/>
+
+  <!-- Clipboard clip at top -->
+  <rect x="44" y="16" width="32" height="14" rx="5" ry="5" fill="#0288d1"/>
+  <rect x="48" y="18" width="24" height="10" rx="4" ry="4" fill="#1a1a2e"/>
+  <!-- Clip hole -->
+  <rect x="56" y="19" width="16" height="8" rx="3" ry="3" fill="#0288d1" opacity="0.6"/>
+
+  <!-- Note lines on clipboard -->
+  <line x1="38" y1="62" x2="84" y2="62" stroke="#90caf9" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+  <line x1="38" y1="72" x2="84" y2="72" stroke="#90caf9" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+  <line x1="38" y1="82" x2="70" y2="82" stroke="#90caf9" stroke-width="2.5" stroke-linecap="round" opacity="0.4"/>
+
+  <!-- "i" info badge (bottom right) -->
+  <circle cx="90" cy="90" r="20" fill="url(#badgeGrad)" filter="url(#badgeShadow)"/>
+  <circle cx="90" cy="90" r="18" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="1.5"/>
+
+  <!-- Letter i -->
+  <circle cx="90" cy="82" r="2.5" fill="white"/>
+  <rect x="87.5" y="87" width="5" height="12" rx="2.5" fill="white"/>
+</svg>
