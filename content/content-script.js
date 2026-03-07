@@ -129,8 +129,8 @@ class YouTubeController {
 
         button.addEventListener('click', () => {
             if (!chrome.runtime?.id) return;
-            chrome.runtime.sendMessage({ action: 'openSidePanel' }, () => {
-                if (!chrome.runtime.lastError) {
+            chrome.runtime.sendMessage({ action: 'openSidePanel' }, (response) => {
+                if (!chrome.runtime.lastError && response?.success) {
                     this.isPanelOpen = true;
                     this.setActivationLauncherVisible(true);
                 }
@@ -212,6 +212,12 @@ class YouTubeController {
     }
 
     setupPlayerObserver() {
+        // Prevent interval accumulation across SPA navigation and re-initialization.
+        if (this._playerInterval) {
+            clearInterval(this._playerInterval);
+            this._playerInterval = null;
+        }
+
         // High frequency check until we find a stable video element
         this._playerInterval = setInterval(() => {
             const v = this.findVideoElement();
@@ -464,6 +470,96 @@ class YouTubeController {
             .trim();
     }
 
+    splitTranscriptTextIntoChunks(text, maxChars = 120) {
+        const normalized = this.normalizeTranscriptText(text);
+        if (!normalized) return [];
+        if (normalized.length <= maxChars) return [normalized];
+
+        const sentenceLike = normalized.match(/[^.!?;:]+[.!?;:]?|[^.!?;:]+$/g) || [normalized];
+        const chunks = [];
+        let buffer = '';
+
+        const pushBuffer = () => {
+            const clean = this.normalizeTranscriptText(buffer);
+            if (clean) chunks.push(clean);
+            buffer = '';
+        };
+
+        for (const partRaw of sentenceLike) {
+            const part = this.normalizeTranscriptText(partRaw);
+            if (!part) continue;
+
+            const candidate = buffer ? `${buffer} ${part}` : part;
+            if (candidate.length <= maxChars) {
+                buffer = candidate;
+                continue;
+            }
+
+            pushBuffer();
+
+            if (part.length <= maxChars) {
+                buffer = part;
+                continue;
+            }
+
+            const words = part.split(' ');
+            let line = '';
+            for (const word of words) {
+                const nextLine = line ? `${line} ${word}` : word;
+                if (nextLine.length <= maxChars) {
+                    line = nextLine;
+                    continue;
+                }
+                const clean = this.normalizeTranscriptText(line);
+                if (clean) chunks.push(clean);
+                line = word;
+            }
+            const clean = this.normalizeTranscriptText(line);
+            if (clean) chunks.push(clean);
+        }
+
+        pushBuffer();
+        return chunks;
+    }
+
+    finalizeTranscriptSegments(rawSegments) {
+        const enriched = [];
+
+        for (const seg of rawSegments || []) {
+            const timestampMs = Number(seg?.timestampMs);
+            if (!Number.isFinite(timestampMs)) continue;
+
+            const text = this.normalizeTranscriptText(seg?.text || '');
+            if (!text) continue;
+
+            const chunks = this.splitTranscriptTextIntoChunks(text, 120);
+            for (const chunk of chunks) {
+                enriched.push({
+                    timestampMs,
+                    time: formatTimeHelper(timestampMs),
+                    text: chunk
+                });
+            }
+        }
+
+        enriched.sort((a, b) => a.timestampMs - b.timestampMs);
+
+        const deduped = [];
+        for (const seg of enriched) {
+            const prev = deduped[deduped.length - 1];
+            if (
+                prev &&
+                prev.text.toLowerCase() === seg.text.toLowerCase() &&
+                Math.abs(prev.timestampMs - seg.timestampMs) < 300
+            ) {
+                continue;
+            }
+            deduped.push(seg);
+        }
+
+        return deduped;
+    }
+
     decodeHtmlEntities(text) {
         const el = document.createElement('textarea');
         el.innerHTML = text;
@@ -609,32 +705,32 @@ class YouTubeController {
         if (!trimmed) return [];
 
         const hint = (hintedFmt || '').toLowerCase();
-        if (hint === 'json3') return this.parseJson3Transcript(trimmed);
+        if (hint === 'json3') return this.finalizeTranscriptSegments(this.parseJson3Transcript(trimmed));
         if (hint === 'srv3' || hint === 'srv2' || hint === 'srv1' || hint === 'ttml' || hint === 'xml') {
-            return this.parseXmlTranscript(trimmed);
+            return this.finalizeTranscriptSegments(this.parseXmlTranscript(trimmed));
         }
-        if (hint === 'vtt') return this.parseVttTranscript(trimmed);
+        if (hint === 'vtt') return this.finalizeTranscriptSegments(this.parseVttTranscript(trimmed));
 
         if (trimmed.startsWith('{')) {
             const jsonSegments = this.parseJson3Transcript(trimmed);
-            if (jsonSegments.length) return jsonSegments;
+            if (jsonSegments.length) return this.finalizeTranscriptSegments(jsonSegments);
         }
         if (trimmed.startsWith('WEBVTT') || trimmed.includes('-->')) {
             const vttSegments = this.parseVttTranscript(trimmed);
-            if (vttSegments.length) return vttSegments;
+            if (vttSegments.length) return this.finalizeTranscriptSegments(vttSegments);
         }
         if (trimmed.startsWith('<')) {
             const xmlSegments = this.parseXmlTranscript(trimmed);
-            if (xmlSegments.length) return xmlSegments;
+            if (xmlSegments.length) return this.finalizeTranscriptSegments(xmlSegments);
         }
 
         // Last-resort parser attempts.
         const jsonFallback = this.parseJson3Transcript(trimmed);
-        if (jsonFallback.length) return jsonFallback;
+        if (jsonFallback.length) return this.finalizeTranscriptSegments(jsonFallback);
         const xmlFallback = this.parseXmlTranscript(trimmed);
-        if (xmlFallback.length) return xmlFallback;
+        if (xmlFallback.length) return this.finalizeTranscriptSegments(xmlFallback);
         const vttFallback = this.parseVttTranscript(trimmed);
-        if (vttFallback.length) return vttFallback;
+        if (vttFallback.length) return this.finalizeTranscriptSegments(vttFallback);
         return [];
     }
 

@@ -110,6 +110,8 @@ body {
     border-radius: 6px;
     transition: background 0.2s;
     cursor: pointer;
+    align-items: flex-start;
+    min-width: 0;
 }
 
 .transcript-item:hover {
@@ -130,6 +132,7 @@ body {
     color: var(--text-main);
     opacity: 0.9;
     word-break: break-word;
+    min-width: 0;
 }
 
 .app-container {
@@ -152,6 +155,8 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    flex: 1;
+    min-width: 0;
 }
 
 .video-title {
@@ -171,6 +176,7 @@ body {
 .header-actions {
     display: flex;
     gap: 8px;
+    flex-shrink: 0;
 }
 
 .icon-btn {
@@ -191,6 +197,44 @@ body {
     color: var(--text-main);
 }
 
+.action-btn-small {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    color: var(--text-main);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.2;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.action-btn-small:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+}
+
+.action-btn-small.primary {
+    background: var(--primary-color);
+    border-color: var(--primary-color);
+    color: #fff;
+}
+
+.action-btn-small.primary:hover {
+    background: var(--primary-hover);
+    border-color: var(--primary-hover);
+    color: #fff;
+}
+
+.action-btn-small.outline {
+    background: transparent;
+}
+
 #btn-close-panel:hover {
     color: var(--danger-color);
     background-color: rgba(231, 76, 60, 0.14);
@@ -205,6 +249,10 @@ body {
     border-bottom: 1px solid var(--border-color);
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.35;
 }
 
 .status-banner.show {
@@ -231,6 +279,7 @@ body {
     align-items: center;
     gap: 10px;
     cursor: pointer;
+    min-width: 0;
 }
 
 .switch-label {
@@ -300,14 +349,13 @@ input:checked~.switch-text {
 }
 
 .quick-actions {
-    display: flex;
-    padding: 2px 4px;
-    gap: 1.5px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(42px, 1fr));
+    padding: 4px 6px;
+    gap: 4px;
     background-color: var(--bg-card);
     border-bottom: 1px solid var(--border-color);
-    align-items: center;
-    justify-content: center;
-    flex-wrap: nowrap;
+    align-items: stretch;
 }
 
 .quick-actions::-webkit-scrollbar {
@@ -319,20 +367,30 @@ input:checked~.switch-text {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0px;
-    padding: 1px 1px;
+    gap: 2px;
+    padding: 2px 2px;
     background-color: var(--bg-header);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-sm);
     cursor: pointer;
-    font-size: 7px;
+    font-size: 9px;
     font-weight: 600;
     color: var(--text-main);
     transition: all 0.2s;
-    min-width: 29px;
-    height: 29px;
-    flex: 1;
+    min-width: 0;
+    width: 100%;
+    height: 34px;
+    min-height: 34px;
+    flex: initial;
     overflow: hidden;
+}
+
+.action-card span {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1;
 }
 
 .action-card:hover {
@@ -623,6 +681,7 @@ input:checked~.switch-text {
     background-color: var(--bg-header);
     border-top: 1px solid var(--border-color);
     gap: 6px;
+    flex-wrap: wrap;
 }
 
 .card-info {
@@ -630,6 +689,7 @@ input:checked~.switch-text {
     align-items: center;
     gap: 6px;
     flex-shrink: 0;
+    min-width: 0;
 }
 
 .card-time {
@@ -655,6 +715,10 @@ input:checked~.switch-text {
     display: flex;
     align-items: center;
     gap: 2px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin-left: auto;
+    min-width: 0;
 }
 
 .card-action-btn {
@@ -2251,4 +2315,301 @@ input:checked~.switch-text {
 .card-action-btn.open-btn:hover {
     background-color: rgba(46, 204, 113, 0.1);
     color: #2ecc71;
+}
+
+@media (max-width: 430px) {
+    .app-header {
+        padding: 6px 8px;
+        gap: 6px;
+    }
+
+    .video-title {
+        font-size: 12px;
+    }
+
+    .video-details {
+        font-size: 10px;
+    }
+
+    .header-actions {
+        gap: 4px;
+    }
+
+    .icon-btn {
+        padding: 3px;
+    }
+
+    .switch-block {
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+
+    .switch-label {
+        font-size: 12px;
+    }
+
+    .quick-actions {
+        display: flex !important;
+        flex-wrap: wrap !important;
+        align-items: stretch;
+        justify-content: flex-start;
+        gap: 3px;
+        padding: 4px;
+    }
+
+    .action-card {
+        flex: 1 1 calc(16.66% - 3px);
+        min-width: 34px;
+        max-width: none;
+        height: 30px;
+        min-height: 30px;
+        font-size: 8px;
+    }
+
+    .action-card svg {
+        width: 12px;
+        height: 12px;
+    }
+
+    .timeline-bar {
+        padding: 6px 8px;
+    }
+
+    .tabs-nav {
+        display: flex;
+        flex-wrap: wrap;
+        overflow-x: visible;
+        gap: 0;
+        padding: 0;
+    }
+
+    .tab-btn {
+        flex: 1 1 50%;
+        text-align: center;
+        padding: 8px 4px;
+        font-size: 11px;
+        white-space: normal;
+        line-height: 1.2;
+        min-height: 30px;
+    }
+
+    .card-action-btn {
+        width: 24px;
+        height: 22px;
+        font-size: 14px;
+    }
+
+    .tab-pane {
+        padding: 8px;
+    }
+
+    #transcript-content {
+        padding: 8px;
+    }
+
+    .transcript-header {
+        padding: 8px 10px;
+        gap: 6px;
+    }
+
+    .transcript-header h3 {
+        font-size: 12px;
+        margin-right: 0;
+        min-width: 0;
+        flex: 1;
+    }
+
+    #btn-copy-transcript {
+        padding: 4px 6px;
+        font-size: 10px;
+        flex-shrink: 0;
+    }
+
+    .history-item {
+        padding: 10px;
+        gap: 6px;
+    }
+
+    .history-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        padding-right: 24px;
+    }
+
+    .history-title {
+        font-size: 12px;
+        padding-right: 0;
+    }
+
+    .history-meta {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+    }
+
+    .history-stats {
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .stat-tag {
+        font-size: 10px;
+        padding: 2px 5px;
+    }
+
+    .toc-list {
+        padding: 6px;
+        gap: 8px;
+    }
+
+    .toc-item {
+        flex-wrap: wrap;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 8px;
+    }
+
+    .toc-time {
+        min-width: 44px;
+        font-size: 11px;
+        padding: 2px 5px;
+    }
+
+    .toc-level {
+        min-width: 44px;
+        font-size: 10px;
+        padding: 3px 6px;
+    }
+
+    .toc-text {
+        width: 100%;
+        font-size: 12px;
+        margin-top: 2px;
+    }
+
+    .toc-delete {
+        opacity: 1;
+        margin-left: auto;
+    }
+}
+
+@media (max-width: 360px) {
+    .switch-text {
+        font-size: 11px;
+    }
+
+    .optin-bar {
+        padding: 6px 8px;
+    }
+
+    .switch-label {
+        font-size: 11px;
+    }
+
+    .action-card span {
+        display: none;
+    }
+
+    .action-card {
+        flex: 1 1 calc(20% - 3px);
+        min-width: 30px;
+        height: 28px;
+        min-height: 28px;
+    }
+
+    .action-card svg {
+        width: 11px;
+        height: 11px;
+    }
+
+    .tabs-nav {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+    }
+
+    .tab-btn {
+        flex: 0 0 auto;
+        min-width: 25%;
+        font-size: 10px;
+        padding: 7px 4px;
+        white-space: nowrap;
+    }
+
+    .card-controls-bar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .card-info {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .card-actions {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .transcript-header {
+        padding: 8px 10px;
+    }
+
+    .transcript-header h3 {
+        font-size: 12px;
+    }
+
+    .transcript-item {
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .transcript-time {
+        min-width: 0;
+    }
+
+    .tab-pane {
+        padding: 6px;
+    }
+
+    .history-item {
+        padding: 8px;
+    }
+
+    .history-title {
+        font-size: 11px;
+    }
+
+    .history-meta {
+        font-size: 10px;
+        gap: 4px;
+    }
+
+    .toc-list {
+        padding: 4px;
+    }
+
+    .toc-item {
+        padding: 7px;
+        gap: 6px;
+    }
+
+    .toc-time,
+    .toc-level {
+        min-width: 40px;
+        font-size: 10px;
+    }
+
+    .toc-text {
+        font-size: 11px;
+    }
+
+    .transcript-text {
+        font-size: 12px;
+        line-height: 1.4;
+    }
+
+    .transcript-time {
+        font-size: 11px;
+    }
 }

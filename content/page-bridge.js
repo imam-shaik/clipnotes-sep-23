@@ -3,7 +3,7 @@
 
 (function () {
     const MAX_TRACKED_TIMEDTEXT_URLS = 80;
-    // url -> { ts: timestamp, hasPot: boolean }
+    // url -> { ts: eviction score, hasPot: boolean, seenAt: timestamp }
     const timedtextUrlMap = new Map();
 
     function parseMaybeJson(value) {
@@ -34,10 +34,11 @@
 
             const hasPot = url.searchParams.has('pot');
             const normalized = url.toString();
+            const seenAt = Date.now();
 
             // pot-bearing URLs get a boost of 1e12 so they always outlast others
-            const ts = hasPot ? Date.now() + 1e12 : Date.now();
-            timedtextUrlMap.set(normalized, { ts, hasPot });
+            const ts = hasPot ? seenAt + 1e12 : seenAt;
+            timedtextUrlMap.set(normalized, { ts, hasPot, seenAt });
 
             // Evict the lowest-priority entry if over limit
             if (timedtextUrlMap.size > MAX_TRACKED_TIMEDTEXT_URLS) {
@@ -75,17 +76,30 @@
         if (!currentVideoId) return allEntries.slice(0, 20);
 
         const matchingVideoUrls = [];
+        const recentNoVideoUrls = [];
+        const now = Date.now();
         for (const raw of allEntries) {
             try {
                 const url = new URL(raw);
-                if (url.searchParams.get('v') === currentVideoId) {
+                const vParam = url.searchParams.get('v');
+                if (vParam === currentVideoId) {
                     matchingVideoUrls.push(raw);
+                    continue;
+                }
+                // Some app/PWA requests may omit `v`; allow only very recent no-`v` URLs.
+                if (!vParam) {
+                    const meta = timedtextUrlMap.get(raw);
+                    const age = now - Number(meta?.seenAt || 0);
+                    if (Number.isFinite(age) && age <= 25000) {
+                        recentNoVideoUrls.push(raw);
+                    }
                 }
             } catch (_) { }
         }
 
-        // Prefer current-video URLs; fall back to all if none found
-        return (matchingVideoUrls.length > 0 ? matchingVideoUrls : allEntries).slice(0, 20);
+        // Prefer strict current-video URLs; fallback to very recent no-`v` URLs only.
+        if (matchingVideoUrls.length > 0) return matchingVideoUrls.slice(0, 20);
+        return recentNoVideoUrls.slice(0, 20);
     }
 
     function getPlayerResponseCandidates() {
@@ -130,6 +144,15 @@
             const exactMatch = candidates.find(pr => getResponseVideoId(pr) === currentVideoId);
             if (exactMatch) return exactMatch;
         }
+
+        const withCaptions = candidates.find(pr => {
+            const tracks = pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            return Array.isArray(tracks) && tracks.length > 0;
+        });
+        if (withCaptions) return withCaptions;
+
+        const withVideoId = candidates.find(pr => !!getResponseVideoId(pr));
+        if (withVideoId) return withVideoId;
 
         return candidates[0];
     }

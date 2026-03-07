@@ -3,6 +3,14 @@
 let currentVideoId = null;
 let currentVideoTitle = null;
 let currentTabId = null;
+const initialPanelUrlParams = new URLSearchParams(window.location.search);
+const launchedForTabId = Number(initialPanelUrlParams.get('tabId'));
+const panelMode = initialPanelUrlParams.get('mode') || '';
+const launchedForHostWindowId = Number(initialPanelUrlParams.get('hostWindowId'));
+const isDetachedPanel = panelMode === 'detached';
+if (Number.isInteger(launchedForTabId)) {
+    currentTabId = launchedForTabId;
+}
 let videoScrapeTimer = null;
 let isNotebookEnabled = false;
 let isDataLoadedForId = null; // Track if we've already loaded state for the current ID
@@ -10,6 +18,7 @@ let titleUsedForLoad = null; // Track which title was used for loading (to detec
 let isVideoPlaying = false; // Track playback status
 let lastCaptureTime = 0; // Prevent spamming screenshots too fast
 let panelHeartbeatTimer = null;
+let disconnectedPollCount = 0;
 let state = {
     screenshots: [], // { id, timestampMs, timeFormatted, dataUrl, noteHtml, filename, createdAt }
     toc: [],          // { id, timeFormatted, timestampMs, title }
@@ -74,10 +83,95 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 10, delayMs = 5
     return null;
 }
 
+function isYouTubeWatchUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+        const parsed = new URL(url);
+        const host = (parsed.hostname || '').toLowerCase();
+        if (!(host === 'youtube.com' || host.endsWith('.youtube.com'))) return false;
+        if (parsed.pathname !== '/watch') return false;
+        return parsed.searchParams.has('v');
+    } catch (_) {
+        return false;
+    }
+}
+
+function shouldTrackSenderTab(tab) {
+    if (!tab || !Number.isInteger(tab.id)) return false;
+
+    if (isDetachedPanel && Number.isInteger(launchedForTabId) && tab.id === launchedForTabId) {
+        return !tab.url || isYouTubeWatchUrl(tab.url);
+    }
+
+    if (isDetachedPanel && Number.isInteger(launchedForTabId) && tab.id !== launchedForTabId) {
+        return false;
+    }
+
+    if (
+        isDetachedPanel &&
+        Number.isInteger(launchedForHostWindowId) &&
+        Number.isInteger(tab.windowId) &&
+        tab.windowId !== launchedForHostWindowId
+    ) {
+        return false;
+    }
+
+    return isYouTubeWatchUrl(tab.url);
+}
+
+async function getValidatedWatchTab(tabId) {
+    if (!Number.isInteger(tabId)) return null;
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab && isYouTubeWatchUrl(tab.url)) {
+            return tab;
+        }
+    } catch (_) { }
+    return null;
+}
+
+function extractVideoIdFromWatchUrl(url) {
+    if (!url || typeof url !== 'string') return '';
+    try {
+        const parsed = new URL(url);
+        return parsed.searchParams.get('v') || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+function pickBestYouTubeWatchTab(candidates) {
+    const list = Array.isArray(candidates) ? candidates.filter(tab => isYouTubeWatchUrl(tab?.url)) : [];
+    if (!list.length) return null;
+
+    const scored = list.map((tab) => {
+        let score = 0;
+        if (Number.isInteger(launchedForTabId) && tab.id === launchedForTabId) score += 300;
+        if (Number.isInteger(launchedForHostWindowId) && tab.windowId === launchedForHostWindowId) score += 150;
+        if (Number.isInteger(currentTabId) && tab.id === currentTabId) score += 80;
+        if (currentVideoId && extractVideoIdFromWatchUrl(tab.url) === currentVideoId) score += 120;
+        return { tab, score };
+    });
+
+    scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return Number(b.tab?.lastAccessed || 0) - Number(a.tab?.lastAccessed || 0);
+    });
+
+    return scored[0]?.tab || null;
+}
+
+async function seekActiveYouTubeTab(timeMs) {
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId)) return false;
+    chrome.tabs.sendMessage(tabId, { action: 'seekTo', timeMs });
+    return true;
+}
+
 function initMessageListeners() {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        // Refresh tab ID if the message comes from a YouTube tab
-        if (sender && sender.tab) {
+        // Keep tab binding stable in detached mode; avoid drifting to unrelated YouTube tabs.
+        if (sender && sender.tab && shouldTrackSenderTab(sender.tab)) {
             currentTabId = sender.tab.id;
         }
 
@@ -151,8 +245,9 @@ async function handleScreenshotEditedResult(shotId, newDataUrl) {
 
 // Helper for immediate triggered metadata check
 async function checkMetadataImmediate() {
-    if (!currentTabId) return;
-    chrome.tabs.sendMessage(currentTabId, { action: 'getMetadata' }, async (response) => {
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId)) return;
+    chrome.tabs.sendMessage(tabId, { action: 'getMetadata' }, async (response) => {
         if (chrome.runtime.lastError || !response) return;
         if (response.videoId === currentVideoId) {
             handleMetadataResponse(response);
@@ -301,14 +396,76 @@ function showPrompt(message, defaultValue = "", choices = null) {
 }
 
 async function resolveActiveYouTubeTabId() {
-    if (Number.isInteger(currentTabId)) return currentTabId;
+    if (isDetachedPanel && Number.isInteger(launchedForTabId)) {
+        const lockedTab = await getValidatedWatchTab(launchedForTabId);
+        if (lockedTab) {
+            currentTabId = lockedTab.id;
+            return currentTabId;
+        }
+    }
+
+    if (Number.isInteger(currentTabId)) {
+        const trackedTab = await getValidatedWatchTab(currentTabId);
+        if (trackedTab) {
+            return trackedTab.id;
+        }
+        currentTabId = null;
+    }
+
     try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab && tab.url && tab.url.includes('youtube.com/watch')) {
+        if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+            const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: launchedForHostWindowId });
+            if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url)) {
+                currentTabId = tabInHostWindow.id;
+                return currentTabId;
+            }
+        }
+
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (tab && isYouTubeWatchUrl(tab.url)) {
             currentTabId = tab.id;
             return currentTabId;
         }
     } catch (_) { }
+
+    if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+        try {
+            const hostTabs = await chrome.tabs.query({
+                windowId: launchedForHostWindowId,
+                url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
+            });
+            const fallback = hostTabs.find(tab => isYouTubeWatchUrl(tab?.url));
+            if (fallback) {
+                currentTabId = fallback.id;
+                return currentTabId;
+            }
+        } catch (_) { }
+    }
+
+    try {
+        const allWatchTabs = await chrome.tabs.query({
+            url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
+        });
+        const best = pickBestYouTubeWatchTab(allWatchTabs);
+        if (best && Number.isInteger(best.id)) {
+            currentTabId = best.id;
+            return currentTabId;
+        }
+    } catch (_) { }
+
+    return null;
+}
+
+async function resolveTrackedYouTubeTab() {
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId)) return null;
+    const tab = await getValidatedWatchTab(tabId);
+    if (tab) {
+        return tab;
+    }
+    if (currentTabId === tabId) {
+        currentTabId = null;
+    }
     return null;
 }
 
@@ -599,11 +756,8 @@ function openLastScreenshotNote() {
 // Secondary Action Handlers (WIP)
 // ---------------------------------------------------------
 async function handleAreaCapture() {
-    if (!currentTabId) {
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (tab) currentTabId = tab.id;
-    }
-    if (!currentTabId || isCapturing) return;
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId) || isCapturing) return;
 
     const btn = document.getElementById('btn-capture-area');
     const originalText = btn.innerHTML;
@@ -645,7 +799,7 @@ async function handleAreaCapture() {
             return;
         }
 
-        chrome.tabs.sendMessage(currentTabId, { action: 'startAreaSelection' }, async (response) => {
+        chrome.tabs.sendMessage(tabId, { action: 'startAreaSelection' }, async (response) => {
             try {
                 if (chrome.runtime.lastError || !response || !response.success) {
                     if (response && response.error !== "Cancelled") {
@@ -729,11 +883,13 @@ function syncNotebookStateToContent(isOn) {
         console.warn("Failed to sync notebook state to extension storage:", err);
     }
 
-    if (!currentTabId) return;
-    chrome.tabs.sendMessage(currentTabId, { action: 'setNotebookEnabled', enabled }, () => {
-        if (chrome.runtime.lastError) {
-            // Content script may not be injected yet; storage sync covers late injection.
-        }
+    resolveActiveYouTubeTabId().then((tabId) => {
+        if (!Number.isInteger(tabId)) return;
+        chrome.tabs.sendMessage(tabId, { action: 'setNotebookEnabled', enabled }, () => {
+            if (chrome.runtime.lastError) {
+                // Content script may not be injected yet; storage sync covers late injection.
+            }
+        });
     });
 }
 
@@ -766,8 +922,9 @@ function initOptInToggle() {
 async function pollCurrentVideo() {
     // Repeatedly check the active tab for a youtube video to connect to
     setInterval(async () => {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab && tab.url && tab.url.includes("youtube.com/watch")) {
+        const tab = await resolveTrackedYouTubeTab();
+        if (tab && isYouTubeWatchUrl(tab.url)) {
+            disconnectedPollCount = 0;
             currentTabId = tab.id;
             // PRE-CHECK: Detect video change from URL instantly
             try {
@@ -799,6 +956,16 @@ async function pollCurrentVideo() {
                 if (isVideoPlaying && Date.now() - lastAutoSaveTime > AUTO_SAVE_INTERVAL) {
                     lastAutoSaveTime = Date.now();
                     saveVideoState(currentVideoId, currentVideoTitle);
+                }
+            }
+        } else {
+            disconnectedPollCount += 1;
+            if (disconnectedPollCount >= 2) {
+                currentTabId = null;
+                isVideoPlaying = false;
+                const detailsEl = document.getElementById('video-details');
+                if (detailsEl && (!detailsEl.textContent || !detailsEl.textContent.trim() || /reconnecting/i.test(detailsEl.textContent))) {
+                    detailsEl.textContent = 'Reconnecting to YouTube tab...';
                 }
             }
         }
@@ -833,11 +1000,8 @@ function updateTimeline(vidState) {
 // Action: Screenshot Capture
 // ==========================================
 async function handleCapture() {
-    if (!currentTabId) {
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (tab) currentTabId = tab.id;
-    }
-    if (!currentTabId || isCapturing) return;
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId) || isCapturing) return;
 
     const btn = document.getElementById('btn-capture-full');
     const originalText = btn.innerHTML;
@@ -890,7 +1054,7 @@ async function handleCapture() {
             return;
         }
 
-        const response = await sendMessageWithRetry(currentTabId, { action: 'captureScreenshot' }, 5, 500);
+        const response = await sendMessageWithRetry(tabId, { action: 'captureScreenshot' }, 5, 500);
         try {
             let finalImageData = null;
             let finalTimeMs = 0;
@@ -905,7 +1069,7 @@ async function handleCapture() {
                     console.log("Sidepanel: Capture successful via fallback (captureVisibleTab)");
 
                     // We still need the timestamp, so ask the content script just for the state
-                    const stateResp = await new Promise(res => chrome.tabs.sendMessage(currentTabId, { action: 'getState' }, res));
+                    const stateResp = await new Promise(res => chrome.tabs.sendMessage(tabId, { action: 'getState' }, res));
                     finalTimeMs = stateResp ? stateResp.currentTimeMs : 0;
 
                 } catch (fallbackErr) {
@@ -1160,9 +1324,7 @@ function createTOCGalleryElement(entry) {
     `;
 
     item.querySelector('.toc-time-btn').addEventListener('click', () => {
-        if (currentTabId) {
-            chrome.tabs.sendMessage(currentTabId, { action: 'seekTo', timeMs: entry.timestampMs });
-        }
+        seekActiveYouTubeTab(entry.timestampMs);
     });
 
     const titleEdit = item.querySelector('.toc-title');
@@ -1284,9 +1446,7 @@ function createScreenshotCard(shot, index) {
     });
 
     card.querySelector('.seek-btn').addEventListener('click', () => {
-        if (currentTabId) {
-            chrome.tabs.sendMessage(currentTabId, { action: 'seekTo', timeMs: shot.timestampMs });
-        }
+        seekActiveYouTubeTab(shot.timestampMs);
     });
 
     card.querySelector('.edit-btn').addEventListener('click', () => {
@@ -1859,7 +2019,13 @@ function renderHistoryEntry(list, entry) {
     item.addEventListener('click', (e) => {
         if (e.target.closest('.history-delete-btn')) return;
         if (url !== "#") {
-            chrome.tabs.update(currentTabId, { url: url });
+            resolveActiveYouTubeTabId().then((tabId) => {
+                if (Number.isInteger(tabId)) {
+                    chrome.tabs.update(tabId, { url: url });
+                } else {
+                    chrome.tabs.create({ url });
+                }
+            });
         }
     });
 
@@ -2057,7 +2223,7 @@ function renderTOCList() {
 
         // Click on time to seek
         item.querySelector('.toc-time').addEventListener('click', () => {
-            chrome.tabs.sendMessage(currentTabId, { action: 'seekTo', timeMs: entry.timestampMs });
+            seekActiveYouTubeTab(entry.timestampMs);
         });
 
         const levelSelect = item.querySelector('.toc-level');
@@ -3548,9 +3714,7 @@ async function loadVideoState(forVideoId, forTitle) {
         if (loadedState && loadedState.metadata && loadedState.metadata.lastTimeMs > 0) {
             console.log("Sidepanel: Resuming video at", loadedState.metadata.lastTimeMs);
             setTimeout(() => {
-                if (currentTabId) {
-                    chrome.tabs.sendMessage(currentTabId, { action: 'seekTo', timeMs: loadedState.metadata.lastTimeMs });
-                }
+                seekActiveYouTubeTab(loadedState.metadata.lastTimeMs);
             }, 1000); // Give content script a moment to stabilize
         }
 
@@ -3595,37 +3759,150 @@ function setNotebookToggleState(isOn) {
 // Transcript Feature
 // ==========================================
 async function refreshTranscript() {
-    if (!currentTabId) return;
     const list = document.getElementById('transcript-content');
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId)) {
+        list.innerHTML = `<div class="empty-state"><p>Please open a YouTube watch page first.</p></div>`;
+        return;
+    }
     list.innerHTML = `<div class="empty-state"><p>Loading transcript...</p></div>`;
 
-    chrome.tabs.sendMessage(currentTabId, { action: 'getTranscript' }, (response) => {
-        if (chrome.runtime.lastError || !response || !response.success) {
-            const errorMsg = response ? response.error : "Could not reach video page.";
-            list.innerHTML = `
-                <div class="empty-state">
-                    <p style="color: var(--status-error);">${errorMsg}</p>
-                    <p style="font-size: 11px; margin-top: 8px; opacity: 0.7;">
-                        Tip: Turn captions ON once, wait 2-3 seconds, then retry transcript.
-                    </p>
-                </div>`;
+    const attempts = 3;
+    const errors = [];
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        const response = await sendMessageWithRetry(tabId, { action: 'getTranscript' }, 2, 250);
+        const segments = normalizeTranscriptSegmentsForDisplay(response?.segments);
+
+        if (response?.success && segments.length > 0) {
+            displayTranscript(segments);
             return;
         }
 
-        displayTranscript(response.segments);
-    });
+        if (response?.error) {
+            errors.push(response.error);
+        } else if (response?.success && segments.length === 0) {
+            errors.push("Transcript returned empty segments.");
+        } else {
+            errors.push("Could not reach video page.");
+        }
+
+        if (attempt < attempts) {
+            list.innerHTML = `<div class="empty-state"><p>Retrying transcript (${attempt}/${attempts})...</p></div>`;
+            await new Promise(r => setTimeout(r, 650 * attempt));
+        }
+    }
+
+    const uniqueErrors = Array.from(new Set(errors.filter(Boolean)));
+    const errorMsg = uniqueErrors.slice(-2).join(' | ') || "Transcript is unavailable right now.";
+    list.innerHTML = `
+        <div class="empty-state">
+            <p style="color: var(--status-error);">${errorMsg}</p>
+            <p style="font-size: 11px; margin-top: 8px; opacity: 0.75;">
+                Tip: Keep the video playing for 2-3 seconds after seek/resize, then retry transcript.
+            </p>
+        </div>`;
+}
+
+function splitTranscriptTextForDisplay(text, maxChars = 120) {
+    const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return [];
+    if (normalized.length <= maxChars) return [normalized];
+
+    const sentenceLike = normalized.match(/[^.!?;:]+[.!?;:]?|[^.!?;:]+$/g) || [normalized];
+    const chunks = [];
+    let buffer = '';
+
+    const flush = () => {
+        const clean = buffer.trim();
+        if (clean) chunks.push(clean);
+        buffer = '';
+    };
+
+    for (const partRaw of sentenceLike) {
+        const part = partRaw.trim();
+        if (!part) continue;
+        const candidate = buffer ? `${buffer} ${part}` : part;
+        if (candidate.length <= maxChars) {
+            buffer = candidate;
+            continue;
+        }
+
+        flush();
+
+        if (part.length <= maxChars) {
+            buffer = part;
+            continue;
+        }
+
+        const words = part.split(' ');
+        let line = '';
+        for (const word of words) {
+            const nextLine = line ? `${line} ${word}` : word;
+            if (nextLine.length <= maxChars) {
+                line = nextLine;
+                continue;
+            }
+            const clean = line.trim();
+            if (clean) chunks.push(clean);
+            line = word;
+        }
+        const clean = line.trim();
+        if (clean) chunks.push(clean);
+    }
+
+    flush();
+    return chunks;
+}
+
+function normalizeTranscriptSegmentsForDisplay(segments) {
+    const prepared = [];
+
+    for (const rawSeg of segments || []) {
+        const timeLabel = String(rawSeg?.time || '').trim();
+        const tsFromField = Number(rawSeg?.timestampMs);
+        const tsFromLabel = parseTimeToMs(timeLabel);
+        const timestampMs = Number.isFinite(tsFromField) ? tsFromField : tsFromLabel;
+        if (!Number.isFinite(timestampMs) || timestampMs < 0) continue;
+
+        const textChunks = splitTranscriptTextForDisplay(rawSeg?.text || '', 120);
+        for (const chunk of textChunks) {
+            prepared.push({
+                timestampMs,
+                time: formatTime(timestampMs),
+                text: chunk
+            });
+        }
+    }
+
+    prepared.sort((a, b) => a.timestampMs - b.timestampMs);
+
+    const deduped = [];
+    for (const seg of prepared) {
+        const prev = deduped[deduped.length - 1];
+        if (
+            prev &&
+            prev.text.toLowerCase() === seg.text.toLowerCase() &&
+            Math.abs(prev.timestampMs - seg.timestampMs) < 300
+        ) {
+            continue;
+        }
+        deduped.push(seg);
+    }
+    return deduped;
 }
 
 function displayTranscript(segments) {
     const list = document.getElementById('transcript-content');
     list.innerHTML = '';
 
-    if (!segments || segments.length === 0) {
+    const normalizedSegments = normalizeTranscriptSegmentsForDisplay(segments);
+    if (!normalizedSegments.length) {
         list.innerHTML = `<div class="empty-state"><p>Transcript is empty.</p></div>`;
         return;
     }
 
-    segments.forEach(seg => {
+    normalizedSegments.forEach(seg => {
         const item = document.createElement('div');
         item.className = 'transcript-item';
         item.innerHTML = `
@@ -3635,9 +3912,12 @@ function displayTranscript(segments) {
 
         item.addEventListener('click', () => {
             const ms = parseTimeToMs(seg.time);
-            if (currentTabId && ms !== null) {
-                chrome.tabs.sendMessage(currentTabId, { action: 'seekTo', timeMs: ms });
-            }
+            if (ms === null) return;
+            resolveActiveYouTubeTabId().then((tabId) => {
+                if (Number.isInteger(tabId)) {
+                    chrome.tabs.sendMessage(tabId, { action: 'seekTo', timeMs: ms });
+                }
+            });
         });
 
         list.appendChild(item);
@@ -3776,12 +4056,13 @@ function initDurationCalculator() {
 }
 
 async function openDurationCalculator() {
-    if (!currentTabId) {
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId)) {
         alert("Please open and play a YouTube video first.");
         return;
     }
 
-    const stateResp = await sendMessageWithRetry(currentTabId, { action: 'getState' }, 3, 500);
+    const stateResp = await sendMessageWithRetry(tabId, { action: 'getState' }, 3, 500);
     if (!stateResp || !stateResp.durationMs) {
         alert("Could not get video state. Ensure the video is loaded and try again.");
         return;
