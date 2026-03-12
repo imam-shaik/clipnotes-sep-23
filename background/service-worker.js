@@ -2,19 +2,169 @@
 
 const panelHeartbeatByTab = new Map();
 const detachedPanelWindowByTab = new Map();
-const DETACHED_PANEL_MIN_WIDTH = 380;
+const relatedWindowsByTab = new Map(); // tabId -> Set of windowIds (detached panels, editors)
+const DETACHED_PANEL_MIN_WIDTH = 180;
 const DETACHED_PANEL_MAX_WIDTH = 480;
-const DETACHED_PANEL_DEFAULT_WIDTH = 430;
+const DETACHED_PANEL_DEFAULT_WIDTH = 350;
 const DETACHED_PANEL_MIN_HEIGHT = 640;
 const HOST_MIN_CONTENT_WIDTH = 760;
-const DETACHED_SYNC_LOCK_MS = 450;
-const DETACHED_JOIN_OVERLAP = 8;
+const DETACHED_JOIN_OVERLAP = 9;
 
+const TIMEOUT_CONFIG = {
+  WINDOW_STATE_MAX_WAIT: 1500, // Max wait for maximize/restore transitions
+  WINDOW_STATE_NORMAL_WAIT: 1000,
+  DETACHED_SYNC_LOCK: 450,
+  BOUNDS_CHANGE_DEBOUNCE: 100,
+  POLL_INTERVAL_FAST: 50,
+  POLL_INTERVAL_NORMAL: 200
+};
+
+// Keep track of original maximize states during tiling
+const tilingRestoreStates = new Map();
+
+// Helper to wait for a window to reach a certain state (Fix #3)
+async function waitForWindowState(windowId, targetState, maxWaitMs = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const win = await chrome.windows.get(windowId);
+      if (win.state === targetState) return true;
+    } catch (e) {
+      break;
+    }
+    await new Promise(r => setTimeout(r, TIMEOUT_CONFIG.POLL_INTERVAL_FAST));
+  }
+  return false;
+}
+
+// 1. Consolidated Message Dispatcher
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'openBigEditor') {
+    handleOpenBigEditor(message, sender, sendResponse);
+    return true;
+  } else if (message.action === 'syncNoteEdit') {
+    handleSyncNoteEdit(message, sender, sendResponse);
+    return true;
+  } else if (message.action === 'openSidePanel') {
+    handleOpenSidePanel(message, sender, sendResponse);
+    return true;
+  } else if (message.action === 'closeSidePanel') {
+    handleCloseSidePanel(message, sender, sendResponse);
+    return true;
+  } else if (message.action === 'panelHeartbeat') {
+    handlePanelHeartbeat(message, sender, sendResponse);
+    return false;
+  } else if (message.action === 'panelClosed') {
+    handlePanelClosed(message, sender, sendResponse);
+    return false;
+  } else if (message.action === 'isPanelOpen') {
+    handleIsPanelOpen(message, sender, sendResponse);
+    return false;
+  } else if (message.action === 'contentScriptReady') {
+    handleContentScriptReady(message, sender, sendResponse);
+    return false;
+  }
+});
+
+function handleOpenBigEditor(message, sender, sendResponse) {
+  const { shotId, videoId, videoTitle, html } = message;
+  chrome.storage.local.set({ bigEditorBuffer: { shotId, html } }, () => {
+    const query = new URLSearchParams({
+      shotId,
+      videoId,
+      videoTitle: videoTitle || "Video Note"
+    });
+    const url = chrome.runtime.getURL(`sidepanel/note-editor-big.html?${query.toString()}`);
+
+    chrome.windows.create({
+      url,
+      type: "popup",
+      width: 1000,
+      height: 800,
+      focused: true
+    }).then(created => {
+      if (created && created.id) {
+        const tabId = message.tabId || sender?.tab?.id;
+        if (tabId) {
+          if (!relatedWindowsByTab.has(tabId)) relatedWindowsByTab.set(tabId, new Set());
+          relatedWindowsByTab.get(tabId).add(created.id);
+        }
+      }
+    });
+    sendResponse({ success: true });
+  });
+}
+
+function handleSyncNoteEdit(message, sender, sendResponse) {
+  chrome.runtime.sendMessage({
+    type: 'NOTE_SYNCED',
+    shotId: message.shotId,
+    videoId: message.videoId,
+    html: message.html
+  });
+  sendResponse({ success: true });
+}
+
+function handleOpenSidePanel(message, sender, sendResponse) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) {
+    sendResponse({ success: false, error: 'Missing tab id' });
+    return;
+  }
+  openNotesPanelForTab(tabId, sender?.tab?.windowId)
+    .then((ok) => sendResponse({ success: ok }))
+    .catch(() => sendResponse({ success: false }));
+}
+
+function handleCloseSidePanel(message, sender, sendResponse) {
+  const requestedTabId = Number(message.tabId);
+  const tabId = Number.isInteger(requestedTabId) ? requestedTabId : sender?.tab?.id;
+  if (!tabId) {
+    sendResponse({ success: false, error: 'Missing tab id' });
+    return;
+  }
+  closeNotesPanelForTab(tabId)
+    .then((ok) => sendResponse({ success: ok }))
+    .catch(() => sendResponse({ success: false }));
+}
+
+function handlePanelHeartbeat(message, sender, sendResponse) {
+  const tabId = Number(message.tabId);
+  if (Number.isInteger(tabId)) {
+    panelHeartbeatByTab.set(tabId, Date.now());
+  }
+  sendResponse({ success: true });
+}
+
+function handlePanelClosed(message, sender, sendResponse) {
+  const tabId = Number(message.tabId);
+  if (Number.isInteger(tabId)) {
+    panelHeartbeatByTab.delete(tabId);
+  }
+  sendResponse({ success: true });
+}
+
+function handleIsPanelOpen(message, sender, sendResponse) {
+  const tabId = sender?.tab?.id;
+  sendResponse({ success: true, open: isPanelOpenForTab(tabId) });
+}
+
+function handleContentScriptReady(message, sender, sendResponse) {
+  try {
+    chrome.runtime.sendMessage(
+      { type: 'CONTENT_READY', videoId: message.videoId },
+      () => {
+        if (chrome.runtime.lastError) { /* ignore */ }
+      }
+    );
+  } catch (e) { }
+  sendResponse({ success: true });
+}
 function isPanelOpenForTab(tabId) {
   if (!Number.isInteger(tabId)) return false;
   const ts = panelHeartbeatByTab.get(tabId);
   if (!ts) return false;
-  return (Date.now() - ts) <= 7000;
+  return (Date.now() - ts) <= 4000;
 }
 
 async function resolveHostWindowForTab(tabId, hostWindowIdHint) {
@@ -57,7 +207,7 @@ function joinedPanelLeft(hostLeft, hostWidth) {
 
 function lockDetachedSync(entry) {
   if (!entry) return;
-  entry.syncLockUntil = Date.now() + DETACHED_SYNC_LOCK_MS;
+  entry.syncLockUntil = Date.now() + TIMEOUT_CONFIG.DETACHED_SYNC_LOCK;
 }
 
 function isDetachedSyncLocked(entry) {
@@ -93,9 +243,18 @@ async function syncDetachedPairFromHost(tabId) {
     if (hostWindow.state !== "normal" || panelWindow.state !== "normal") return false;
 
     const panelWidth = clampDetachedPanelWidth(panelWindow.width || entry.panelWidth);
-    const nextLeft = joinedPanelLeft(hostWindow.left, hostWindow.width);
-    const nextTop = hostWindow.top;
+    const nextLeft = Math.round(joinedPanelLeft(hostWindow.left, hostWindow.width));
+    const nextTop = Math.round(hostWindow.top);
     const nextHeight = Math.max(DETACHED_PANEL_MIN_HEIGHT, hostWindow.height);
+
+    // DELTA CHECK: Skip if already aligned within 1.5 pixels to prevent recursive update loops
+    const deltaL = Math.abs(Number(panelWindow.left) - nextLeft);
+    const deltaT = Math.abs(Number(panelWindow.top) - nextTop);
+    const deltaW = Math.abs(Number(panelWindow.width) - panelWidth);
+    const deltaH = Math.abs(Number(panelWindow.height) - nextHeight);
+    if (deltaL < 2 && deltaT < 2 && deltaW < 2 && deltaH < 2) {
+      return true;
+    }
 
     lockDetachedSync(entry);
     await chrome.windows.update(panelWindowId, {
@@ -107,6 +266,13 @@ async function syncDetachedPairFromHost(tabId) {
 
     entry.panelWidth = panelWidth;
     panelHeartbeatByTab.set(tabId, Date.now());
+
+    // Persist widths
+    chrome.storage.local.set({
+      lastPreferredHostWidth: hostWindow.width,
+      lastPreferredPanelWidth: panelWidth
+    });
+
     return true;
   } catch (_) {
     return false;
@@ -138,9 +304,20 @@ async function syncDetachedPairFromPanel(tabId) {
     }
 
     const hostWidth = Math.max(HOST_MIN_CONTENT_WIDTH, Math.round(proposedHostWidth));
-    const panelLeft = joinedPanelLeft(hostWindow.left, hostWidth);
-    const panelTop = hostWindow.top;
+    const panelLeft = Math.round(joinedPanelLeft(hostWindow.left, hostWidth));
+    const panelTop = Math.round(hostWindow.top);
     const panelHeight = Math.max(DETACHED_PANEL_MIN_HEIGHT, hostWindow.height);
+
+    // DELTA CHECK: If both windows are already aligned, skip to prevent infinite feedback
+    const hDeltaW = Math.abs(Number(hostWindow.width) - hostWidth);
+    const pDeltaL = Math.abs(Number(panelWindow.left) - panelLeft);
+    const pDeltaT = Math.abs(Number(panelWindow.top) - panelTop);
+    const pDeltaW = Math.abs(Number(panelWindow.width) - panelWidth);
+    const pDeltaH = Math.abs(Number(panelWindow.height) - panelHeight);
+
+    if (hDeltaW < 2 && pDeltaL < 2 && pDeltaT < 2 && pDeltaW < 2 && pDeltaH < 2) {
+      return true;
+    }
 
     lockDetachedSync(entry);
     await chrome.windows.update(hostWindowId, {
@@ -158,6 +335,13 @@ async function syncDetachedPairFromPanel(tabId) {
 
     entry.panelWidth = panelWidth;
     panelHeartbeatByTab.set(tabId, Date.now());
+
+    // Persist widths
+    chrome.storage.local.set({
+      lastPreferredHostWidth: hostWidth,
+      lastPreferredPanelWidth: panelWidth
+    });
+
     return true;
   } catch (_) {
     return false;
@@ -178,75 +362,98 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
   }
 
   let hostWindow = await resolveHostWindowForTab(tabId, hostWindowIdHint);
-  const originalHostState = hostWindow?.state || "normal";
-  const originalHostBounds = hostWindow ? {
+  if (!hostWindow) return false;
+
+  const originalHostState = hostWindow.state || "normal";
+  const originalHostBounds = {
     left: hostWindow.left,
     top: hostWindow.top,
     width: hostWindow.width,
     height: hostWindow.height
-  } : null;
+  };
 
-  if (hostWindow && hostWindow.state === "maximized") {
+  // 1. Foolproof Native Screen Measurement
+  // We briefly maximize the window to ask the OS EXACTLY what the monitor bounds are,
+  // including all invisible border compensations and taskbars.
+  let screenBounds = null;
+  if (originalHostState === "maximized") {
+    screenBounds = hostWindow;
+  } else {
     try {
-      await chrome.windows.update(hostWindow.id, { state: "normal" });
-      hostWindow = await chrome.windows.get(hostWindow.id);
+      await chrome.windows.update(hostWindow.id, { state: "maximized" });
+      // Use config for robust wait
+      await waitForWindowState(hostWindow.id, "maximized", TIMEOUT_CONFIG.WINDOW_STATE_MAX_WAIT);
+      screenBounds = await chrome.windows.get(hostWindow.id);
     } catch (_) {
-      // If normalization fails, continue with current bounds.
+      screenBounds = hostWindow; // absolute fallback
     }
   }
-  const layoutBase = (originalHostState === "maximized" && originalHostBounds) ? originalHostBounds : hostWindow;
-  const panelWidth = pickDetachedPanelWidth(layoutBase?.width);
-  const panelHeight = Math.max(DETACHED_PANEL_MIN_HEIGHT, Number(layoutBase?.height) || 900);
+
+  // 2. Put host back into "normal" state so we can freely position it
+  try {
+    await chrome.windows.update(hostWindow.id, { state: "normal" });
+    // Use config for robust wait
+    await waitForWindowState(hostWindow.id, "normal", TIMEOUT_CONFIG.WINDOW_STATE_NORMAL_WAIT);
+  } catch (_) { }
+
+  // Retrieve last saved panel width (ignore host width to ensure full-screen fill)
+  let storedPanelWidth = null;
+  try {
+    const data = await chrome.storage.local.get(['lastPreferredPanelWidth']);
+    if (data.lastPreferredPanelWidth) {
+      storedPanelWidth = clampDetachedPanelWidth(data.lastPreferredPanelWidth);
+    }
+  } catch (_) { }
+
+  const baseLeft = Number(screenBounds.left);
+  const baseTop = Number(screenBounds.top);
+  const totalAvailableWidth = Number(screenBounds.width);
+  const totalAvailableHeight = Number(screenBounds.height);
+
+  const panelWidth = storedPanelWidth || pickDetachedPanelWidth(totalAvailableWidth);
+  const panelHeight = Math.max(DETACHED_PANEL_MIN_HEIGHT, totalAvailableHeight);
+
+  // 3. FORCE Tiling: Ensure host + panel EXACTLY fill the totalAvailableWidth
+  // We ignore storedHostWidth here to guarantee the "Full Screen Opening" objective.
+  const resizedHostWidth = totalAvailableWidth - panelWidth + DETACHED_JOIN_OVERLAP;
 
   let left;
-  let top;
+  let top = baseTop;
   let hostResizeRestore = null;
 
-  if (hostWindow && Number.isInteger(layoutBase?.left) && Number.isInteger(layoutBase?.top)) {
-    const baseLeft = layoutBase.left;
-    const baseTop = layoutBase.top;
-    const baseWidth = Number(layoutBase.width);
-    const baseHeight = Number(layoutBase.height);
-    top = baseTop;
+  if (Number.isFinite(resizedHostWidth) && resizedHostWidth >= HOST_MIN_CONTENT_WIDTH) {
+    try {
+      // Use absolute coordinates from maximized state to cover entire workspace
+      await chrome.windows.update(hostWindow.id, {
+        state: "normal",
+        left: Math.round(baseLeft),
+        top: Math.round(baseTop),
+        width: Math.round(resizedHostWidth),
+        height: Math.round(totalAvailableHeight)
+      });
 
-    if (
-      hostWindow.state === "normal" &&
-      Number.isFinite(baseWidth) &&
-      Number.isFinite(baseHeight) &&
-      (baseWidth - panelWidth + DETACHED_JOIN_OVERLAP) >= HOST_MIN_CONTENT_WIDTH
-    ) {
-      const resizedHostWidth = baseWidth - panelWidth + DETACHED_JOIN_OVERLAP;
-      try {
-        await chrome.windows.update(hostWindow.id, {
-          left: baseLeft,
-          top: baseTop,
-          width: resizedHostWidth,
-          height: baseHeight
-        });
-        left = joinedPanelLeft(baseLeft, resizedHostWidth);
-        hostResizeRestore = {
-          hostWindowId: hostWindow.id,
-          restoreState: originalHostState,
-          left: originalHostBounds?.left ?? baseLeft,
-          top: originalHostBounds?.top ?? baseTop,
-          width: originalHostBounds?.width ?? baseWidth,
-          height: originalHostBounds?.height ?? baseHeight
-        };
-      } catch (_) {
-        left = joinedPanelLeft(baseLeft, Math.max(HOST_MIN_CONTENT_WIDTH, baseWidth - panelWidth + DETACHED_JOIN_OVERLAP));
-      }
-    } else if (Number.isFinite(baseWidth)) {
-      left = joinedPanelLeft(baseLeft, baseWidth);
+      left = Math.round(joinedPanelLeft(baseLeft, resizedHostWidth));
+      hostResizeRestore = {
+        hostWindowId: hostWindow.id,
+        restoreState: originalHostState,
+        left: Math.round(originalHostBounds.left),
+        top: Math.round(originalHostBounds.top),
+        width: Math.round(originalHostBounds.width),
+        height: Math.round(originalHostBounds.height)
+      };
+    } catch (err) {
+      console.warn("SW: Failed to update host bounds:", err);
+      left = joinedPanelLeft(baseLeft, Math.max(HOST_MIN_CONTENT_WIDTH, resizedHostWidth));
     }
+  } else {
+    left = joinedPanelLeft(baseLeft, totalAvailableWidth);
   }
 
   const query = new URLSearchParams({
     tabId: String(tabId),
-    mode: "detached"
+    mode: "detached",
+    hostWindowId: String(hostWindow?.id || "")
   });
-  if (Number.isInteger(hostWindow?.id)) {
-    query.set("hostWindowId", String(hostWindow.id));
-  }
   const url = chrome.runtime.getURL(`sidepanel/panel.html?${query.toString()}`);
   try {
     const createOptions = {
@@ -265,12 +472,17 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
     if (Number.isInteger(created?.id)) {
       detachedPanelWindowByTab.set(tabId, {
         panelWindowId: created.id,
-        hostWindowId: Number.isInteger(hostWindow?.id) ? hostWindow.id : null,
+        hostWindowId: hostWindow.id,
         panelWidth,
-        syncLockUntil: 0,
+        syncLockUntil: Date.now() + 1500, // Lock for 1.5s to allow OS animations to finish
         hostResizeRestore
       });
-      await syncDetachedPairFromHost(tabId);
+      // Track related window
+      if (!relatedWindowsByTab.has(tabId)) relatedWindowsByTab.set(tabId, new Set());
+      relatedWindowsByTab.get(tabId).add(created.id);
+
+      // Initial tiling is already perfected by the created/update calls with shared bounds.
+      // Re-triggering sync immediately would just risk race conditions with partially applied OS bounds.
     }
     return true;
   } catch (_) {
@@ -339,6 +551,15 @@ async function closeNotesPanelForTab(tabId) {
     }
   }
 
+  // Close all other related windows (e.g. Big Editor)
+  const related = relatedWindowsByTab.get(tabId);
+  if (related) {
+    related.forEach(winId => {
+      chrome.windows.remove(winId).catch(() => { });
+    });
+    relatedWindowsByTab.delete(tabId);
+  }
+
   const hostResizeRestore = detachedEntry?.hostResizeRestore;
   if (
     hostResizeRestore &&
@@ -378,13 +599,46 @@ async function closeNotesPanelForTab(tabId) {
 }
 
 // Initialize context menus and listeners
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async (details) => {
+  // Create context menu
   chrome.contextMenus.create({
     id: "open-notes-panel",
     title: "Open YouTube Notes Panel",
     contexts: ["all"],
     documentUrlPatterns: ["*://*.youtube.com/watch*"]
   });
+
+  // Mass-inject into existing YouTube tabs on install/update
+  // This allows the extension to work immediately without a page refresh
+  try {
+    const tabs = await chrome.tabs.query({
+      url: ["*://*.youtube.com/*"]
+    });
+
+    for (const tab of tabs) {
+      // Inject main content script
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content/content-script.js"]
+      }).catch(err => console.warn(`Failed to inject content script into tab ${tab.id}:`, err));
+
+      // Inject page bridge (MAIN world)
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content/page-bridge.js"],
+        world: "MAIN"
+      }).catch(err => console.warn(`Failed to inject page bridge into tab ${tab.id}:`, err));
+
+      // Inject styles
+      chrome.scripting.insertCSS({
+        target: { tabId: tab.id },
+        files: ["content/content-styles.css"]
+      }).catch(err => console.warn(`Failed to inject CSS into tab ${tab.id}:`, err));
+    }
+    console.log(`Mass-injected into ${tabs.length} tabs.`);
+  } catch (err) {
+    console.error("Mass-injection failed:", err);
+  }
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
@@ -398,78 +652,6 @@ chrome.action.onClicked.addListener((tab) => {
   openNotesPanelForTab(tab?.id, tab?.windowId).catch(() => { });
 });
 
-// Listener to handle messages from content script or panel
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'openSidePanel') {
-    const tabId = sender?.tab?.id;
-    if (!tabId) {
-      sendResponse({ success: false, error: 'Missing tab id' });
-      return false;
-    }
-
-    openNotesPanelForTab(tabId, sender?.tab?.windowId)
-      .then((ok) => sendResponse({ success: ok }))
-      .catch(() => sendResponse({ success: false }));
-    return true;
-  }
-
-  if (message.action === 'closeSidePanel') {
-    const requestedTabId = Number(message.tabId);
-    const tabId = Number.isInteger(requestedTabId) ? requestedTabId : sender?.tab?.id;
-    if (!tabId) {
-      sendResponse({ success: false, error: 'Missing tab id' });
-      return false;
-    }
-
-    closeNotesPanelForTab(tabId)
-      .then((ok) => sendResponse({ success: ok }))
-      .catch(() => sendResponse({ success: false }));
-    return true;
-  }
-
-  if (message.action === 'panelHeartbeat') {
-    const tabId = Number(message.tabId);
-    if (Number.isInteger(tabId)) {
-      panelHeartbeatByTab.set(tabId, Date.now());
-    }
-    sendResponse({ success: true });
-    return false;
-  }
-
-  if (message.action === 'panelClosed') {
-    const tabId = Number(message.tabId);
-    if (Number.isInteger(tabId)) {
-      panelHeartbeatByTab.delete(tabId);
-    }
-    sendResponse({ success: true });
-    return false;
-  }
-
-  if (message.action === 'isPanelOpen') {
-    const tabId = sender?.tab?.id;
-    sendResponse({ success: true, open: isPanelOpenForTab(tabId) });
-    return false;
-  }
-
-  if (message.action === 'contentScriptReady') {
-    // Notify the side panel that content script is ready
-    // CRITICAL: Side panel may not be open, so we MUST handle the error
-    try {
-      chrome.runtime.sendMessage(
-        { type: 'CONTENT_READY', videoId: message.videoId },
-        () => {
-          // Check for error (side panel not listening) and ignore it
-          if (chrome.runtime.lastError) {
-            // Totally normal — side panel may not be open yet
-          }
-        }
-      );
-    } catch (e) {
-      // Swallow: Side panel not available
-    }
-    sendResponse({ success: true });
-  }
-});
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   panelHeartbeatByTab.delete(tabId);
@@ -480,6 +662,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (Number.isInteger(panelWindowId)) {
     chrome.windows.remove(panelWindowId).catch(() => { });
   }
+
+  // Close all other related windows (e.g. Big Editor)
+  const related = relatedWindowsByTab.get(tabId);
+  if (related) {
+    related.forEach(winId => {
+      chrome.windows.remove(winId).catch(() => { });
+    });
+    relatedWindowsByTab.delete(tabId);
+  }
+
   if (hostResizeRestore && Number.isInteger(hostResizeRestore.hostWindowId)) {
     chrome.windows.update(hostResizeRestore.hostWindowId, {
       left: hostResizeRestore.left,
@@ -496,7 +688,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.windows.onRemoved.addListener((windowId) => {
   for (const [tabId, entry] of detachedPanelWindowByTab.entries()) {
-    if (Number(entry?.panelWindowId) === windowId) {
+    const panelWindowId = Number(entry?.panelWindowId);
+    const hostWindowId = Number(entry?.hostWindowId);
+
+    if (panelWindowId === windowId) {
       detachedPanelWindowByTab.delete(tabId);
       panelHeartbeatByTab.delete(tabId);
       const hostResizeRestore = entry?.hostResizeRestore;
@@ -514,8 +709,45 @@ chrome.windows.onRemoved.addListener((windowId) => {
       }
       break;
     }
+
+    // If host window closes, force-close detached panel and all related extension windows.
+    if (hostWindowId === windowId) {
+      detachedPanelWindowByTab.delete(tabId);
+      panelHeartbeatByTab.delete(tabId);
+
+      if (Number.isInteger(panelWindowId) && panelWindowId !== windowId) {
+        chrome.windows.remove(panelWindowId).catch(() => { });
+      }
+
+      const related = relatedWindowsByTab.get(tabId);
+      if (related) {
+        related.forEach((winId) => {
+          if (winId !== windowId && winId !== panelWindowId) {
+            chrome.windows.remove(winId).catch(() => { });
+          }
+        });
+        relatedWindowsByTab.delete(tabId);
+      }
+      break;
+    }
+  }
+
+  // Also remove from relatedWindowsByTab
+  for (const [tabId, windowSet] of relatedWindowsByTab.entries()) {
+    if (windowSet.has(windowId)) {
+      windowSet.delete(windowId);
+      if (windowSet.size === 0) relatedWindowsByTab.delete(tabId);
+    }
+  }
+
+  // Cleanup debounce timers for the closing window
+  if (boundsChangeDebounceTimers.has(windowId)) {
+    clearTimeout(boundsChangeDebounceTimers.get(windowId));
+    boundsChangeDebounceTimers.delete(windowId);
   }
 });
+
+const boundsChangeDebounceTimers = new Map();
 
 chrome.windows.onBoundsChanged.addListener((window) => {
   const windowId = Number(window?.id);
@@ -527,9 +759,56 @@ chrome.windows.onBoundsChanged.addListener((window) => {
   const { tabId, entry, role } = match;
   if (isDetachedSyncLocked(entry)) return;
 
-  if (role === "host") {
-    syncDetachedPairFromHost(tabId).catch(() => { });
-    return;
+  // Debounce rapid resize events to prevent CPU thrashing (per-window)
+  if (boundsChangeDebounceTimers.has(windowId)) {
+    clearTimeout(boundsChangeDebounceTimers.get(windowId));
   }
-  syncDetachedPairFromPanel(tabId).catch(() => { });
+
+  const timer = setTimeout(() => {
+    boundsChangeDebounceTimers.delete(windowId);
+    onBoundsChangedExecution(windowId);
+  }, TIMEOUT_CONFIG.BOUNDS_CHANGE_DEBOUNCE);
+
+  boundsChangeDebounceTimers.set(windowId, timer);
+});
+
+const autoOpenTimers = new Map();
+
+// Auto-open logic on navigation
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && tab.url && tab.url.includes('youtube.com/watch')) {
+    try {
+      // Check if auto-open is enabled (default true)
+      const data = await chrome.storage.local.get('isAutoOpenEnabled');
+      const isAutoOpenEnabled = data.isAutoOpenEnabled !== false; // Correct default to true
+
+      if (isAutoOpenEnabled) {
+        // Check if panel is already open to avoid duplicate/flicker
+        if (!isPanelOpenForTab(tabId)) {
+          // Clear any existing timer for this tab
+          if (autoOpenTimers.has(tabId)) {
+            clearTimeout(autoOpenTimers.get(tabId));
+          }
+
+          // Small delay to ensure content script is ready or page is stable
+          const timer = setTimeout(async () => {
+            autoOpenTimers.delete(tabId);
+            try {
+              // Re-check if still on watch page and panel still not open
+              const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+              if (currentTab?.url?.includes('youtube.com/watch') && !isPanelOpenForTab(tabId)) {
+                await openNotesPanelForTab(tabId, currentTab.windowId);
+              }
+            } catch (err) {
+              console.warn("Auto-open background check failed:", err);
+            }
+          }, 1000);
+
+          autoOpenTimers.set(tabId, timer);
+        }
+      }
+    } catch (e) {
+      console.error('Auto-open failed:', e);
+    }
+  }
 });

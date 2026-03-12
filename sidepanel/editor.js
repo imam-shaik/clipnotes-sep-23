@@ -9,6 +9,11 @@ let currentTool = 'pen';
 let currentColor = '#ff4757';
 let currentSize = 5;
 let baseImage = new Image();
+let imageNaturalWidth = 0;
+let imageNaturalHeight = 0;
+let currentViewportScale = 1;
+let statusPrefix = "";
+let resizeRaf = null;
 
 // History System for Annotations
 let historyStack = [];
@@ -25,7 +30,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     chrome.storage.local.get([`edit_state_${shotId}`], (result) => {
         const data = result[`edit_state_${shotId}`];
         if (!data || !data.dataUrl) return window.close();
-        document.getElementById('status-text').textContent = `Editing capture from ${data.timeFormatted}`;
+        statusPrefix = `Editing capture from ${data.timeFormatted || 'unknown time'}`;
+        updateStatusText();
         initEditor(data.dataUrl);
     });
 });
@@ -40,8 +46,10 @@ function initEditor(dataUrl) {
     previewCtx = previewCanvas.getContext('2d', { alpha: true });
 
     baseImage.onload = () => {
-        const w = baseImage.width;
-        const h = baseImage.height;
+        imageNaturalWidth = baseImage.width;
+        imageNaturalHeight = baseImage.height;
+        const w = imageNaturalWidth;
+        const h = imageNaturalHeight;
 
         // Set all canvases to match image
         [bgCanvas, drawCanvas, previewCanvas].forEach(c => {
@@ -53,6 +61,7 @@ function initEditor(dataUrl) {
         const container = document.getElementById('canvas-container');
         container.style.width = w + 'px';
         container.style.height = h + 'px';
+        applyCanvasViewportFit();
 
         // Initial background
         bgCtx.drawImage(baseImage, 0, 0);
@@ -72,10 +81,21 @@ function initEditor(dataUrl) {
 function setupInteractions() {
     let points = [];
 
+    const getViewportScaleFactor = () => {
+        const rect = drawCanvas.getBoundingClientRect();
+        const safeWidth = Math.max(1, rect.width);
+        const safeHeight = Math.max(1, rect.height);
+        const scaleX = drawCanvas.width / safeWidth;
+        const scaleY = drawCanvas.height / safeHeight;
+        return (scaleX + scaleY) / 2;
+    };
+
     const getPos = (e) => {
         const rect = drawCanvas.getBoundingClientRect();
-        const scaleX = drawCanvas.width / rect.width;
-        const scaleY = drawCanvas.height / rect.height;
+        const safeWidth = Math.max(1, rect.width);
+        const safeHeight = Math.max(1, rect.height);
+        const scaleX = drawCanvas.width / safeWidth;
+        const scaleY = drawCanvas.height / safeHeight;
         return {
             x: (e.clientX - rect.left) * scaleX,
             y: (e.clientY - rect.top) * scaleY,
@@ -99,7 +119,7 @@ function setupInteractions() {
         }
     });
 
-    window.addEventListener('pointermove', (e) => {
+    const onPointerMove = (e) => {
         if (!isDrawing) return;
         const pos = getPos(e);
 
@@ -109,7 +129,7 @@ function setupInteractions() {
             if (points.length < 3) {
                 // Not enough points for a curve yet, draw a simple line
                 drawCtx.beginPath();
-                drawCtx.lineWidth = currentSize * (pos.pressure * 1.5 || 1);
+                drawCtx.lineWidth = Math.max(1, currentSize * (pos.pressure * 1.5 || 1) * getViewportScaleFactor());
                 if (currentTool === 'eraser') {
                     drawCtx.globalCompositeOperation = 'destination-out';
                 } else {
@@ -125,7 +145,7 @@ function setupInteractions() {
 
                 // Pressure smoothing (average last few points)
                 const avgPressure = points.slice(-3).reduce((acc, p) => acc + p.pressure, 0) / 3;
-                drawCtx.lineWidth = currentSize * (avgPressure * 1.5 || 1);
+                drawCtx.lineWidth = Math.max(1, currentSize * (avgPressure * 1.5 || 1) * getViewportScaleFactor());
 
                 if (currentTool === 'eraser') {
                     drawCtx.globalCompositeOperation = 'destination-out';
@@ -149,11 +169,11 @@ function setupInteractions() {
         } else {
             // Shapes on Preview Layer
             previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-            drawShape(previewCtx, startPos, pos, currentTool, currentColor, currentSize);
+            drawShape(previewCtx, startPos, pos, currentTool, currentColor, currentSize * getViewportScaleFactor());
         }
-    });
+    };
 
-    window.addEventListener('pointerup', (e) => {
+    const onPointerUp = (e) => {
         if (!isDrawing) return;
         isDrawing = false;
         drawCanvas.releasePointerCapture(e.pointerId);
@@ -162,13 +182,20 @@ function setupInteractions() {
             // Commit shape from preview to drawing layer
             const pos = getPos(e);
             previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-            drawShape(drawCtx, startPos, pos, currentTool, currentColor, currentSize);
+            drawShape(drawCtx, startPos, pos, currentTool, currentColor, currentSize * getViewportScaleFactor());
         } else {
             // Draw the final segment
             if (points.length >= 2) {
                 const last = points[points.length - 1];
                 const prev = points[points.length - 2];
                 drawCtx.beginPath();
+                drawCtx.lineWidth = Math.max(1, currentSize * getViewportScaleFactor());
+                if (currentTool === 'eraser') {
+                    drawCtx.globalCompositeOperation = 'destination-out';
+                } else {
+                    drawCtx.globalCompositeOperation = 'source-over';
+                    drawCtx.strokeStyle = currentColor;
+                }
                 drawCtx.moveTo(prev.x, prev.y);
                 drawCtx.lineTo(last.x, last.y);
                 drawCtx.stroke();
@@ -177,7 +204,14 @@ function setupInteractions() {
 
         points = [];
         saveToHistory();
-    });
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+
+    // Track for cleanup
+    window._editorPointerMove = onPointerMove;
+    window._editorPointerUp = onPointerUp;
 
     // Toolbar logic
     document.querySelectorAll('.tool-btn[data-tool]').forEach(btn => {
@@ -211,8 +245,9 @@ function setupInteractions() {
     document.getElementById('undo-btn').addEventListener('click', undo);
     document.getElementById('redo-btn').addEventListener('click', redo);
 
-    document.getElementById('clear-btn').addEventListener('click', () => {
-        if (confirm("Clear all annotations? Original image will be kept.")) {
+    document.getElementById('clear-btn').addEventListener('click', async () => {
+        const confirmed = await showConfirm("Clear all annotations? Original image will be kept.");
+        if (confirmed) {
             drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
             saveToHistory();
         }
@@ -236,6 +271,57 @@ function setupInteractions() {
             dataUrl: finalCanvas.toDataURL('image/png')
         }, () => window.close());
     });
+
+    window.addEventListener('resize', handleViewportResize);
+}
+
+function handleViewportResize() {
+    if (!imageNaturalWidth || !imageNaturalHeight) return;
+    if (resizeRaf) cancelAnimationFrame(resizeRaf);
+    resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        applyCanvasViewportFit();
+    });
+}
+
+function applyCanvasViewportFit() {
+    const workspace = document.querySelector('.workspace');
+    const container = document.getElementById('canvas-container');
+    if (!workspace || !container || !imageNaturalWidth || !imageNaturalHeight) return;
+
+    const styles = window.getComputedStyle(workspace);
+    const padX = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+    const padY = (parseFloat(styles.paddingTop) || 0) + (parseFloat(styles.paddingBottom) || 0);
+
+    const availableW = Math.max(1, workspace.clientWidth - padX);
+    const availableH = Math.max(1, workspace.clientHeight - padY);
+    const fitScale = Math.min(availableW / imageNaturalWidth, availableH / imageNaturalHeight, 1);
+    currentViewportScale = Number.isFinite(fitScale) && fitScale > 0 ? fitScale : 1;
+
+    const renderW = Math.max(1, Math.round(imageNaturalWidth * currentViewportScale));
+    const renderH = Math.max(1, Math.round(imageNaturalHeight * currentViewportScale));
+
+    container.style.width = `${renderW}px`;
+    container.style.height = `${renderH}px`;
+
+    [bgCanvas, drawCanvas, previewCanvas].forEach((canvas) => {
+        if (!canvas) return;
+        canvas.style.width = `${renderW}px`;
+        canvas.style.height = `${renderH}px`;
+    });
+
+    updateStatusText();
+}
+
+function updateStatusText() {
+    const statusEl = document.getElementById('status-text');
+    if (!statusEl) return;
+
+    const details = (imageNaturalWidth > 0 && imageNaturalHeight > 0)
+        ? `${imageNaturalWidth}x${imageNaturalHeight} @ ${Math.round(currentViewportScale * 100)}%`
+        : '';
+
+    statusEl.textContent = [statusPrefix, details].filter(Boolean).join(' | ');
 }
 
 // ── Shape Drawing Math ───────────────────────────────────────
@@ -301,12 +387,22 @@ function redo() {
 }
 
 function restoreFromData(dataUrl) {
+    if (!dataUrl) return;
     const img = new Image();
     img.onload = () => {
         drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
         drawCtx.globalCompositeOperation = 'source-over';
         drawCtx.drawImage(img, 0, 0);
+
+        // Clean up to prevent memory leak
+        img.onload = null;
+        img.src = "";
+
         updateHistoryButtons();
+    };
+    img.onerror = () => {
+        img.onload = null;
+        img.src = "";
     };
     img.src = dataUrl;
 }
@@ -317,7 +413,95 @@ function updateHistoryButtons() {
 }
 
 // Keyboard shortcuts
-window.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && e.key === 'z') undo();
-    if (e.ctrlKey && e.key === 'y') redo();
+const onKeyDown = (e) => {
+    const key = String(e.key || '').toLowerCase();
+    const withModifier = e.ctrlKey || e.metaKey;
+
+    if (withModifier && key === 's') {
+        e.preventDefault();
+        const saveBtn = document.getElementById('save-edit');
+        if (saveBtn) saveBtn.click();
+        return;
+    }
+
+    if (key === 'escape') {
+        e.preventDefault();
+        const cancelBtn = document.getElementById('cancel-edit');
+        if (cancelBtn) cancelBtn.click();
+        return;
+    }
+
+    if (withModifier && !e.shiftKey && key === 'z') {
+        e.preventDefault();
+        undo();
+        return;
+    }
+
+    if ((withModifier && key === 'y') || (withModifier && e.shiftKey && key === 'z')) {
+        e.preventDefault();
+        redo();
+    }
+};
+
+window.addEventListener('keydown', onKeyDown);
+window._editorKeyDown = onKeyDown;
+
+// ── CUSTOM DIALOG OVERLAY ───────────────────────────────────
+function showConfirm(message) {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('custom-prompt-overlay');
+        const input = document.getElementById('custom-prompt-input');
+        const msgEl = document.getElementById('custom-prompt-message');
+        const confirmBtn = document.getElementById('custom-prompt-confirm');
+        const cancelBtn = document.getElementById('custom-prompt-cancel');
+        const choicesContainer = document.getElementById('custom-prompt-choices');
+
+        msgEl.textContent = message;
+        input.classList.add('hidden');
+        choicesContainer.classList.add('hidden');
+        overlay.classList.remove('hidden');
+
+        const cleanup = (val) => {
+            overlay.classList.add('hidden');
+            confirmBtn.onclick = null;
+            cancelBtn.onclick = null;
+            resolve(val);
+        };
+
+        confirmBtn.onclick = () => cleanup(true);
+        cancelBtn.onclick = () => cleanup(false);
+    });
+}
+
+function showAlert(message) {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('custom-prompt-overlay');
+        const input = document.getElementById('custom-prompt-input');
+        const msgEl = document.getElementById('custom-prompt-message');
+        const confirmBtn = document.getElementById('custom-prompt-confirm');
+        const cancelBtn = document.getElementById('custom-prompt-cancel');
+        const choicesContainer = document.getElementById('custom-prompt-choices');
+
+        msgEl.textContent = message;
+        input.classList.add('hidden');
+        choicesContainer.classList.add('hidden');
+        cancelBtn.classList.add('hidden'); // Hide cancel for alert
+        overlay.classList.remove('hidden');
+
+        const cleanup = () => {
+            overlay.classList.add('hidden');
+            cancelBtn.classList.remove('hidden');
+            confirmBtn.onclick = null;
+            resolve();
+        };
+
+        confirmBtn.onclick = cleanup;
+    });
+}
+
+// Global Cleanup
+window.addEventListener('unload', () => {
+    if (window._editorPointerMove) window.removeEventListener('pointermove', window._editorPointerMove);
+    if (window._editorPointerUp) window.removeEventListener('pointerup', window._editorPointerUp);
+    if (window._editorKeyDown) window.removeEventListener('keydown', window._editorKeyDown);
 });

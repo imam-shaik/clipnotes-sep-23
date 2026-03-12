@@ -81,8 +81,14 @@ const FileSystemModule = {
                 results.pdf = pdfRequest.result;
                 if (++count === 2) resolve(results);
             };
-            request.onerror = () => { if (++count === 2) resolve(results); };
-            pdfRequest.onerror = () => { if (++count === 2) resolve(results); };
+            request.onerror = (e) => {
+                console.error("FileSystem: loadHandle root failed:", e.target.error);
+                if (++count === 2) resolve(results);
+            };
+            pdfRequest.onerror = (e) => {
+                console.error("FileSystem: loadHandle pdf failed:", e.target.error);
+                if (++count === 2) resolve(results);
+            };
         });
     },
 
@@ -176,9 +182,9 @@ const FileSystemModule = {
 
         if (typeof window.showDirectoryPicker !== 'function') {
             if (isBrave) {
-                alert(this.getBraveFolderPickerMessage());
+                this.showAlert(this.getBraveFolderPickerMessage());
             } else {
-                alert("Your browser does not support the File System Access API. Please use a supported browser like Chrome or Edge for local folder auto-save.");
+                this.showAlert("Your browser does not support the File System Access API. Please use a supported browser like Chrome or Edge for local folder auto-save.");
             }
             return false;
         }
@@ -197,7 +203,7 @@ const FileSystemModule = {
             // Most common false-positive in Brave: user activation is lost if picker is not called immediately.
             if (err?.name === 'SecurityError' || err?.name === 'NotAllowedError') {
                 console.error("Directory picker needs direct user activation:", err);
-                alert("Folder picker must be opened from a direct button click.\n\nPlease click Select Folder once again. If this keeps happening, close/reopen the side panel and try again.");
+                this.showAlert("Folder picker must be opened from a direct button click.\n\nPlease click Select Folder once again. If this keeps happening, close/reopen the side panel and try again.");
                 return false;
             }
 
@@ -209,13 +215,13 @@ const FileSystemModule = {
 
                 if (looksBlockedOrUnsupported) {
                     console.error("Brave blocked or does not support directory picker in current mode:", err);
-                    alert(this.getBraveFolderPickerMessage());
+                    this.showAlert(this.getBraveFolderPickerMessage());
                     return false;
                 }
             }
 
             console.error("Failed to open directory picker", err);
-            alert("Could not open the folder picker. Please try again.");
+            this.showAlert("Could not open the folder picker. Please try again.");
             return false;
         }
     },
@@ -227,7 +233,7 @@ const FileSystemModule = {
             throw new Error("No directory handle available. User must select a folder first.");
         }
 
-        // IMPORTANT: background autosave must not trigger requestPermission() without a user gesture.
+        // 1. Pre-flight permission check
         const hasPerm = await this.verifyPermission(this.dirHandle, true, withPrompt);
         if (!hasPerm) {
             this.permissionNeedsUserGesture = true;
@@ -237,21 +243,50 @@ const FileSystemModule = {
             return false;
         }
 
-        try {
-            const fileHandle = await targetHandle.getFileHandle(filename, { create: true });
-            const writable = await fileHandle.createWritable();
-            await writable.write(blobData);
-            await writable.close();
-            this.permissionNeedsUserGesture = false;
-            return true;
-        } catch (err) {
-            const name = err?.name || '';
-            if (name === 'NotAllowedError' || name === 'SecurityError') {
-                this.permissionNeedsUserGesture = true;
+        // 2. Multi-attempt save logic for transient errors (e.g. file locks)
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const fileHandle = await targetHandle.getFileHandle(filename, { create: true });
+                const writable = await fileHandle.createWritable();
+                await writable.write(blobData);
+                await writable.close();
+
+                this.permissionNeedsUserGesture = false;
+                return true;
+            } catch (err) {
+                const name = err?.name || '';
+
+                // CRITICAL: Handle Staleness (Root folder moved or deleted)
+                if (name === 'NotFoundError') {
+                    console.error("FileSystem: Target location not found. Handle is stale.", err);
+                    // Invalidating the root handle triggers the "Select Folder" UI automatically.
+                    this.dirHandle = null;
+                    return false;
+                }
+
+                if (name === 'NotAllowedError' || name === 'SecurityError') {
+                    this.permissionNeedsUserGesture = true;
+                    return false;
+                }
+
+                if (name === 'QuotaExceededError') {
+                    console.error("FileSystem: Disk quota exceeded.", err);
+                    this.showAlert("Your disk is full or the browser quota has been exceeded.\n\nPlease free up some space and try again.");
+                    return false;
+                }
+
+                // Retry for generic transient errors (e.g. "The user aborted a request" or lock issues)
+                if (attempt < maxAttempts) {
+                    const delay = attempt * 300;
+                    console.warn(`FileSystem: Save attempt ${attempt} failed, retrying in ${delay}ms:`, err.message);
+                    await new Promise(r => setTimeout(r, delay));
+                } else {
+                    console.error("FileSystem: Final save attempt failed:", err);
+                }
             }
-            console.error("File save error:", err);
-            return false;
         }
+        return false;
     },
 
     async saveFileAs(suggestedName, blobData) {
@@ -271,7 +306,7 @@ const FileSystemModule = {
                 options.startIn = 'documents';
             }
             if (typeof window.showSaveFilePicker !== 'function') {
-                alert("Your browser does not support the File System Access API. Please use a supported browser like Chrome or Edge.");
+                this.showAlert("Your browser does not support the File System Access API. Please use a supported browser like Chrome or Edge.");
                 return false;
             }
 
@@ -329,37 +364,36 @@ const FileSystemModule = {
     async isRootHandleAlive() {
         if (!this.dirHandle) return { alive: false, reason: 'missing' };
 
+        // 1) Verify existence by trying to get a dummy handle or list entries.
+        // This is the only way to reliably catch "NotFoundError" (folder moved/deleted).
         try {
-            const permission = await this.dirHandle.queryPermission({ mode: 'readwrite' });
-            if (permission !== 'granted') {
-                return { alive: true, reason: 'needs_permission' };
-            }
+            const iter = this.dirHandle.values();
+            await iter.next();
+            // If we get here, the directory EXISTS (even if permission is not yet granted).
         } catch (e) {
             const name = e?.name || '';
+
+            // This is the "Stale Handle" signal.
+            if (name === 'NotFoundError') {
+                console.error("FileSystem: Root handle is STALE (directory deleted/moved).");
+                return { alive: false, reason: 'missing' };
+            }
+
+            // Permissions errors are NOT "stale handle" signals. They just mean we need a gesture.
             if (name === 'NotAllowedError' || name === 'SecurityError') {
                 return { alive: true, reason: 'needs_permission' };
             }
         }
 
+        // 2) Verify current permission level
         try {
-            const iter = this.dirHandle.values();
-            await iter.next();
-            return { alive: true, reason: 'ok' };
+            const permission = await this.dirHandle.queryPermission({ mode: 'readwrite' });
+            if (permission === 'granted') {
+                return { alive: true, reason: 'ok' };
+            }
+            return { alive: true, reason: 'needs_permission' };
         } catch (e) {
-            const name = e?.name || '';
-
-            if (name === 'NotAllowedError' || name === 'SecurityError') {
-                console.warn("FileSystem: Root handle exists but current context cannot access it yet.");
-                return { alive: true, reason: 'needs_permission' };
-            }
-
-            if (name === 'NotFoundError') {
-                console.error("FileSystem: Root handle is STALE (directory deleted/moved):", e.message);
-                return { alive: false, reason: 'missing' };
-            }
-
-            console.warn("FileSystem: Could not verify root handle state, keeping existing handle:", e?.message || e);
-            return { alive: true, reason: 'unknown' };
+            return { alive: true, reason: 'needs_permission' };
         }
     },
 
@@ -395,6 +429,14 @@ const FileSystemModule = {
                 return await this.dirHandle.getDirectoryHandle(folderWithId, { create: createIfMissing });
             } catch (e) {
                 const name = e?.name || '';
+                // Handle stale root detected during subfolder access
+                if (name === 'NotFoundError' && createIfMissing) {
+                    const rootCheck = await this.isRootHandleAlive();
+                    if (!rootCheck.alive) {
+                        this.dirHandle = null;
+                        return null;
+                    }
+                }
                 if (name === 'NotAllowedError' || name === 'SecurityError') {
                     this.permissionNeedsUserGesture = true;
                     return null;
@@ -478,6 +520,14 @@ const FileSystemModule = {
         } catch (err) {
             console.error(`Failed to delete directory ${folderName}:`, err);
             return false;
+        }
+    },
+
+    showAlert(message) {
+        if (typeof window.showAlert === 'function') {
+            window.showAlert(message);
+        } else {
+            alert(message);
         }
     }
 };

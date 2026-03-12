@@ -1,4 +1,5 @@
-﻿// sidepanel/panel.js
+// sidepanel/panel.js
+// VERSION: ANTIGRAVITY_STABILITY_V4 (Global Canvas Protection)
 
 let currentVideoId = null;
 let currentVideoTitle = null;
@@ -16,13 +17,42 @@ let isNotebookEnabled = false;
 let isDataLoadedForId = null; // Track if we've already loaded state for the current ID
 let titleUsedForLoad = null; // Track which title was used for loading (to detect stale titles)
 let isVideoPlaying = false; // Track playback status
+let isAutoOpenEnabled = true; // New: Auto-Open toggle state
+let isCaptionEnabled = false; // CC-on-Screenshot toggle: OFF by default (clean screenshots)
 let lastCaptureTime = 0; // Prevent spamming screenshots too fast
 let panelHeartbeatTimer = null;
 let disconnectedPollCount = 0;
+let detachedHostMissingCount = 0;
+const VIDEO_STATE_FILENAME = 'video_notes_state.json';
+const HISTORY_INDEX_FILENAME = 'history_index.json';
+const WATCH_LATER_FILENAME = 'watch_later_list.json';
+const COUNTDOWN_FILENAME = 'countdown_list.json';
+const ENABLE_REHYDRATION_DEBUG_LOGS = false;
+const TRANSPARENT_PIXEL_DATA_URL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+const MISSING_SCREENSHOT_PLACEHOLDER_DATA_URL = "data:image/svg+xml;utf8," + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360"><rect width="640" height="360" fill="#f1f5f9"/><g fill="#64748b" font-family="Arial, sans-serif" text-anchor="middle"><text x="320" y="170" font-size="22">Screenshot file missing</text><text x="320" y="204" font-size="15">Re-capture or restore the image in your Save Folder</text></g></svg>'
+);
+
+const TIMEOUT_CONFIG = {
+    TOAST_DURATION: 3000,
+    TOAST_REMOVE_DELAY: 300,
+    VIDEO_POLL_RATE: 2000,
+    AUTO_SAVE_DEBOUNCE: 1500,
+    METADATA_CHECK_DELAY: 100,
+    EDITOR_FOCUS_DELAY: 50,
+    EDITOR_OPEN_DELAY: 500,
+    BLOB_REVOKE_DELAY: 30000,
+    RETRY_JITTER_BASE: 650
+};
+
 let state = {
-    screenshots: [], // { id, timestampMs, timeFormatted, dataUrl, noteHtml, filename, createdAt }
-    toc: [],          // { id, timeFormatted, timestampMs, title }
-    intervalMarkers: [], // [{ percentage, color, number }]
+    screenshots: [],
+    toc: [],
+    intervalMarkers: [],
+    activeMiniViewId: null, // Fix #19
+    blobUrls: new Set(),    // Fix #11: Track Blob URLs for revocation
+    watchLaterList: [],
+    countdowns: [], // { id, title, startDate, endDate, durationDays }
     metadata: {
         videoId: null,
         videoTitle: "",
@@ -33,28 +63,158 @@ let state = {
     }
 };
 
-const VIDEO_STATE_FILENAME = 'video_notes_state.json';
-const HISTORY_INDEX_FILENAME = 'history_index.json';
-
 let isCapturing = false;      // Prevent multiple screenshots at once
+let cachedTranscriptSegments = null; // Cache transcript for "Add CC to Note"
+
+
+const ENABLE_DEBUG_LOGGING = false;
+function debugLog(...args) {
+    if (ENABLE_DEBUG_LOGGING) console.log("[DEBUG]", ...args);
+}
+
+// GLOBAL ERROR TRACKING
+window.onerror = function (msg, url, lineNo, columnNo, error) {
+    if (msg.includes("Extension context invalidated")) return true; 
+    console.error(`[FATAL_STABILITY] ${msg} at ${lineNo}:${columnNo}`, error);
+    return false;
+};
+
+/**
+ * Robust wrapper for chrome.tabs.sendMessage that handles context invalidation
+ * and provides descriptive logging for other failure modes.
+ */
+async function safeSendMessage(tabId, message) {
+    if (!tabId || !chrome?.tabs?.sendMessage) return null;
+    try {
+        return await chrome.tabs.sendMessage(tabId, message);
+    } catch (err) {
+        const msg = err?.message || "";
+        if (msg.includes("Extension context invalidated")) {
+            debugLog("Extension context invalidated during message. This is expected on re-injection/update.");
+            return null;
+        }
+        if (msg.includes("Could not establish connection")) {
+            debugLog("Waiting for content script connection...");
+            return null;
+        }
+        console.warn(`[safeSendMessage] Failed to send ${message.action || 'message'}:`, err);
+        return null;
+    }
+}
 
 // ==========================================
 // Initialization
 // ==========================================
 document.addEventListener('DOMContentLoaded', async () => {
-    startPanelHeartbeat();
-    initTheme();
-    await initFileSystem();
-    initTabs(); // Initialize tab switching
-    initButtons();
-    initOptInToggle();
-    initMessageListeners(); // New: Listen for background/content signals
-    pollCurrentVideo();
+    // console.log("[STABILITY_V3] DOMContentLoaded starting...");
+    try {
+        // Notify content script that panel is open
+        if (launchedForTabId) {
+            safeSendMessage(launchedForTabId, { action: 'TAB_PANEL_OPENED' });
+        }
+
+        startPanelHeartbeat();
+        initTheme();
+        await initFileSystem();
+
+        if (panelMode === 'preview') {
+            // Special full-tab preview mode
+            initPreviewMode();
+        } else {
+            initTabs(); // Initialize tab switching
+            initButtons();
+            initOptInToggle();
+            initAutoOpenToggle();
+            await initAutoShotToggle(); // Initialize Auto-Shot timer logic
+            initCCToggle();
+            initTranscriptRangeSettings();
+            initWatchLaterTab();
+            initMessageListeners();
+            
+            // Performance: Only poll if the panel is currently visible
+            setInterval(() => {
+                if (document.visibilityState === 'visible') {
+                    pollCurrentVideo();
+                }
+            }, TIMEOUT_CONFIG.VIDEO_POLL_RATE);
+
+            checkMetadataImmediate();
+            loadWatchLaterList(); // Load global watch later list
+            loadCountdowns(); // Load global countdowns limit
+        }
+    } catch (err) {
+        console.error("[STABILITY_V3] Critical initialization failed:", err);
+    }
 });
 
 window.addEventListener('beforeunload', () => {
+    // Notify content script that panel is closed
+    if (launchedForTabId) {
+        safeSendMessage(launchedForTabId, { action: 'TAB_PANEL_CLOSED' });
+    }
     stopPanelHeartbeat();
 });
+
+// --- UI Utilities ---
+function showToast(message, type = 'info') {
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        document.body.appendChild(container);
+    }
+
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+
+    container.appendChild(toast);
+
+    // Force reflow
+    toast.offsetHeight;
+
+    toast.classList.add('show');
+
+    // Auto-remove after configured duration
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), TIMEOUT_CONFIG.TOAST_REMOVE_DELAY);
+    }, TIMEOUT_CONFIG.TOAST_DURATION);
+}
+
+/**
+ * GLOBAL STABILITY HELPER: Prevents TypeError: Cannot set properties of null (setting 'innerHTML')
+ */
+function safeSetInnerHTML(idOrEl, html) {
+    const el = (typeof idOrEl === 'string') ? document.getElementById(idOrEl) : idOrEl;
+    if (!el) {
+        // Silently return since we intentionally removed some UI elements (like Timeline TOC)
+        return false;
+    }
+    try {
+        el.innerHTML = html;
+        return true;
+    } catch (e) {
+        console.error(`[STABILITY] Failed to set innerHTML.`, e, idOrEl);
+        return false;
+    }
+}
+
+function isMissingFileSystemEntryError(err) {
+    if (!err) return false;
+    const name = String(err.name || '');
+    const msg = String(err.message || '');
+    if (name === 'NotFoundError') return true;
+    return /not\s*found/i.test(msg) || /requested file or directory/i.test(msg);
+}
+
+function isPermissionDeniedFileSystemError(err) {
+    if (!err) return false;
+    const name = String(err.name || '');
+    const msg = String(err.message || '');
+    if (name === 'NotAllowedError' || name === 'SecurityError') return true;
+    return /denied/i.test(msg) || /permission/i.test(msg) || /allowed/i.test(msg);
+}
 
 // Centralize communication with content script to handle SPA navigation race conditions
 async function sendMessageWithRetry(tabId, message, maxRetries = 10, delayMs = 500) {
@@ -170,6 +330,7 @@ async function seekActiveYouTubeTab(timeMs) {
 
 function initMessageListeners() {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        // console.log("Sidepanel: Message received:", message.action || message.type, message);
         // Keep tab binding stable in detached mode; avoid drifting to unrelated YouTube tabs.
         if (sender && sender.tab && shouldTrackSenderTab(sender.tab)) {
             currentTabId = sender.tab.id;
@@ -188,7 +349,7 @@ function initMessageListeners() {
             // Always check metadata for the current video
             checkMetadataImmediate();
         } else if (message.action === 'shortcutPressed') {
-            console.log("Sidepanel: Shortcut detected:", message.key);
+            // console.log("Sidepanel: Shortcut detected:", message.key);
             if (message.key === 's') {
                 handleCapture();
             } else if (message.key === 'z') {
@@ -197,7 +358,28 @@ function initMessageListeners() {
                 handleAddTOC();
             } else if (message.key === 'a') {
                 handleAreaCapture();
+            } else if (message.key === 'e') {
+                editLastScreenshot();
+            } else if (message.key === '+') {
+                handleAddWatchLaterRequest(message.metadata);
             }
+        } else if (message.type === 'NOTE_SYNCED') {
+            const { shotId, html } = message;
+            const card = document.getElementById(shotId);
+            if (card) {
+                const ed = card.querySelector('.note-editor');
+                if (ed) {
+                    ed.innerHTML = html;
+                    // Ensure visual states are correct
+                    const container = card.querySelector('.note-container');
+                    if (container) container.classList.add('visible');
+                    const btn = card.querySelector('.notes-toggle-btn');
+                    if (btn) btn.classList.add('active');
+                }
+            }
+            // Update the data in state array too
+            const shot = state.screenshots.find(s => s.id === shotId);
+            if (shot) shot.noteHtml = html;
         } else if (message.action === 'screenshotEdited') {
             console.log("Sidepanel: Screenshot edited result received for", message.shotId);
             handleScreenshotEditedResult(message.shotId, message.dataUrl);
@@ -247,12 +429,12 @@ async function handleScreenshotEditedResult(shotId, newDataUrl) {
 async function checkMetadataImmediate() {
     const tabId = await resolveActiveYouTubeTabId();
     if (!Number.isInteger(tabId)) return;
-    chrome.tabs.sendMessage(tabId, { action: 'getMetadata' }, async (response) => {
-        if (chrome.runtime.lastError || !response) return;
-        if (response.videoId === currentVideoId) {
-            handleMetadataResponse(response);
-        }
-    });
+
+    // Increased retry count for immediate check to handle initialization
+    const response = await sendMessageWithRetry(tabId, { action: 'getMetadata' }, 5, 400);
+    if (response && response.videoId) {
+        handleMetadataResponse(response);
+    }
 }
 
 function handleMetadataResponse(response) {
@@ -277,7 +459,13 @@ function handleMetadataResponse(response) {
 
     // CRITICAL: Only trigger LOAD if it's a new video and NOT the placeholder "YouTube / YouTube Video"
     if (isDataLoadedForId !== response.videoId && !isGeneric) {
-        console.log("Sidepanel: Real metadata detected, loading state for", response.videoId, "Title:", response.title);
+        debugLog("Sidepanel: Real metadata detected, loading state for", response.videoId, "Title:", response.title);
+
+        cachedTranscriptSegments = null; // Clear cached transcript on video change
+
+        // Reset Notebook toggle to OFF by default for new videos
+        // It will be turned back ON if loadVideoState finds an existing folder/state.
+        setNotebookToggleState(false);
 
         // Update global tracking state fully
         currentVideoId = response.videoId;
@@ -293,15 +481,13 @@ function handleMetadataResponse(response) {
     } else if (isDataLoadedForId === response.videoId && !isGeneric && titleUsedForLoad && titleUsedForLoad !== response.title) {
         // Title changed after initial load (e.g., stale SPA title -> real title)
         // Re-load with the correct title to get the right folder
-        console.log("Sidepanel: Title changed after load, re-loading:", titleUsedForLoad, "->", response.title);
+        debugLog("Sidepanel: Title changed after load, re-loading:", titleUsedForLoad, "->", response.title);
         currentVideoTitle = response.title;
         state.metadata.videoTitle = response.title;
         titleUsedForLoad = response.title;
         clearVideoStateUI();
         isDataLoadedForId = response.videoId; // Keep it set
         loadVideoState(response.videoId, response.title);
-    } else if (isDataLoadedForId === response.videoId && state.screenshots.length > 0 && !isNotebookEnabled) {
-        setNotebookToggleState(true);
     }
 }
 
@@ -341,6 +527,13 @@ function showPrompt(message, defaultValue = "", choices = null) {
             btnOk.classList.add('hidden'); // OK button redundant for choices
             choicesEl.innerHTML = '';
 
+            // Layout density optimization: Use grid for 4+ options
+            if (choices.length >= 4) {
+                choicesEl.classList.add('grid-layout');
+            } else {
+                choicesEl.classList.remove('grid-layout');
+            }
+
             const normalizedChoices = choices.map((choice) => {
                 if (choice && typeof choice === 'object') {
                     const value = choice.value ?? choice.label ?? "";
@@ -348,18 +541,21 @@ function showPrompt(message, defaultValue = "", choices = null) {
                     return {
                         value: String(value),
                         label: String(label),
-                        icon: choice.icon ? String(choice.icon) : ""
+                        icon: choice.icon ? String(choice.icon) : "",
+                        description: choice.description ? String(choice.description) : ""
                     };
                 }
                 const val = String(choice ?? "");
-                return { value: val, label: val, icon: "" };
+                return { value: val, label: val, icon: "", description: "" };
             });
 
             normalizedChoices.forEach(choice => {
                 const btn = document.createElement('button');
                 btn.className = 'choice-btn';
+                if (choice.description) btn.classList.add('has-description');
                 const iconHtml = choice.icon ? `<span class="choice-icon">${choice.icon}</span>` : '';
-                btn.innerHTML = `${iconHtml}<span class="choice-label">${choice.label}</span>`;
+                const descriptionHtml = choice.description ? `<span class="choice-description">${choice.description}</span>` : '';
+                btn.innerHTML = `${iconHtml}<span class="choice-text"><span class="choice-label">${choice.label}</span>${descriptionHtml}</span>`;
                 btn.onclick = () => closeAndResolve(choice.value);
                 choicesEl.appendChild(btn);
             });
@@ -395,8 +591,87 @@ function showPrompt(message, defaultValue = "", choices = null) {
     });
 }
 
+/**
+ * Premium custom confirm dialog — replaces native browser confirm().
+ * Returns true if user clicks OK, false if they click Cancel.
+ */
+function showConfirm(message) {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('custom-prompt-overlay');
+        const msgEl = document.getElementById('custom-prompt-message');
+        const inputEl = document.getElementById('custom-prompt-input');
+        const choicesEl = document.getElementById('custom-prompt-choices');
+        const btnOk = document.getElementById('custom-prompt-confirm');
+        const btnCancel = document.getElementById('custom-prompt-cancel');
+
+        msgEl.textContent = message;
+        inputEl.classList.add('hidden');
+        choicesEl.classList.add('hidden');
+        btnOk.classList.remove('hidden');
+        btnCancel.classList.remove('hidden');
+        overlay.classList.remove('hidden');
+
+        const close = (result) => {
+            overlay.classList.add('hidden');
+            btnOk.removeEventListener('click', onOk);
+            btnCancel.removeEventListener('click', onCancel);
+            document.removeEventListener('keydown', onKey);
+            resolve(result);
+        };
+
+        const onOk = () => close(true);
+        const onCancel = () => close(false);
+        const onKey = (e) => {
+            if (e.key === 'Enter') onOk();
+            if (e.key === 'Escape') onCancel();
+        };
+
+        btnOk.addEventListener('click', onOk);
+        btnCancel.addEventListener('click', onCancel);
+        document.addEventListener('keydown', onKey, { once: true });
+    });
+}
+
+/**
+ * Premium custom alert dialog — replaces native browser alert().
+ * Shows a message with just an OK button.
+ */
+function showAlert(message) {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('custom-prompt-overlay');
+        const msgEl = document.getElementById('custom-prompt-message');
+        const inputEl = document.getElementById('custom-prompt-input');
+        const choicesEl = document.getElementById('custom-prompt-choices');
+        const btnOk = document.getElementById('custom-prompt-confirm');
+        const btnCancel = document.getElementById('custom-prompt-cancel');
+
+        msgEl.textContent = message;
+        inputEl.classList.add('hidden');
+        choicesEl.classList.add('hidden');
+        btnOk.classList.remove('hidden');
+        btnCancel.classList.add('hidden'); // No cancel for alerts
+        overlay.classList.remove('hidden');
+
+        const close = () => {
+            overlay.classList.add('hidden');
+            btnOk.removeEventListener('click', close);
+            document.removeEventListener('keydown', onKey);
+            btnCancel.classList.remove('hidden'); // Restore for next use
+            resolve();
+        };
+
+        const onKey = (e) => {
+            if (e.key === 'Enter' || e.key === 'Escape') close();
+        };
+
+        btnOk.addEventListener('click', close, { once: true });
+        document.addEventListener('keydown', onKey, { once: true });
+    });
+}
+
+
 async function resolveActiveYouTubeTabId() {
-    if (isDetachedPanel && Number.isInteger(launchedForTabId)) {
+    if (Number.isInteger(launchedForTabId)) {
         const lockedTab = await getValidatedWatchTab(launchedForTabId);
         if (lockedTab) {
             currentTabId = lockedTab.id;
@@ -412,23 +687,17 @@ async function resolveActiveYouTubeTabId() {
         currentTabId = null;
     }
 
-    try {
-        if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+    // Detached panel must stay bound to its original host window.
+    // Do not rebind globally to another random YouTube tab.
+    if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+        try {
             const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: launchedForHostWindowId });
             if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url)) {
                 currentTabId = tabInHostWindow.id;
                 return currentTabId;
             }
-        }
+        } catch (_) { }
 
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (tab && isYouTubeWatchUrl(tab.url)) {
-            currentTabId = tab.id;
-            return currentTabId;
-        }
-    } catch (_) { }
-
-    if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
         try {
             const hostTabs = await chrome.tabs.query({
                 windowId: launchedForHostWindowId,
@@ -440,20 +709,51 @@ async function resolveActiveYouTubeTabId() {
                 return currentTabId;
             }
         } catch (_) { }
+
+        return null;
     }
 
     try {
-        const allWatchTabs = await chrome.tabs.query({
-            url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
-        });
-        const best = pickBestYouTubeWatchTab(allWatchTabs);
-        if (best && Number.isInteger(best.id)) {
-            currentTabId = best.id;
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (tab && isYouTubeWatchUrl(tab.url)) {
+            currentTabId = tab.id;
             return currentTabId;
         }
     } catch (_) { }
 
+    if (Date.now() - window.lastGlobalTabQueryFallback > 2000 || !window.lastGlobalTabQueryFallback) {
+        window.lastGlobalTabQueryFallback = Date.now();
+        try {
+            const allWatchTabs = await chrome.tabs.query({
+                url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
+            });
+            const best = pickBestYouTubeWatchTab(allWatchTabs);
+            if (best && Number.isInteger(best.id)) {
+                currentTabId = best.id;
+                return currentTabId;
+            }
+        } catch (_) { }
+    }
+
     return null;
+}
+
+async function closeDetachedPanelIfHostMissing() {
+    if (!isDetachedPanel || !Number.isInteger(launchedForHostWindowId)) return false;
+    try {
+        await chrome.windows.get(launchedForHostWindowId);
+        detachedHostMissingCount = 0;
+        return false;
+    } catch (_) {
+        detachedHostMissingCount += 1;
+        if (detachedHostMissingCount < 2) {
+            return false;
+        }
+        try {
+            window.close();
+        } catch (_) { }
+        return true;
+    }
 }
 
 async function resolveTrackedYouTubeTab() {
@@ -470,6 +770,8 @@ async function resolveTrackedYouTubeTab() {
 }
 
 async function sendPanelHeartbeat() {
+    if (await closeDetachedPanelIfHostMissing()) return;
+
     const tabId = await resolveActiveYouTubeTabId();
     if (!Number.isInteger(tabId)) return;
     chrome.runtime.sendMessage({ action: 'panelHeartbeat', tabId }, () => {
@@ -505,17 +807,6 @@ function stopPanelHeartbeat() {
     sendPanelClosed();
 }
 
-async function handleCloseSidePanel() {
-    const tabId = await resolveActiveYouTubeTabId();
-    stopPanelHeartbeat();
-
-    chrome.runtime.sendMessage({ action: 'closeSidePanel', tabId }, (response) => {
-        if (chrome.runtime.lastError || !response?.success) {
-            // Fallback if browser refuses close API in this context.
-            window.close();
-        }
-    });
-}
 
 let exportProgressOverlayRef = null;
 
@@ -602,7 +893,24 @@ function showFolderPermissionBanner() {
     }
 }
 
+function showFolderMissingBanner() {
+    const banner = document.getElementById('folder-status-banner');
+    if (!banner) return;
+
+    banner.innerHTML = '&#9888; Save Folder is missing or moved. Please click the folder icon (top right) to re-select it.';
+    banner.classList.add('show');
+
+    if (folderPermissionClickListener) {
+        document.body.removeEventListener('click', folderPermissionClickListener);
+        folderPermissionClickListener = null;
+    }
+}
+
 function showFolderPermissionBannerIfNeeded() {
+    if (!FileSystemModule.dirHandle) {
+        showFolderMissingBanner();
+        return true;
+    }
     if (FileSystemModule.permissionNeedsUserGesture) {
         showFolderPermissionBanner();
         return true;
@@ -623,14 +931,21 @@ async function initFileSystem() {
             }
             // Try loading state immediately for the current video now that we have a fresh folder
             if (currentVideoId && currentVideoTitle) await loadVideoState(currentVideoId, currentVideoTitle);
+            // Also ensure global lists are loaded
+            await loadWatchLaterList();
+            await loadCountdowns();
         }
     });
 
     const fsState = await FileSystemModule.setup();
     if (fsState === false) {
-        banner.classList.add('show');
+        showFolderMissingBanner();
     } else if (fsState === 'needs_permission') {
         showFolderPermissionBanner();
+    } else {
+        // Success case (permission granted or already set)
+        await loadWatchLaterList();
+        await loadCountdowns();
     }
 }
 
@@ -640,19 +955,25 @@ async function initFileSystem() {
 function initTabs() {
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
+            const currentBtn = e.currentTarget;
+            if (!currentBtn) return;
+
             // Remove active classes
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
 
             // Add to targeted
-            const targetId = e.target.getAttribute('data-tab');
-            e.target.classList.add('active');
-            document.getElementById(targetId).classList.add('active');
+            const targetId = currentBtn.getAttribute('data-tab');
+            if (targetId) {
+                currentBtn.classList.add('active');
+                const pane = document.getElementById(targetId);
+                if (pane) pane.classList.add('active');
 
-            if (targetId === 'tab-history') {
-                refreshHistory();
-            } else if (targetId === 'tab-transcript') {
-                refreshTranscript();
+                if (targetId === 'tab-history') {
+                    refreshHistory();
+                } else if (targetId === 'tab-transcript') {
+                    refreshTranscript();
+                }
             }
         });
     });
@@ -661,27 +982,32 @@ function initTabs() {
 function initButtons() {
     // Primary Actions
     const btnCaptureFull = document.getElementById('btn-capture-full');
-    const btnAddTOC = document.getElementById('btn-add-toc');
+    const btnCountdownManager = document.getElementById('btn-countdown-manager');
+    const btnAddCountdown = document.getElementById('btn-add-countdown');
     const btnExportPDF = document.getElementById('btn-export-pdf');
     const btnPreviewPDF = document.getElementById('btn-preview-pdf');
     const btnClosePreview = document.getElementById('btn-close-preview');
     const btnClosePanel = document.getElementById('btn-close-panel');
     const btnCopyTranscript = document.getElementById('btn-copy-transcript');
+    const btnDeleteAllScreenshots = document.getElementById('btn-delete-all-screenshots');
 
     // Secondary Actions
     const btnCaptureArea = document.getElementById('btn-capture-area');
-    const btnAutoScreenshot = document.getElementById('btn-auto-screenshot');
     const btnDurationCalc = document.getElementById('btn-duration-calc');
     const btnCreateBoard = document.getElementById('btn-create-board');
     const btnAddImg = document.getElementById('btn-add-image');
 
     // Listeners
     if (btnCaptureFull) btnCaptureFull.addEventListener('click', handleCapture);
-    if (btnAddTOC) btnAddTOC.addEventListener('click', handleAddTOC);
+    if (btnCountdownManager) btnCountdownManager.addEventListener('click', () => {
+        const tabBtn = document.querySelector('.tab-btn[data-tab="tab-countdown"]');
+        if (tabBtn) tabBtn.click();
+    });
+    if (btnAddCountdown) btnAddCountdown.addEventListener('click', handleAddCountdownPrompt);
+
     if (btnExportPDF) btnExportPDF.addEventListener('click', handleExportPDF);
     if (btnPreviewPDF) btnPreviewPDF.addEventListener('click', handlePreviewPDF);
     if (btnClosePreview) btnClosePreview.addEventListener('click', closePdfPreviewModal);
-    if (btnClosePanel) btnClosePanel.addEventListener('click', handleCloseSidePanel);
 
     const previewOverlay = document.getElementById('pdf-preview-overlay');
     if (previewOverlay) {
@@ -694,9 +1020,14 @@ function initButtons() {
     if (btnCopyTranscript) btnCopyTranscript.addEventListener('click', copyTranscriptToClipboard);
 
     if (btnCaptureArea) btnCaptureArea.addEventListener('click', handleAreaCapture);
-    if (btnAutoScreenshot) btnAutoScreenshot.addEventListener('click', handleAutoScreenshotToggle);
     if (btnDurationCalc) btnDurationCalc.addEventListener('click', handleDurationCalculator);
     if (btnCreateBoard) btnCreateBoard.addEventListener('click', handleCreateBoard);
+    if (btnDeleteAllScreenshots) btnDeleteAllScreenshots.addEventListener('click', handleDeleteAllScreenshotsForCurrentVideo);
+    const btnCaptureAuto = document.getElementById('btn-capture-auto');
+    if (btnCaptureAuto) {
+        // Initialization handled by initAutoShotToggle
+    }
+
     if (document.getElementById('btn-set-interval')) {
         document.getElementById('btn-set-interval').addEventListener('click', handleSetInterval);
     }
@@ -708,6 +1039,7 @@ function initButtons() {
 
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
+        if (e.repeat) return;
         const tag = document.activeElement?.tagName?.toLowerCase();
         const isEditable = tag === 'input' || tag === 'textarea' || document.activeElement?.isContentEditable;
         if (isEditable) return;
@@ -719,18 +1051,23 @@ function initButtons() {
         } else if (key === 'z') {
             e.preventDefault();
             openLastScreenshotNote();
-        } else if (key === 't') {
-            e.preventDefault();
-            handleAddTOC();
         } else if (key === 'a') {
             e.preventDefault();
             handleAreaCapture();
+        } else if (key === 'e') {
+            e.preventDefault();
+            editLastScreenshot();
+        } else if (key === '+') {
+            handleAddWatchLaterRequest();
         }
     });
 }
 
 function openLastScreenshotNote() {
     if (state.screenshots.length === 0) return;
+
+    // Ensure the sidepanel window itself is focused
+    window.focus();
 
     // Sort screenshots by creation time to ensure we get the "last" one taken
     const shots = [...state.screenshots].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
@@ -742,13 +1079,37 @@ function openLastScreenshotNote() {
         const notesBtn = card.querySelector('.notes-toggle-btn');
         const editor = card.querySelector('.note-editor');
 
-        if (!noteContainer.classList.contains('visible')) {
-            notesBtn.click(); // This opens and focuses
-        } else {
-            editor.focus();
+        if (noteContainer && notesBtn && editor) {
+            const focusEditor = () => {
+                editor.focus();
+                // Place caret at the end
+                const range = document.createRange();
+                range.selectNodeContents(editor);
+                range.collapse(false);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            };
+
+            if (!noteContainer.classList.contains('visible')) {
+                notesBtn.click(); // This opens. notesBtn listener already has focus logic, 
+                                 // but we'll reinforce it to be sure.
+                setTimeout(focusEditor, 50); 
+            } else {
+                focusEditor();
+            }
         }
 
         card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+}
+
+function editLastScreenshot() {
+    if (state.screenshots.length === 0) return;
+    const shots = [...state.screenshots].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    const lastShot = shots[shots.length - 1];
+    if (lastShot) {
+        openScreenshotEditor(lastShot.id);
     }
 }
 
@@ -756,8 +1117,9 @@ function openLastScreenshotNote() {
 // Secondary Action Handlers (WIP)
 // ---------------------------------------------------------
 async function handleAreaCapture() {
+    if (isCapturing) return; // Guard at top before expensive async task queries
     const tabId = await resolveActiveYouTubeTabId();
-    if (!Number.isInteger(tabId) || isCapturing) return;
+    if (!Number.isInteger(tabId)) return;
 
     const btn = document.getElementById('btn-capture-area');
     const originalText = btn.innerHTML;
@@ -773,20 +1135,24 @@ async function handleAreaCapture() {
         btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
         btn.disabled = true;
 
-        if (!isNotebookEnabled) setNotebookToggleState(true);
+        if (!isNotebookEnabled) {
+            showToast("Notebook is OFF. Turn it ON to enable capturing.", "warning");
+            resetBtn();
+            return;
+        }
 
         const targetVideoId = currentVideoId;
         const targetVideoTitle = currentVideoTitle;
 
         if (!targetVideoId || !targetVideoTitle || targetVideoTitle === "Loading...") {
-            alert("Wait for the video title to load.");
+            showToast("Wait for the video title to load.", "info");
             resetBtn();
             return;
         }
 
         if (!FileSystemModule.dirHandle) await FileSystemModule.setup();
         if (!FileSystemModule.dirHandle) {
-            alert("Please select a Save Folder first.");
+            showToast("Please select a Save Folder first.", "warning");
             resetBtn();
             return;
         }
@@ -803,18 +1169,19 @@ async function handleAreaCapture() {
             try {
                 if (chrome.runtime.lastError || !response || !response.success) {
                     if (response && response.error !== "Cancelled") {
-                        alert("Area capture failed: " + (response.error || "Unknown error"));
+                        showToast("Area capture failed: " + (response.error || "Unknown error"), "error");
                     }
+                    resetBtn();
                     return;
                 }
 
                 const finalImageData = response.imageData;
                 const finalTimeMs = response.currentTimeMs;
-                const blob = dataURLtoBlob(finalImageData);
+                const blob = await dataURLtoBlobAsync(finalImageData);
                 const timeF = formatTime(finalTimeMs);
                 const safeTimeStr = timeF.replace(/:/g, '-');
                 const fileUnique = Date.now().toString().slice(-4);
-                const filename = `AreaShot_${safeTimeStr}_${fileUnique}.png`;
+                const filename = `AreaShot_${safeTimeStr}_${fileUnique}.jpg`;
 
                 const subFolder = await FileSystemModule.getVideoFolderHandle(targetVideoTitle, true, targetVideoId);
                 if (subFolder) {
@@ -838,7 +1205,37 @@ async function handleAreaCapture() {
     }
 }
 
-let autoScreenshotInterval = null;
+async function initAutoShotToggle() {
+    const btn = document.getElementById('btn-capture-auto');
+    if (!btn) return;
+
+    try {
+        const result = await chrome.storage.local.get('autoScreenshotIntervalSecs');
+        const seconds = parseInt(result.autoScreenshotIntervalSecs) || 0;
+        if (seconds >= 1) {
+            startAutoScreenshot(seconds, btn);
+        }
+    } catch (err) {
+        console.warn("Failed to load Auto-Shot state:", err);
+    }
+
+    btn.addEventListener('click', handleAutoScreenshotToggle);
+}
+
+function startAutoScreenshot(seconds, btn) {
+    if (autoScreenshotInterval) clearInterval(autoScreenshotInterval);
+    const ms = seconds * 1000;
+    autoScreenshotInterval = setInterval(() => {
+        if (isVideoPlaying && document.visibilityState === 'visible') {
+            console.log("Auto-capturing because video is playing...");
+            handleCapture();
+        }
+    }, ms);
+    btn.classList.add('primary');
+    btn.title = `Auto Screenshot ON (Every ${seconds}s) - Click to Stop`;
+    chrome.storage.local.set({ autoScreenshotIntervalSecs: seconds });
+}
+
 function handleAutoScreenshotToggle(e) {
     const btn = e.currentTarget;
     if (autoScreenshotInterval) {
@@ -846,25 +1243,29 @@ function handleAutoScreenshotToggle(e) {
         autoScreenshotInterval = null;
         btn.classList.remove('primary');
         btn.title = "Toggle Auto Screenshot";
+        chrome.storage.local.remove('autoScreenshotIntervalSecs');
         console.log("Auto Screenshot STOPPED.");
     } else {
-        // We use an IIFE to handle the async prompt without making the click handler itself async, 
-        // which could cause rapid double-click race conditions.
         (async () => {
-            const intervalSecs = await showPrompt("Enter Auto-Screenshot interval in seconds (will only capture while video is PLAYING):", "10");
-            if (intervalSecs && !isNaN(intervalSecs)) {
-                const ms = parseInt(intervalSecs) * 1000;
-                autoScreenshotInterval = setInterval(() => {
-                    if (isVideoPlaying) {
-                        console.log("Auto-capturing because video is playing...");
-                        handleCapture();
-                    } else {
-                        console.log("Auto-capture skipped: Video is paused/off.");
-                    }
-                }, ms);
-                btn.classList.add('primary');
-                btn.title = "Auto Screenshot ON (Click to Stop)";
-                console.log(`Auto Screenshot ENABLED every ${intervalSecs} seconds.`);
+            const input = await showPrompt("Enter Auto-Screenshot interval (e.g., '10s' or '1m'). Min 1s:", "10s");
+            if (!input) return;
+
+            let seconds = 0;
+            const match = input.toLowerCase().match(/^(\d+)([sm]?)$/);
+            if (match) {
+                const val = parseInt(match[1]);
+                const unit = match[2] || 's';
+                if (unit === 'm') seconds = val * 60;
+                else seconds = val;
+            } else if (!isNaN(input)) {
+                seconds = parseInt(input);
+            }
+
+            if (seconds >= 1) {
+                startAutoScreenshot(seconds, btn);
+                console.log(`Auto Screenshot ENABLED every ${seconds} seconds.`);
+            } else {
+                showToast("Invalid interval. Minimum 1s required.", "error");
             }
         })();
     }
@@ -896,16 +1297,8 @@ function syncNotebookStateToContent(isOn) {
 function initOptInToggle() {
     const toggle = document.getElementById('toggle-notebook');
 
-    // Load initial state from localStorage
-    const savedState = localStorage.getItem('ynNotebookEnabled');
-    if (savedState === 'true') {
-        setNotebookToggleState(true);
-    } else if (savedState === 'false') {
-        setNotebookToggleState(false);
-    } else {
-        // DEFAULT: OFF for new users, but once they turn it ON, it sticks.
-        setNotebookToggleState(false);
-    }
+    // DEFAULT: Always OFF on startup/tab load unless found by loadVideoState
+    setNotebookToggleState(false);
 
     toggle.addEventListener('change', (e) => {
         setNotebookToggleState(!!e.target.checked);
@@ -919,14 +1312,22 @@ function initOptInToggle() {
 // ==========================================
 // Video Integration Polling
 // ==========================================
+let isPollInProgress = false; 
+/**
+ * Single-execution check for video status.
+ * Called periodically by DOMContentLoaded's visibility-aware interval.
+ */
 async function pollCurrentVideo() {
-    // Repeatedly check the active tab for a youtube video to connect to
-    setInterval(async () => {
+    if (isPollInProgress) return;
+    isPollInProgress = true;
+
+    try {
         const tab = await resolveTrackedYouTubeTab();
         if (tab && isYouTubeWatchUrl(tab.url)) {
             disconnectedPollCount = 0;
             currentTabId = tab.id;
-            // PRE-CHECK: Detect video change from URL instantly
+            
+            // Detect video change from URL instantly
             try {
                 const urlObj = new URL(tab.url);
                 const urlParams = new URLSearchParams(urlObj.search);
@@ -935,19 +1336,22 @@ async function pollCurrentVideo() {
                 if (urlVideoId && currentVideoId !== urlVideoId) {
                     console.log("Sidepanel: Instant URL-based navigation detected:", urlVideoId);
                     currentVideoId = urlVideoId;
-                    currentVideoTitle = null; // Reset title to require fresh load
-                    isDataLoadedForId = null; // Reset load tracker
+                    currentVideoTitle = null; 
+                    isDataLoadedForId = null; 
                     clearVideoStateUI();
                 }
             } catch (urlErr) { console.warn("Invalid URL in poll check:", tab.url); }
 
-            // Using the retry wrapper here prevents errors when content script is still injecting
-            const metaResponse = await sendMessageWithRetry(currentTabId, { action: 'getMetadata' }, 1, 0); // Quick check
-            if (metaResponse && metaResponse.videoId === currentVideoId) {
-                handleMetadataResponse(metaResponse);
+            // Fetch metadata with retry (only if title is missing)
+            if (!currentVideoTitle) {
+                const metaResponse = await sendMessageWithRetry(currentTabId, { action: 'getMetadata' }, 3, 200);
+                if (metaResponse) {
+                    handleMetadataResponse(metaResponse);
+                }
             }
 
-            const stateResponse = await sendMessageWithRetry(currentTabId, { action: 'getState' }, 1, 0); // Quick check
+            // Quick check for playback state
+            const stateResponse = await sendMessageWithRetry(currentTabId, { action: 'getState' }, 1, 0);
             if (stateResponse) {
                 isVideoPlaying = stateResponse.isPaused === false;
                 updateTimeline(stateResponse);
@@ -969,7 +1373,9 @@ async function pollCurrentVideo() {
                 }
             }
         }
-    }, 1000);
+    } finally {
+        isPollInProgress = false;
+    }
 }
 
 function updateTimeline(vidState) {
@@ -977,7 +1383,48 @@ function updateTimeline(vidState) {
     const currentStr = formatTime(vidState.currentTimeMs);
     const durStr = formatTime(vidState.durationMs);
 
-    document.getElementById('time-display').textContent = `${currentStr} / ${durStr}`;
+    let displayStr = `${currentStr} / ${durStr}`;
+    let flagStats = null;
+
+    // Add interval info if active
+    const intervalStr = state.metadata.selectedInterval;
+    if (intervalStr && intervalStr !== "None") {
+        const secs = parseInt(intervalStr, 10);
+        if (Number.isFinite(secs) && secs > 0) {
+            const intervalMs = secs * 1000;
+            let intervalLabel = "";
+            if (secs >= 3600) {
+                const hours = secs / 3600;
+                intervalLabel = `${Number.isInteger(hours) ? hours : hours.toFixed(1)} hour`;
+                if (hours !== 1) intervalLabel += "s";
+            } else if (secs >= 60) {
+                const mins = secs / 60;
+                intervalLabel = `${Number.isInteger(mins) ? mins : mins.toFixed(1)} min`;
+            } else {
+                intervalLabel = `${secs} sec`;
+            }
+
+            const durationMs = Math.max(0, Number(vidState.durationMs) || 0);
+            const currentMs = Math.max(0, Number(vidState.currentTimeMs) || 0);
+            const totalFlags = durationMs > 0 ? Math.floor((durationMs - 1) / intervalMs) : 0;
+            const completedFlags = totalFlags > 0
+                ? Math.min(totalFlags, Math.floor(currentMs / intervalMs))
+                : 0;
+            const nextFlagNumber = completedFlags + 1;
+
+            let nextFlagLabel = "all done";
+            if (nextFlagNumber <= totalFlags) {
+                const nextFlagTimeMs = nextFlagNumber * intervalMs;
+                const remainingMs = Math.max(0, nextFlagTimeMs - currentMs);
+                nextFlagLabel = `#${nextFlagNumber} in ${formatTime(remainingMs)}`;
+            }
+
+            displayStr += ` (${intervalLabel} flags, next ${nextFlagLabel})`;
+            flagStats = { completedFlags, totalFlags };
+        }
+    }
+
+    document.getElementById('time-display').textContent = displayStr;
 
     // Update duration in metadata if it's new
     if (vidState.durationMs > 0 && (!state.metadata.durationMs || Math.abs(state.metadata.durationMs - vidState.durationMs) > 2000)) {
@@ -993,15 +1440,23 @@ function updateTimeline(vidState) {
     const pct = vidState.durationMs === 0 ? 0 : (vidState.currentTimeMs / vidState.durationMs) * 100;
 
     document.getElementById('progress-fill').style.width = `${pct}%`;
-    document.getElementById('progress-percentage').textContent = `${Math.round(pct)}%`;
+    const progressEl = document.getElementById('progress-percentage');
+    if (progressEl) {
+        if (flagStats && flagStats.totalFlags > 0) {
+            progressEl.innerHTML = `${Math.round(pct)}% <span class="timeline-flag-count">(${flagStats.completedFlags}/${flagStats.totalFlags})</span>`;
+        } else {
+            progressEl.textContent = `${Math.round(pct)}%`;
+        }
+    }
 }
 
 // ==========================================
 // Action: Screenshot Capture
 // ==========================================
 async function handleCapture() {
+    if (isCapturing) return; // Guard at top
     const tabId = await resolveActiveYouTubeTabId();
-    if (!Number.isInteger(tabId) || isCapturing) return;
+    if (!Number.isInteger(tabId)) return;
 
     const btn = document.getElementById('btn-capture-full');
     const originalText = btn.innerHTML;
@@ -1014,13 +1469,13 @@ async function handleCapture() {
 
     try {
         isCapturing = true;
-        btn.innerHTML = `<span>ðŸ“¸ Capturing...</span>`;
+        btn.innerHTML = `<span>\u{1F4F7} Capturing...</span>`;
         btn.disabled = true;
 
-        // AUTO-OPT-IN: If they click capture but toggle is OFF, just turn it ON
         if (!isNotebookEnabled) {
-            console.log("Sidepanel: Auto-enabling notebook for capture");
-            setNotebookToggleState(true);
+            showToast("Notebook is OFF. Turn it ON to enable capturing.", "warning");
+            resetBtn();
+            return;
         }
 
         // LOCK: Capture the current target video ID and title locally
@@ -1030,7 +1485,7 @@ async function handleCapture() {
         const targetVideoTitle = currentVideoTitle;
 
         if (!targetVideoId || !targetVideoTitle || targetVideoTitle === "Loading...") {
-            alert("Please wait a moment for the YouTube video title to load.\n\nIf it takes too long, try refreshing the YouTube page.");
+            showToast("Wait for the video title to load.", "info");
             resetBtn();
             return;
         }
@@ -1041,7 +1496,7 @@ async function handleCapture() {
         }
 
         if (!FileSystemModule.dirHandle) {
-            alert("Please select a Save Folder (top right icon) before taking screenshots so they can save directly to Windows!");
+            showToast("Please select a Save Folder (top right icon) first.", "warning");
             resetBtn();
             return;
         }
@@ -1054,19 +1509,44 @@ async function handleCapture() {
             return;
         }
 
-        const response = await sendMessageWithRetry(tabId, { action: 'captureScreenshot' }, 5, 500);
+        // If CCs are enabled, we CANNOT use `canvas.drawImage` because it only grabs the raw video pixels.
+        // We MUST force the fallback to `captureVisibleTab` which captures the whole DOM (including CCs).
+        let response = null;
+        let activeCaptionState = false;
+        try {
+            const ccOpt = await chrome.storage.local.get('isCaptionEnabled');
+            activeCaptionState = !!ccOpt.isCaptionEnabled;
+        } catch (e) { activeCaptionState = isCaptionEnabled; }
+
+        if (!activeCaptionState) {
+            response = await sendMessageWithRetry(tabId, { action: 'captureScreenshot', includeCaptions: false }, 5, 500);
+        }
+
         try {
             let finalImageData = null;
             let finalTimeMs = 0;
 
-            // If content script failed (usually due to YouTube cross-origin canvas taint)
+            // If content script failed (usually due to YouTube cross-origin canvas taint) OR if CCs are forced
             if (!response || !response.success) {
-                console.warn("Canvas capture failed or no response, falling back to chrome.tabs.captureVisibleTab", response?.error);
+                // Silence expected fallback warnings to prevent user alarm
+                if (response?.error && !response.error.toLowerCase().includes("blocked") && !response.error.toLowerCase().includes("failed")) {
+                    console.warn("Canvas capture failed, falling back to visible tab:", response.error);
+                }
 
                 // Fallback: Capture the entire visible tab via Chrome API
                 try {
-                    finalImageData = await chrome.tabs.captureVisibleTab(null, { format: 'png', quality: 100 });
-                    console.log("Sidepanel: Capture successful via fallback (captureVisibleTab)");
+                    // CRITICAL: When detached, we must capture the HOST window, not the panel window
+                    const captureWinId = (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) ? launchedForHostWindowId : null;
+
+                    // If caps disabled: hide them before capture, restore after
+                    if (!activeCaptionState) {
+                        await sendMessageWithRetry(tabId, { action: 'hideCaptions' }, 1, 50);
+                    }
+                    finalImageData = await chrome.tabs.captureVisibleTab(captureWinId, { format: 'png', quality: 100 });
+                    if (!activeCaptionState) {
+                        sendMessageWithRetry(tabId, { action: 'showCaptions' }, 1, 50); // fire-and-forget restore
+                    }
+                    console.log("Sidepanel: Capture successful via fallback (captureVisibleTab) for win:", captureWinId);
 
                     // We still need the timestamp, so ask the content script just for the state
                     const stateResp = await new Promise(res => chrome.tabs.sendMessage(tabId, { action: 'getState' }, res));
@@ -1074,7 +1554,7 @@ async function handleCapture() {
 
                 } catch (fallbackErr) {
                     console.error("Sidepanel: Both capture methods failed", fallbackErr);
-                    alert("Both native and fallback capture methods failed.");
+                    showToast("Capture failed. Try refreshing YouTube.", "error");
                     return; // Exit inner try, finally will run
                 }
             } else {
@@ -1088,18 +1568,18 @@ async function handleCapture() {
                 return; // Exit inner try, finally will run
             }
 
-            const blob = dataURLtoBlob(finalImageData);
+            const blob = await dataURLtoBlobAsync(finalImageData);
             const timeF = formatTime(finalTimeMs);
             const safeTimeStr = timeF.replace(/:/g, '-');
             const fileUnique = Date.now().toString().slice(-4);
-            const filename = `Screenshot_${safeTimeStr}_${fileUnique}.png`;
+            const filename = `Screenshot_${safeTimeStr}_${fileUnique}.jpg`;
 
             // Save DIRECTLY to local windows sub-folder using the LOCKED target title
             const subFolder = await FileSystemModule.getVideoFolderHandle(targetVideoTitle, true, targetVideoId);
 
             if (!subFolder) {
                 if (!showFolderPermissionBannerIfNeeded()) {
-                    alert("Could not create or access a sub-folder for this video. Please check your folder permissions.");
+                    showToast("Could not access sub-folder. Check permissions.", "error");
                 }
                 return; // Exit inner try, finally will run
             }
@@ -1111,18 +1591,25 @@ async function handleCapture() {
                 // Only add to UI if we successfully saved to Disk (source of truth)
                 addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename);
             } else {
-                showFolderPermissionBannerIfNeeded();
+                // If save failed but didn't throw (retries exhausted or permission lost)
+                if (FileSystemModule.permissionNeedsUserGesture) {
+                    showFolderPermissionBannerIfNeeded();
+                } else if (!FileSystemModule.dirHandle) {
+                    showToast("Save folder missing or moved. Please re-select.", "error");
+                } else {
+                    showToast("Failed to save. Disk might be full or locked.", "error");
+                }
             }
 
         } catch (innerErr) {
             console.error("Capture Logic Error:", innerErr);
-            alert("An error occurred while saving the screenshot.");
+            showToast("An error occurred while saving.", "error");
         } finally {
             resetBtn();
         }
     } catch (err) {
         console.error("Capture Error:", err);
-        alert("An error occurred starting the capture process.");
+        await showAlert("An error occurred starting the capture process.");
         resetBtn();
     }
 }
@@ -1143,7 +1630,7 @@ async function handleAddLocalImage(e) {
             await FileSystemModule.setup();
         }
         if (!FileSystemModule.dirHandle) {
-            alert("Please select a Save Folder (top right icon) first!");
+            await showAlert("Please select a Save Folder (top right icon) first!");
             inputElement.value = '';
             return;
         }
@@ -1152,7 +1639,7 @@ async function handleAddLocalImage(e) {
         const targetVideoTitle = currentVideoTitle;
 
         if (!targetVideoId || !targetVideoTitle) {
-            alert("Please wait for the video to load before adding images.");
+            await showAlert("Please wait for the video to load before adding images.");
             inputElement.value = '';
             return;
         }
@@ -1185,7 +1672,7 @@ async function handleAddLocalImage(e) {
         const subFolder = await FileSystemModule.getVideoFolderHandle(targetVideoTitle, true, targetVideoId);
         if (!subFolder) {
             if (!showFolderPermissionBannerIfNeeded()) {
-                alert("Could not access video folder.");
+                await showAlert("Could not access video folder.");
             }
             inputElement.value = '';
             return;
@@ -1219,20 +1706,20 @@ async function handleAddLocalImage(e) {
 
     } catch (err) {
         console.error("handleAddLocalImage failed:", err);
-        alert("Failed to add image: " + err.message);
+        await showAlert("Failed to add image: " + err.message);
     } finally {
         inputElement.value = '';
     }
 }
 
 
-function dataURLtoBlob(dataurl) {
-    let arr = dataurl.split(','), mime = arr[0].match(/:(.*?);/)[1],
-        bstr = atob(arr[1]), n = bstr.length, u8arr = new Uint8Array(n);
-    while (n--) {
-        u8arr[n] = bstr.charCodeAt(n);
-    }
-    return new Blob([u8arr], { type: mime });
+/**
+ * Modern, non-blocking Data URL to Blob conversion using browser native fetch.
+ * This is 10x faster than legacy atob loops and doesn't "hang" the UI thread.
+ */
+async function dataURLtoBlobAsync(dataurl) {
+    const res = await fetch(dataurl);
+    return await res.blob();
 }
 
 // ==========================================
@@ -1279,20 +1766,23 @@ function renderMainGallery() {
         return;
     }
 
+    const fragment = document.createDocumentFragment();
     let shotCounter = 1;
     items.forEach(item => {
         if (item.type === 'screenshot') {
             const card = createScreenshotCard(item.ref, shotCounter++);
-            list.appendChild(card);
+            fragment.appendChild(card);
         } else {
             const tocElement = createTOCGalleryElement(item.ref);
-            list.appendChild(tocElement);
+            fragment.appendChild(tocElement);
         }
     });
+    list.appendChild(fragment);
 }
 
 function createTOCGalleryElement(entry) {
     const level = normalizeTOCLevel(entry.level);
+    entry.level = level;
     const item = document.createElement('div');
     item.className = `toc-gallery-item toc-gallery-${level.toLowerCase()}`;
     item.id = entry.id;
@@ -1301,6 +1791,11 @@ function createTOCGalleryElement(entry) {
         <div class="toc-content">
             <div class="toc-header">
                 <span class="toc-level-chip">${level}</span>
+                <select class="toc-level-select hidden" title="Heading Level">
+                    <option value="H1" ${level === 'H1' ? 'selected' : ''}>H1</option>
+                    <option value="H2" ${level === 'H2' ? 'selected' : ''}>H2</option>
+                    <option value="H3" ${level === 'H3' ? 'selected' : ''}>H3</option>
+                </select>
                 <span class="toc-tag">MARKER</span>
                 <span class="toc-time-btn" title="Seek to this moment">${entry.timeFormatted}</span>
                 <div class="toc-spacer"></div>
@@ -1311,6 +1806,17 @@ function createTOCGalleryElement(entry) {
                             <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"></path>
                         </svg>
                     </button>
+                    <button class="toc-action-btn toc-save-btn hidden" title="Save Marker">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg>
+                    </button>
+                    <button class="toc-action-btn toc-cancel-btn hidden" title="Cancel Edit">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
                     <button class="toc-action-btn toc-delete-btn" title="Delete Marker">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polyline points="3 6 5 6 21 6"></polyline>
@@ -1319,7 +1825,7 @@ function createTOCGalleryElement(entry) {
                     </button>
                 </div>
             </div>
-            <div class="toc-title" contenteditable="true">${entry.title}</div>
+            <div class="toc-title" contenteditable="false" spellcheck="false">${entry.title}</div>
         </div>
     `;
 
@@ -1328,26 +1834,111 @@ function createTOCGalleryElement(entry) {
     });
 
     const titleEdit = item.querySelector('.toc-title');
-    titleEdit.addEventListener('input', () => {
-        entry.title = titleEdit.innerText;
-        saveVideoState(currentVideoId);
-        renderTOCList();
-    });
+    const levelChip = item.querySelector('.toc-level-chip');
+    const levelSelect = item.querySelector('.toc-level-select');
+    const editBtn = item.querySelector('.toc-edit-btn');
+    const saveBtn = item.querySelector('.toc-save-btn');
+    const cancelBtn = item.querySelector('.toc-cancel-btn');
 
-    item.querySelector('.toc-edit-btn').addEventListener('click', (e) => {
-        e.stopPropagation();
-        titleEdit.focus();
+    let isEditing = false;
+    let originalTitle = entry.title;
+    let originalLevel = level;
+
+    const placeCaretAtEnd = (el) => {
         const range = document.createRange();
-        range.selectNodeContents(titleEdit);
+        range.selectNodeContents(el);
         range.collapse(false);
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
+    };
+
+    const applyLevelVisual = (nextLevel) => {
+        const normalized = normalizeTOCLevel(nextLevel);
+        entry.level = normalized;
+        item.className = `toc-gallery-item toc-gallery-${normalized.toLowerCase()}${isEditing ? ' is-editing' : ''}`;
+        levelChip.textContent = normalized;
+        levelSelect.value = normalized;
+    };
+
+    const setEditMode = (enabled) => {
+        isEditing = enabled;
+        item.classList.toggle('is-editing', enabled);
+        titleEdit.contentEditable = enabled ? 'true' : 'false';
+        levelChip.classList.toggle('hidden', enabled);
+        levelSelect.classList.toggle('hidden', !enabled);
+        editBtn.classList.toggle('hidden', enabled);
+        saveBtn.classList.toggle('hidden', !enabled);
+        cancelBtn.classList.toggle('hidden', !enabled);
+        if (enabled) {
+            titleEdit.focus();
+            placeCaretAtEnd(titleEdit);
+        }
+    };
+
+    const saveEdit = () => {
+        const nextTitle = String(titleEdit.innerText || '').trim();
+        if (!nextTitle) {
+            showToast("Marker title cannot be empty.", "warning");
+            titleEdit.focus();
+            return;
+        }
+
+        entry.title = nextTitle;
+        applyLevelVisual(levelSelect.value);
+        setEditMode(false);
+        renderMainGallery();
+        renderTOCList();
+        saveVideoState(currentVideoId);
+    };
+
+    const cancelEdit = () => {
+        titleEdit.innerText = originalTitle;
+        applyLevelVisual(originalLevel);
+        setEditMode(false);
+    };
+
+    editBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        originalTitle = entry.title;
+        originalLevel = normalizeTOCLevel(entry.level);
+        titleEdit.innerText = originalTitle;
+        levelSelect.value = originalLevel;
+        setEditMode(true);
     });
 
-    item.querySelector('.toc-delete-btn').addEventListener('click', (e) => {
+    saveBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (confirm("Delete this marker?")) {
+        saveEdit();
+    });
+
+    cancelBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        cancelEdit();
+    });
+
+    titleEdit.addEventListener('keydown', (e) => {
+        if (!isEditing) {
+            e.preventDefault();
+            return;
+        }
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            saveEdit();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelEdit();
+        }
+    });
+
+    levelSelect.addEventListener('change', () => {
+        if (!isEditing) return;
+        applyLevelVisual(levelSelect.value);
+    });
+
+    item.querySelector('.toc-delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (await showConfirm("Delete this marker?")) {
             state.toc = state.toc.filter(t => t.id !== entry.id);
             renderMainGallery();
             renderTOCList();
@@ -1355,7 +1946,56 @@ function createTOCGalleryElement(entry) {
         }
     });
 
+    applyLevelVisual(entry.level);
     return item;
+}
+
+// The inline note highlighter uses #FFF36A; browsers serialize this differently
+// (e.g. #fff36a, rgb(255, 243, 106), background shorthand). We normalize it.
+const NOTE_HIGHLIGHT_STYLE_RE = /#fff36a|#ffff00|rgba?\(\s*255\s*,\s*243\s*,\s*106(?:\s*,\s*1(?:\.0+)?)?\s*\)|rgba?\(\s*255\s*,\s*255\s*,\s*0(?:\s*,\s*1(?:\.0+)?)?\s*\)|\byellow\b/i;
+
+function hasNoteHighlightStyle(styleText) {
+    return NOTE_HIGHLIGHT_STYLE_RE.test(String(styleText || ''));
+}
+
+function syncNoteHighlightNodes(editorEl) {
+    if (!editorEl) return;
+
+    editorEl.querySelectorAll('[style], [data-note-highlight]').forEach((node) => {
+        if (!(node instanceof HTMLElement)) return;
+        const styleText = node.getAttribute('style') || '';
+        if (hasNoteHighlightStyle(styleText)) {
+            node.setAttribute('data-note-highlight', '1');
+        } else {
+            node.removeAttribute('data-note-highlight');
+        }
+    });
+}
+
+function applyNoteToolbarCommand(editorEl, cmd, value) {
+    if (!editorEl || !cmd) return;
+    editorEl.focus();
+
+    // `backColor` is inconsistent in contenteditable (especially dark UI).
+    // Prefer `hiliteColor` then normalize selected highlight nodes.
+    if (cmd === 'backColor') {
+        const highlightColor = value || '#FFF36A';
+        try { document.execCommand('styleWithCSS', false, true); } catch (_) { }
+
+        let applied = false;
+        try { applied = document.execCommand('hiliteColor', false, highlightColor); } catch (_) { }
+        if (!applied) {
+            try { document.execCommand('backColor', false, highlightColor); } catch (_) { }
+        }
+
+        syncNoteHighlightNodes(editorEl);
+        return;
+    }
+
+    document.execCommand(cmd, false, value || null);
+    if (cmd === 'removeFormat') {
+        syncNoteHighlightNodes(editorEl);
+    }
 }
 
 function createScreenshotCard(shot, index) {
@@ -1363,43 +2003,74 @@ function createScreenshotCard(shot, index) {
     if (shot.noteHtml !== noteHtml) {
         shot.noteHtml = noteHtml;
     }
+    const imageSrc = shot.dataUrl || (shot.missingOnDisk ? MISSING_SCREENSHOT_PLACEHOLDER_DATA_URL : TRANSPARENT_PIXEL_DATA_URL);
+    const imageAlt = shot.missingOnDisk
+        ? `Missing screenshot file for ${shot.timeFormatted || 'unknown time'}`
+        : `Screenshot at ${shot.timeFormatted}`;
     const hasNote = noteHtml && noteHtml.trim().replace(/<[^>]*>/g, '').trim().length > 0;
     const card = document.createElement('div');
     card.className = 'screenshot-card';
     card.id = shot.id;
     card.innerHTML = `
         <div class="card-img-container">
-            <img src="${shot.dataUrl}" class="card-img" alt="Screenshot at ${shot.timeFormatted}" />
+            <img src="${imageSrc}" class="card-img" alt="${imageAlt}" />
         </div>
         <div class="card-controls-bar">
             <div class="card-info">
-                <span class="card-time">&#9201; ${shot.timeFormatted}</span>
+                <span class="card-time"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg> ${shot.timeFormatted}</span>
                 <span class="card-divider">|</span>
                 <span class="card-index">#${index}</span>
             </div>
             <div class="card-actions">
-                <button class="card-action-btn notes-toggle-btn ${hasNote ? 'active' : ''}" title="Toggle Notes (ðŸ“)">&#128221;</button>
-                <button class="card-action-btn expand-btn" title="View in Full Editor (â¤¢)">&#10562;</button>
-                <button class="card-action-btn edit-btn" title="Edit Screenshot (âœï¸)">&#9998;</button>
-                <button class="card-action-btn toc-add-btn" title="Open TOC Dialog for this screenshot">&#128209;</button>
-                <button class="card-action-btn seek-btn" title="Seek to Timestamp">&#9654;</button>
-                <button class="card-action-btn open-btn" title="Download Image (â¬‡ï¸)">&#11118;</button>
-                <button class="card-action-btn delete-btn" title="Delete Screenshot (ðŸ—‘ï¸)">&#128465;</button>
+                <button class="card-action-btn notes-toggle-btn ${hasNote ? 'active' : ''}" title="Toggle Notes">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
+                </button>
+                <button class="card-action-btn add-cc-btn" title="Add Transcript to Notes">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                </button>
+                <button class="card-action-btn expand-btn" title="View in Full Editor">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
+                </button>
+                <button class="card-action-btn edit-btn" title="Edit Screenshot">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+                </button>
+                <button class="card-action-btn toc-add-btn" title="Bookmark this moment">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                </button>
+                <button class="card-action-btn seek-btn" title="Seek to Timestamp">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                </button>
+                <button class="card-action-btn open-btn" title="Download Image">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                </button>
+                <button class="card-action-btn delete-btn" title="Delete Screenshot">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                </button>
             </div>
         </div>
         <div class="note-container ${hasNote ? 'visible' : ''}">
             <div class="note-toolbar">
-                <button class="toolbar-btn" data-cmd="bold" title="Bold"><strong>B</strong></button>
-                <button class="toolbar-btn" data-cmd="italic" title="Italic"><em>I</em></button>
-                <button class="toolbar-btn" data-cmd="underline" title="Underline"><u>U</u></button>
-                <button class="toolbar-btn" data-cmd="backColor" data-val="#FFFF00" title="Highlight">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="#FFFF00" stroke="#888" stroke-width="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/></svg>
+                <button class="toolbar-btn" data-cmd="bold" title="Bold">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"></path><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"></path></svg>
+                </button>
+                <button class="toolbar-btn" data-cmd="italic" title="Italic">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="4" x2="10" y2="4"></line><line x1="14" y1="20" x2="5" y2="20"></line><line x1="15" y1="4" x2="9" y2="20"></line></svg>
+                </button>
+                <button class="toolbar-btn" data-cmd="underline" title="Underline">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"></path><line x1="4" y1="21" x2="20" y2="21"></line></svg>
+                </button>
+                <button class="toolbar-btn" data-cmd="backColor" data-val="#FFF36A" title="Highlight">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="#FFF36A" stroke="#888" stroke-width="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/></svg>
                 </button>
                 <button class="toolbar-btn" data-cmd="removeFormat" title="Clear Formatting">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="20" x2="20" y2="20"/><path d="M8.5 14.5L4 19l1.5-4.5"/><path d="M12 3L5.5 17.5"/><path d="M12 3l6.5 14.5"/><path d="M19 9H9"/></svg>
                 </button>
-                <button class="toolbar-btn list-style-btn" data-marker="&#10145;" title="Arrow List">&#10145;</button>
-                <button class="toolbar-btn list-style-btn" data-marker="&#9989;" title="Check List">&#9989;</button>
+                <button class="toolbar-btn list-style-btn" data-marker="→" title="Arrow List">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+                </button>
+                <button class="toolbar-btn list-style-btn" data-marker="✓" title="Check List">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                </button>
             </div>
             <div class="note-editor" contenteditable="true" placeholder="Add notes for this screenshot...">${noteHtml}</div>
         </div>
@@ -1423,12 +2094,13 @@ function createScreenshotCard(shot, index) {
     });
 
     const editor = card.querySelector('.note-editor');
+    syncNoteHighlightNodes(editor);
     card.querySelectorAll('.toolbar-btn:not(.list-style-btn)').forEach(btn => {
         btn.addEventListener('mousedown', (e) => {
             e.preventDefault();
             const cmd = btn.getAttribute('data-cmd');
             const val = btn.getAttribute('data-val');
-            document.execCommand(cmd, false, val || null);
+            applyNoteToolbarCommand(editor, cmd, val);
             editor.focus();
         });
     });
@@ -1439,6 +2111,72 @@ function createScreenshotCard(shot, index) {
             editor.focus();
             document.execCommand('insertText', false, btn.getAttribute('data-marker') + ' ');
         });
+    });
+
+    card.querySelector('.add-cc-btn').addEventListener('click', async (e) => {
+        e.preventDefault();
+        const btn = e.currentTarget;
+        const originalText = btn.innerHTML;
+        btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" class="spin" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
+        btn.disabled = true;
+
+        try {
+            let segments = await getCachedTranscript();
+            if (!segments || segments.length === 0) {
+                segments = await getCachedTranscript(true); // Force fetch
+            }
+
+            if (!segments || segments.length === 0) {
+                showToast("Transcript not available for this video.", "warning");
+                return;
+            }
+
+            // Get range settings from UI
+            const preSec = parseInt(document.getElementById('transcript-before')?.value || '4');
+            const postSec = parseInt(document.getElementById('transcript-after')?.value || '5');
+
+            const startTargetMs = shot.timestampMs - (preSec * 1000);
+            const endTargetMs = shot.timestampMs + (postSec * 1000);
+
+            // Filter segments within the [startTargetMs, endTargetMs] window
+            const rangeSegments = segments.filter(seg => {
+                const segEndMs = seg.timestampMs + (seg.durationMs || 3000); // Assume 3s if duration missing
+                return seg.timestampMs <= endTargetMs && segEndMs >= startTargetMs;
+            });
+
+            if (rangeSegments.length === 0) {
+                showToast("No transcript found for this range.", "warning");
+                return;
+            }
+
+            // Concatenate text
+            const timeLabel = rangeSegments[0].time;
+            const fullText = rangeSegments.map(s => s.text).join(' ');
+
+            const htmlToInsert = `<blockquote>\u{1F4AC} [${timeLabel}] ${fullText}</blockquote><br>`;
+
+            if (document.activeElement === editor) {
+                document.execCommand('insertHTML', false, htmlToInsert);
+            } else {
+                editor.innerHTML += (editor.innerHTML ? '<br>' : '') + htmlToInsert;
+            }
+
+            editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+            const noteContainer = card.querySelector('.note-container');
+            const notesBtn = card.querySelector('.notes-toggle-btn');
+            if (noteContainer && !noteContainer.classList.contains('visible') && notesBtn) {
+                notesBtn.click();
+            }
+            showToast("Transcript added to notes!", "success");
+
+        } catch (err) {
+            console.error("Failed to add transcript:", err);
+            showToast("Failed to get transcript.", "error");
+        } finally {
+            btn.innerHTML = originalText;
+            btn.disabled = false;
+        }
     });
 
     card.querySelector('.expand-btn').addEventListener('click', () => {
@@ -1461,10 +2199,23 @@ function createScreenshotCard(shot, index) {
         const targetTitle = currentVideoTitle;
         const details = await collectTOCEntryDetails(`Marker @ ${shot.timeFormatted || '00:00'}`, 'H2');
         if (!details) return;
+        let placement = 'bottom';
+        if (state.screenshots.length >= 2) {
+            const pickedPlacement = await collectTOCPlacementForScreenshot('bottom');
+            if (!pickedPlacement) return;
+            placement = pickedPlacement;
+        }
+
+        const createdBase = Number(shot.createdAt || Date.now());
+        const createdOffset = placement === 'top' ? -0.1 : 0.1;
+        const anchoredCreatedAt = createdBase + createdOffset;
 
         if (targetId === currentVideoId) {
-            addTOCToUI(details.title, shot.timeFormatted || formatTime(shot.timestampMs || 0), shot.timestampMs || 0, null, details.level);
-            document.querySelector('.tab-btn[data-tab="tab-toc"]').click();
+            addTOCToUI(details.title, shot.timeFormatted || formatTime(shot.timestampMs || 0), shot.timestampMs || 0, anchoredCreatedAt, details.level);
+
+            // Switch to Screenshots tab (where markers are now interleaved)
+            const tabBtn = document.querySelector('.tab-btn[data-tab="tab-screenshots"]');
+            if (tabBtn) tabBtn.click();
         } else {
             const pendingEntry = normalizeTOCRecord({
                 id: `toc-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -1472,7 +2223,7 @@ function createScreenshotCard(shot, index) {
                 timestampMs: shot.timestampMs || 0,
                 title: details.title,
                 level: details.level,
-                createdAt: Date.now()
+                createdAt: anchoredCreatedAt
             });
             state.toc.push(pendingEntry);
             state.toc = sortTOCByCreated(state.toc);
@@ -1491,6 +2242,8 @@ function createScreenshotCard(shot, index) {
     // Debounce timer for note saves
     let noteSaveTimer = null;
     editor.addEventListener('input', () => {
+        syncNoteHighlightNodes(editor);
+
         // Update the ORIGINAL state entry directly via the reference
         shot.noteHtml = editor.innerHTML;
 
@@ -1500,65 +2253,164 @@ function createScreenshotCard(shot, index) {
             stateEntry.noteHtml = editor.innerHTML;
         }
 
-        // Debounce save: wait 500ms after last keystroke before saving to disk
+        // Debounce save: wait for configured delay after last keystroke before saving to disk
         clearTimeout(noteSaveTimer);
         noteSaveTimer = setTimeout(() => {
             saveVideoState(currentVideoId);
-        }, 500);
+        }, TIMEOUT_CONFIG.AUTO_SAVE_DEBOUNCE);
+    });
+
+    editor.addEventListener('keydown', (event) => {
+        handleNoteEditorKeydown(event, editor, shot);
     });
 
     editor.addEventListener('paste', (event) => {
         handleNoteEditorPaste(event, editor, shot);
+        setTimeout(() => syncNoteHighlightNodes(editor), 0);
     });
 
     return card;
 }
 
+function startDownload(downloadOptions) {
+    return chrome.downloads.download(downloadOptions).then((downloadId) => {
+        if (!Number.isInteger(downloadId)) {
+            throw new Error("Download failed: missing download id.");
+        }
+        return downloadId;
+    });
+}
+
+function waitForDownloadCompletion(downloadId, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timeoutId = null;
+
+        const cleanup = () => {
+            if (timeoutId !== null) {
+                clearTimeout(timeoutId);
+                timeoutId = null;
+            }
+            chrome.downloads.onChanged.removeListener(onChanged);
+        };
+
+        const settle = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn(value);
+        };
+
+        const onChanged = (delta) => {
+            if (delta.id !== downloadId || !delta.state || !delta.state.current) return;
+            if (delta.state.current === 'complete') {
+                settle(resolve);
+                return;
+            }
+            if (delta.state.current === 'interrupted') {
+                settle(reject, new Error("Download was interrupted before completion."));
+            }
+        };
+
+        chrome.downloads.onChanged.addListener(onChanged);
+        timeoutId = setTimeout(() => {
+            settle(reject, new Error("Timed out waiting for download to complete."));
+        }, timeoutMs);
+
+        chrome.downloads.search({ id: downloadId }).then((results) => {
+            const entry = Array.isArray(results) ? results[0] : null;
+            if (!entry) {
+                settle(reject, new Error("Download entry not found."));
+                return;
+            }
+            if (entry.state === 'complete') {
+                settle(resolve);
+                return;
+            }
+            if (entry.state === 'interrupted') {
+                settle(reject, new Error("Download was interrupted before completion."));
+            }
+        }).catch((err) => {
+            settle(reject, new Error(err?.message || "Unable to read download status."));
+        });
+    });
+}
+
+function openCompletedDownload(downloadId) {
+    return chrome.downloads.open(downloadId);
+}
+
 // Open the screenshot in the system's default image viewer (Windows Photo Viewer, etc.)
 async function openScreenshotInSystemViewer(shotId) {
     const shot = state.screenshots.find(s => s.id === shotId);
-    if (!shot || !shot.dataUrl) return;
+    if (!shot) return;
+    if (shot.missingOnDisk) {
+        showToast("Screenshot file is missing from your Save Folder.", "warning");
+        return;
+    }
+    if (!shot.dataUrl) return;
 
+    let tempBlobUrl = null;
     try {
-        // We use the Downloads API to "open" the file.
-        // Chrome downloads it (to memory/temp) and then we call 'open'.
-        // This is the only way for an extension to launch a system app for a specific file.
+        // Use Downloads API: write a temp file, wait until complete, then open in system app.
         const blob = await (await fetch(shot.dataUrl)).blob();
-        const url = URL.createObjectURL(blob);
+        tempBlobUrl = URL.createObjectURL(blob);
 
-        const timestamp = new Date().getTime();
+        const timestamp = Date.now();
         const filename = `screenshot_${shotId}_${timestamp}.png`;
-
-        chrome.downloads.download({
-            url: url,
-            filename: filename,
+        const downloadId = await startDownload({
+            url: tempBlobUrl,
+            filename,
             saveAs: false,
             conflictAction: 'overwrite'
-        }, (downloadId) => {
-            if (chrome.runtime.lastError) {
-                console.error("Download failed:", chrome.runtime.lastError);
-                return;
-            }
-            // Once downloaded, open it
-            chrome.downloads.open(downloadId);
-
-            // Cleanup the blob URL after a delay
-            setTimeout(() => URL.revokeObjectURL(url), 10000);
         });
+
+        await waitForDownloadCompletion(downloadId);
+        await openCompletedDownload(downloadId);
     } catch (err) {
         console.error("Failed to open system viewer:", err);
+        showToast("Could not open screenshot. Please try again.", "error");
+    } finally {
+        if (tempBlobUrl) {
+            setTimeout(() => URL.revokeObjectURL(tempBlobUrl), TIMEOUT_CONFIG.BLOB_REVOKE_DELAY);
+        }
     }
 }
 
 // â”€â”€ Internal Image Editor (Opens in a New Window) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-function openScreenshotEditor(shotId) {
+async function openScreenshotEditor(shotId) {
     const shot = state.screenshots.find(s => s.id === shotId);
-    if (!shot || !shot.dataUrl) return;
+    if (!shot) return;
+    if (shot.missingOnDisk) {
+        showToast("Screenshot file is missing from your Save Folder.", "warning");
+        return;
+    }
+    if (!shot.dataUrl) return;
+
+    let finalDataUrl = shot.dataUrl;
+
+    // If it's a blob url (from rehydration), we MUST convert it to base64 dataUrl 
+    // before passing to a different window, as Blob URLs don't survive cross-window storage boundary.
+    if (finalDataUrl.startsWith('blob:')) {
+        try {
+            const blobResp = await fetch(finalDataUrl);
+            const blob = await blobResp.blob();
+            finalDataUrl = await new Promise((res, rej) => {
+                const reader = new FileReader();
+                reader.onloadend = () => res(reader.result);
+                reader.onerror = rej;
+                reader.readAsDataURL(blob);
+            });
+        } catch (e) {
+            console.error("Failed to convert blob to dataUrl for editor", e);
+            return;
+        }
+    }
 
     // Prepare state for the editor window
     const editState = {
         id: shot.id,
-        dataUrl: shot.dataUrl,
+        dataUrl: finalDataUrl,
         timeFormatted: shot.timeFormatted
     };
 
@@ -1587,13 +2439,13 @@ function openScreenshotEditor(shotId) {
  */
 async function handleCreateBoard() {
     if (!currentVideoId) {
-        alert("Please connect to a video first.");
+        await showAlert("Please connect to a video first.");
         return;
     }
 
     const choices = [
-        { label: 'Whiteboard (Bright)', value: 'white', icon: 'â¬œ' },
-        { label: 'Blackboard (Dark)', value: 'black', icon: 'â¬›' }
+        { label: 'Whiteboard (Bright)', value: 'white', icon: '\u2B1C' },
+        { label: 'Blackboard (Dark)', value: 'black', icon: '\u2B1B' }
     ];
 
     const type = await showPrompt('Select board color:', 'white', choices);
@@ -1607,8 +2459,14 @@ async function handleCreateBoard() {
     ctx.fillStyle = color;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    const dataUrl = canvas.toDataURL('image/png');
-    const blob = dataURLtoBlob(dataUrl);
+    let dataUrl = "";
+    try {
+        dataUrl = canvas.toDataURL('image/png');
+    } catch (e) {
+        console.error("Board canvas extraction failed:", e);
+        dataUrl = TRANSPARENT_PIXEL_DATA_URL; // Fallback
+    }
+    const blob = await dataURLtoBlobAsync(dataUrl);
 
     // Get current time from content script
     let timeMs = 0;
@@ -1645,7 +2503,7 @@ async function handleCreateBoard() {
     addScreenshotToUI(dataUrl, timeStr, timeMs, fileName, `<i>[${boardTitle} Board]</i>`, false, id);
 
     // Auto-open editor
-    setTimeout(() => openScreenshotEditor(id), 500);
+    setTimeout(() => openScreenshotEditor(id), TIMEOUT_CONFIG.EDITOR_OPEN_DELAY);
 }
 
 let lastAutoSaveTime = 0;
@@ -1665,15 +2523,27 @@ function normalizeScreenshotRecord(shot, index = 0) {
 }
 
 // Add screenshot to the UI list and local state
-function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml = "", isRestoring = false, existingId = null, existingCreatedAt = null) {
+async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml = "", isRestoring = false, existingId = null, existingCreatedAt = null) {
     const shotId = existingId || `shot-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+    let finalDataUrl = dataUrl;
+    // If we just captured a massive base64 image, convert it to a Blob URL for memory efficiency 
+    // so the side panel doesn't balloon in RAM over time.
+    if (dataUrl && dataUrl.startsWith('data:')) {
+        try {
+            const blob = await dataURLtoBlobAsync(dataUrl);
+            finalDataUrl = URL.createObjectURL(blob);
+            // Fix #11: Track for revocation
+            state.blobUrls.add(finalDataUrl);
+        } catch (e) { console.warn("Blob URL memory optimization failed", e); }
+    }
 
     const item = {
         id: shotId,
         timestampMs: timeMs,
         timeFormatted: timeStr,
         filename: filename,
-        dataUrl: dataUrl,
+        dataUrl: finalDataUrl,
         noteHtml: getScreenshotNoteHtml({ noteHtml: initialNoteHtml }),
         createdAt: existingCreatedAt || Date.now()
     };
@@ -1688,7 +2558,7 @@ function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml =
         setTimeout(() => {
             const card = document.getElementById(shotId);
             if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }, 100);
+        }, TIMEOUT_CONFIG.METADATA_CHECK_DELAY);
         saveVideoState(currentVideoId);
     }
 }
@@ -1757,97 +2627,242 @@ function sortTOCByCreated(entries) {
 }
 
 async function promptTOCLevel(defaultLevel = 'H2') {
-    const choices = ['H1', 'H2', 'H3'];
+    const choices = [
+        {
+            value: 'H1',
+            label: 'H1 Main Heading',
+            icon: '<span style="font-weight:800;font-size:13px;">H1</span>',
+            description: 'Largest title style for major chapter markers.'
+        },
+        {
+            value: 'H2',
+            label: 'H2 Section Heading',
+            icon: '<span style="font-weight:760;font-size:12px;">H2</span>',
+            description: 'Balanced section style for normal marker headings.'
+        },
+        {
+            value: 'H3',
+            label: 'H3 Sub Heading',
+            icon: '<span style="font-weight:700;font-size:11px;">H3</span>',
+            description: 'Compact style for fine-grained points.'
+        }
+    ];
     const picked = await showPrompt("Select TOC level:", normalizeTOCLevel(defaultLevel), choices);
     if (!picked) return null;
     return normalizeTOCLevel(picked);
 }
 
-// â”€â”€ Big Note Editor Overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â”€â”€ Big Note Editor Overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function openBigNoteEditor(shotId, inlineEditor) {
-    const overlay = document.createElement('div');
-    overlay.className = 'big-editor-overlay';
-    overlay.innerHTML = `
-        <div class="big-editor-dialog">
-            <div class="big-editor-header">
-                <span>&#9998; Edit Note</span>
-                <button class="big-editor-close" title="Close">&#10005;</button>
-            </div>
-            <div class="big-editor-toolbar">
-                <button data-cmd="bold" title="Bold"><strong>B</strong></button>
-                <button data-cmd="italic" title="Italic"><em>I</em></button>
-                <button data-cmd="underline" title="Underline"><u>U</u></button>
-                <button data-cmd="backColor" data-val="#FFFF00" title="Highlight">&#9999;</button>
-                <button data-cmd="insertUnorderedList" title="Bullet List">&#8226; List</button>
-                <button data-cmd="removeFormat" title="Clear Format">Clear</button>
-            </div>
-            <div class="big-editor-content" contenteditable="true"></div>
-            <div class="big-editor-footer">
-                <button class="big-editor-cancel">Cancel</button>
-                <button class="big-editor-save">&#10003; Save</button>
-            </div>
-        </div>
-    `;
-    document.body.appendChild(overlay);
-
-    const bigEditor = overlay.querySelector('.big-editor-content');
-    bigEditor.innerHTML = inlineEditor.innerHTML;
-
-    overlay.querySelectorAll('.big-editor-toolbar button').forEach(btn => {
-        btn.addEventListener('mousedown', (e) => {
-            e.preventDefault();
-            const cmd = btn.getAttribute('data-cmd');
-            const val = btn.getAttribute('data-val');
-            document.execCommand(cmd, false, val || null);
-            bigEditor.focus();
-        });
+    chrome.runtime.sendMessage({
+        action: 'openBigEditor',
+        tabId: currentTabId,
+        shotId: shotId,
+        videoId: currentVideoId,
+        videoTitle: currentVideoTitle,
+        html: inlineEditor.innerHTML
     });
-
-    bigEditor.focus();
-
-    overlay.querySelector('.big-editor-close').addEventListener('click', () => overlay.remove());
-    overlay.querySelector('.big-editor-cancel').addEventListener('click', () => overlay.remove());
-    overlay.querySelector('.big-editor-save').addEventListener('click', () => {
-        inlineEditor.innerHTML = bigEditor.innerHTML;
-        inlineEditor.dispatchEvent(new Event('input', { bubbles: true }));
-        // Ensure note container is visible
-        const noteContainer = inlineEditor.closest('.note-container');
-        if (noteContainer) noteContainer.classList.add('visible');
-        const notesBtn = inlineEditor.closest('.screenshot-card')?.querySelector('.notes-toggle-btn');
-        if (notesBtn) notesBtn.classList.add('active');
-        overlay.remove();
-    });
-
-    // Close on overlay click
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 }
 
 
-async function deleteScreenshot(shotId) {
-    if (!confirm("Are you sure you want to delete this screenshot and its nodes?")) return;
+function revokeScreenshotBlobUrlIfNeeded(shot) {
+    if (!shot || !shot.dataUrl) return;
+    if (typeof shot.dataUrl !== 'string') return;
+    if (!shot.dataUrl.startsWith('blob:')) return;
+    try {
+        URL.revokeObjectURL(shot.dataUrl);
+    } catch (_) { }
+    state.blobUrls.delete(shot.dataUrl);
+}
 
-    const idx = state.screenshots.findIndex(s => s.id === shotId);
-    if (idx !== -1) {
-        state.screenshots.splice(idx, 1);
-        const cardEl = document.getElementById(shotId);
-        if (cardEl) cardEl.remove();
-
-        // If list is empty, restore empty state
-        if (state.screenshots.length === 0) {
-            const list = document.getElementById('screenshots-list');
-            const svgIcon = `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>`;
-            list.innerHTML = `<div class="empty-state">${svgIcon}<p>No screenshots taken yet.</p></div>`;
-        } else {
-            // Re-index remaining screenshots in chronological order
-            const cards = Array.from(document.querySelectorAll('.screenshot-card'));
-            cards.forEach((card, i) => {
-                const indexSpan = card.querySelector('.meta-index');
-                if (indexSpan) indexSpan.textContent = `#${i + 1}`;
-            });
-        }
-
-        await saveVideoState(currentVideoId);
+async function deleteScreenshotFilesFromCurrentVideo(shotsToDelete) {
+    const sourceShots = Array.isArray(shotsToDelete) ? shotsToDelete : [];
+    if (sourceShots.length === 0) {
+        return {
+            blocked: false,
+            reason: null,
+            removableIds: [],
+            deletedCount: 0,
+            missingCount: 0,
+            failedCount: 0
+        };
     }
+
+    const removableIds = [];
+    let deletedCount = 0;
+    let missingCount = 0;
+    let failedCount = 0;
+
+    const shotsWithFile = sourceShots.filter((shot) => {
+        const filename = String(shot?.filename || '').trim();
+        return filename.length > 0;
+    });
+
+    // In-memory-only screenshots can still be removed from UI/state.
+    sourceShots.forEach((shot) => {
+        const filename = String(shot?.filename || '').trim();
+        if (!filename && shot?.id) removableIds.push(shot.id);
+    });
+
+    if (shotsWithFile.length === 0) {
+        return {
+            blocked: false,
+            reason: null,
+            removableIds,
+            deletedCount,
+            missingCount,
+            failedCount
+        };
+    }
+
+    if (!FileSystemModule.dirHandle) {
+        return {
+            blocked: true,
+            reason: 'no_root_handle',
+            removableIds,
+            deletedCount,
+            missingCount,
+            failedCount: shotsWithFile.length
+        };
+    }
+
+    const hasPerm = await FileSystemModule.verifyPermission(FileSystemModule.dirHandle, true, false);
+    if (!hasPerm) {
+        return {
+            blocked: true,
+            reason: 'permission',
+            removableIds,
+            deletedCount,
+            missingCount,
+            failedCount: shotsWithFile.length
+        };
+    }
+
+    const targetVideoId = currentVideoId || state.metadata?.videoId || null;
+    const targetVideoTitle = currentVideoTitle || state.metadata?.videoTitle || null;
+    const subFolder = await FileSystemModule.getVideoFolderHandle(targetVideoTitle, false, targetVideoId);
+
+    // If folder no longer exists, those files are already gone on disk.
+    if (!subFolder) {
+        shotsWithFile.forEach((shot) => {
+            if (shot?.id) removableIds.push(shot.id);
+        });
+        return {
+            blocked: false,
+            reason: null,
+            removableIds,
+            deletedCount,
+            missingCount: shotsWithFile.length,
+            failedCount
+        };
+    }
+
+    for (const shot of shotsWithFile) {
+        const filename = String(shot?.filename || '').trim();
+        if (!filename || !shot?.id) continue;
+        try {
+            await subFolder.removeEntry(filename);
+            removableIds.push(shot.id);
+            deletedCount++;
+        } catch (err) {
+            if (isMissingFileSystemEntryError(err)) {
+                removableIds.push(shot.id);
+                missingCount++;
+                continue;
+            }
+            if (isPermissionDeniedFileSystemError(err)) {
+                return {
+                    blocked: true,
+                    reason: 'permission',
+                    removableIds,
+                    deletedCount,
+                    missingCount,
+                    failedCount: shotsWithFile.length - deletedCount - missingCount
+                };
+            }
+            failedCount++;
+            console.warn(`Failed to remove screenshot file "${filename}" from disk:`, err);
+        }
+    }
+
+    return {
+        blocked: false,
+        reason: null,
+        removableIds,
+        deletedCount,
+        missingCount,
+        failedCount
+    };
+}
+
+async function deleteScreenshot(shotId) {
+    if (!await showConfirm("Delete this screenshot and its notes?")) return;
+
+    const shot = state.screenshots.find(s => s.id === shotId);
+    if (!shot) return;
+
+    const diskResult = await deleteScreenshotFilesFromCurrentVideo([shot]);
+    if (diskResult.blocked) {
+        if (diskResult.reason === 'permission' || diskResult.reason === 'no_root_handle') {
+            showFolderPermissionBannerIfNeeded();
+        }
+        showToast("Could not delete screenshot from local folder. Reconnect folder and try again.", "warning");
+        return;
+    }
+
+    if (diskResult.failedCount > 0) {
+        showToast("Could not delete screenshot file from disk.", "error");
+        return;
+    }
+
+    state.screenshots = state.screenshots.filter(s => s.id !== shotId);
+    revokeScreenshotBlobUrlIfNeeded(shot);
+    renderMainGallery();
+    await saveVideoState(currentVideoId, currentVideoTitle);
+}
+
+async function handleDeleteAllScreenshotsForCurrentVideo() {
+    const totalShots = state.screenshots.length;
+    if (totalShots === 0) {
+        showToast("No screenshots to delete for this video.", "info");
+        return;
+    }
+
+    if (!await showConfirm(`Delete ALL ${totalShots} screenshots for this video?\nThis removes local image files and clears the screenshot panel for this video only.`)) {
+        return;
+    }
+
+    const shotsSnapshot = [...state.screenshots];
+    const byId = new Map(shotsSnapshot.map((shot) => [shot.id, shot]));
+    const diskResult = await deleteScreenshotFilesFromCurrentVideo(shotsSnapshot);
+
+    if (diskResult.blocked) {
+        if (diskResult.reason === 'permission' || diskResult.reason === 'no_root_handle') {
+            showFolderPermissionBannerIfNeeded();
+        }
+        showToast("Could not access local folder to delete screenshots.", "warning");
+        return;
+    }
+
+    const removableSet = new Set(diskResult.removableIds);
+    if (removableSet.size === 0 && diskResult.failedCount > 0) {
+        showToast("Delete failed. Some local files could not be removed.", "error");
+        return;
+    }
+
+    state.screenshots = state.screenshots.filter((shot) => !removableSet.has(shot.id));
+    removableSet.forEach((id) => revokeScreenshotBlobUrlIfNeeded(byId.get(id)));
+
+    renderMainGallery();
+    await saveVideoState(currentVideoId, currentVideoTitle);
+
+    const removedCount = removableSet.size;
+    if (diskResult.failedCount > 0) {
+        showToast(`Deleted ${removedCount} screenshot(s); ${diskResult.failedCount} could not be removed from disk.`, "warning");
+        return;
+    }
+
+    showToast(`Deleted ${removedCount} screenshot(s) for this video.`, "success");
 }
 
 // ==========================================
@@ -1946,7 +2961,11 @@ async function writeHistoryIndexEntries(entries) {
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const saved = await FileSystemModule.saveFile(HISTORY_INDEX_FILENAME, blob);
     if (!saved) {
-        showFolderPermissionBannerIfNeeded();
+        if (FileSystemModule.permissionNeedsUserGesture) {
+            showFolderPermissionBannerIfNeeded();
+        } else if (FileSystemModule.dirHandle) {
+            showToast("Failed to update history index. Disk issues?", "error");
+        }
     }
     return saved;
 }
@@ -1964,7 +2983,10 @@ async function upsertHistoryIndexEntry(vState, folderName) {
     } else {
         entries.unshift(nextEntry);
     }
-    await writeHistoryIndexEntries(entries);
+    const saved = await writeHistoryIndexEntries(entries);
+    if (!saved) {
+        console.warn("upsertHistoryIndexEntry: Permission lost or folder missing during save.");
+    }
 }
 
 async function removeHistoryIndexEntry(folderName, videoId = null) {
@@ -1974,7 +2996,10 @@ async function removeHistoryIndexEntry(folderName, videoId = null) {
         if (videoId && entry.videoId === videoId) return false;
         return entry.folderName !== folderName;
     });
-    await writeHistoryIndexEntries(filtered);
+    const saved = await writeHistoryIndexEntries(filtered);
+    if (!saved) {
+        console.warn("removeHistoryIndexEntry: Failed to update index after removal.");
+    }
 }
 
 async function scanFoldersForHistoryEntries() {
@@ -2000,19 +3025,26 @@ function renderHistoryEntry(list, entry) {
     const title = entry.videoTitle || entry.folderName || "Unknown Video";
     const url = entry.videoUrl || "#";
 
+    const thumbUrl = entry.videoId
+        ? `https://i.ytimg.com/vi/${entry.videoId}/mqdefault.jpg`
+        : "";
+
     item.innerHTML = `
-        <div class="history-header">
-            <div class="history-title">${title}</div>
-            <button class="history-delete-btn" title="Delete all data for this video">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-            </button>
-        </div>
-        <div class="history-meta">
-            <div class="history-stats">
-                <span class="stat-tag">${entry.shotCount || 0} shots</span>
-                <span class="stat-tag">${entry.tocCount || 0} markers</span>
+        ${thumbUrl ? `<img class="history-thumb" src="${thumbUrl}" alt="thumb">` : '<div class="history-thumb"></div>'}
+        <div class="history-info">
+            <div class="history-header">
+                <div class="history-title">${title}</div>
+                <button class="history-delete-btn" title="Delete all data for this video">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                </button>
             </div>
-            <div class="history-channel">${entry.channel || 'YouTube'}</div>
+            <div class="history-meta">
+                <div class="history-stats">
+                    <span class="stat-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg> ${entry.shotCount || 0}</span>
+                    <span class="stat-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg> ${entry.tocCount || 0}</span>
+                </div>
+                <div class="history-channel"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg> ${entry.channel || 'YouTube'}</div>
+            </div>
         </div>
     `;
 
@@ -2031,13 +3063,13 @@ function renderHistoryEntry(list, entry) {
 
     item.querySelector('.history-delete-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (!confirm(`CRITICAL: Delete ALL screenshots and notes for "${title}"?\nThis will remove the local folder: ${entry.folderName}`)) {
+        if (!await showConfirm(`Delete ALL screenshots and notes for "${title}"?\nThis will remove the local folder: ${entry.folderName}`)) {
             return;
         }
 
         const success = await FileSystemModule.deleteDirectory(entry.folderName);
         if (!success) {
-            alert("Failed to delete folder. Check permissions.");
+            await showAlert("Failed to delete folder. Check permissions.");
             return;
         }
 
@@ -2058,11 +3090,10 @@ function renderHistoryEntry(list, entry) {
 }
 
 async function refreshHistory() {
-    const list = document.getElementById('history-list');
-    list.innerHTML = '<div class="empty-state"><p>Scanning for history...</p></div>';
+    if (!safeSetInnerHTML('history-list', '<div class="empty-state"><p>Scanning for history...</p></div>')) return;
 
     if (!FileSystemModule.dirHandle) {
-        list.innerHTML = '<div class="empty-state"><p>Select a folder to see history.</p></div>';
+        safeSetInnerHTML('history-list', '<div class="empty-state"><p>Select a folder to see history.</p></div>');
         return;
     }
 
@@ -2086,22 +3117,25 @@ async function refreshHistory() {
         }
 
         if (entries.length === 0) {
-            list.innerHTML = '<div class="empty-state"><p>No recorded notes found in this folder.</p></div>';
+            safeSetInnerHTML('history-list', '<div class="empty-state"><p>No recorded notes found in this folder.</p></div>');
             return;
         }
 
-        list.innerHTML = '';
-        for (const entry of entries) {
-            renderHistoryEntry(list, entry);
-        }
+        const list = document.getElementById('history-list');
+        if (list) {
+            list.innerHTML = '';
+            for (const entry of entries) {
+                renderHistoryEntry(list, entry);
+            }
 
-        if (!list.querySelector('.history-item')) {
-            list.innerHTML = '<div class="empty-state"><p>No valid history files found.</p></div>';
+            if (!list.querySelector('.history-item')) {
+                list.innerHTML = '<div class="empty-state"><p>No valid history files found.</p></div>';
+            }
         }
 
     } catch (err) {
         console.error("History refresh failed:", err);
-        list.innerHTML = '<div class="empty-state"><p>Failed to scan folders.</p></div>';
+        safeSetInnerHTML('history-list', '<div class="empty-state"><p>Failed to scan folders.</p></div>');
     }
 }
 // ==========================================
@@ -2118,16 +3152,36 @@ async function collectTOCEntryDetails(defaultTitle = "Key Moment", defaultLevel 
     return { title: cleanedTitle, level: normalizeTOCLevel(level) };
 }
 
+async function collectTOCPlacementForScreenshot(defaultPlacement = 'bottom') {
+    const choices = [
+        {
+            value: 'bottom',
+            label: 'Below Screenshot',
+            icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14"></path><polyline points="6 13 12 19 18 13"></polyline></svg>',
+            description: 'Add this marker after the screenshot in the gallery flow.'
+        },
+        {
+            value: 'top',
+            label: 'Above Screenshot',
+            icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14"></path><polyline points="6 11 12 5 18 11"></polyline></svg>',
+            description: 'Insert this marker before the screenshot in the gallery flow.'
+        }
+    ];
+
+    const picked = await showPrompt("Place marker above or below this screenshot?", defaultPlacement, choices);
+    if (!picked) return null;
+    return picked === 'top' ? 'top' : 'bottom';
+}
+
 async function handleAddTOC() {
     if (!currentTabId || !currentVideoId) {
         console.warn("Sidepanel: Cannot add TOC, missing tab or video ID");
         return;
     }
 
-    // AUTO-OPT-IN: If toggle is OFF, turn it ON
     if (!isNotebookEnabled) {
-        console.log("Sidepanel: Auto-enabling notebook for TOC entry");
-        setNotebookToggleState(true);
+        showToast("Notebook is OFF. Turn it ON to add markers.", "warning");
+        return;
     }
 
     const targetId = currentVideoId;
@@ -2138,7 +3192,7 @@ async function handleAddTOC() {
 
     if (!response) {
         console.warn("Sidepanel: Failed to get video state for TOC after retries.");
-        alert("Could not read current video time yet. Wait a few seconds for the page to fully load, then try TOC again.");
+        showToast("Could not read video time. Try again in a moment.", "info");
         return;
     }
 
@@ -2153,8 +3207,9 @@ async function handleAddTOC() {
         if (targetId === currentVideoId) {
             addTOCToUI(details.title, timeStr, timeMs, null, details.level);
 
-            // Switch to Timeline tab so user SEES it
-            document.querySelector('.tab-btn[data-tab="tab-toc"]').click();
+            // Switch to Screenshots tab (where markers are now interleaved)
+            const tabBtn = document.querySelector('.tab-btn[data-tab="tab-screenshots"]');
+            if (tabBtn) tabBtn.click();
         } else {
             // Background save if navigated away
             const pendingEntry = normalizeTOCRecord({
@@ -2192,17 +3247,18 @@ function addTOCToUI(title, timeStr, timeMs, existingCreatedAt = null, level = 'H
 }
 
 function renderTOCList() {
-    const list = document.getElementById('toc-list');
-    list.innerHTML = '';
+    console.log("[STABILITY_V3] renderTOCList entry");
+    if (!safeSetInnerHTML('toc-list', '')) return;
 
     if (!Array.isArray(state.toc) || state.toc.length === 0) {
-        list.innerHTML = `<div class="empty-state"><p>No timeline markers added.</p></div>`;
+        safeSetInnerHTML('toc-list', `<div class="empty-state"><p>No timeline markers added.</p></div>`);
         return;
     }
 
-    // NOTEUP behavior: timeline list is ordered by video time.
-    const timelineOrdered = sortTOCByTimeline(state.toc);
-    state.toc = timelineOrdered.map((entry, idx) => normalizeTOCRecord(entry, idx));
+    // NOTEUP behavior: the TOC LIST panel shows entries ordered by video time.
+    // We use a LOCAL sorted copy to avoid mutating state.toc (which must keep
+    // its insertion/createdAt order so renderMainGallery positions markers correctly).
+    const timelineOrdered = sortTOCByTimeline(state.toc).map((entry, idx) => normalizeTOCRecord(entry, idx));
 
     state.toc.forEach(entry => {
         const level = normalizeTOCLevel(entry.level);
@@ -2256,32 +3312,55 @@ function renderTOCList() {
 }
 
 function clearVideoStateUI() {
-    state = {
-        screenshots: [],
-        toc: [],
-        intervalMarkers: [],
-        metadata: {
-            videoId: currentVideoId,
-            videoTitle: currentVideoTitle || "",
-            videoUrl: "", // Will be filled by poll Metadata
-            channel: "",
-            selectedInterval: "None"
+    // Fix #11: Revoke all Blob URLs to free memory
+    state.blobUrls.forEach(url => {
+        try { URL.revokeObjectURL(url); } catch (_) { }
+    });
+    state.blobUrls.clear();
+
+    state.screenshots = [];
+    state.toc = [];
+    state.intervalMarkers = [];
+    state.metadata = {};
+    state.activeIntervalCount = 0;
+
+    // Fix #10: Clear auto-screenshot interval on video change
+    if (autoScreenshotInterval) {
+        clearInterval(autoScreenshotInterval);
+        autoScreenshotInterval = null;
+        const toggle = document.getElementById('toggle-auto-screenshot');
+        if (toggle) toggle.checked = false;
+        const text = document.getElementById('auto-screenshot-text');
+        if (text) {
+            text.textContent = 'Off';
+            text.classList.remove('active');
         }
+    }
+
+    // Fix #17: Clear transcript cache on video change
+    cachedTranscriptSegments = null;
+    state.metadata = {
+        videoId: currentVideoId,
+        videoTitle: currentVideoTitle || "",
+        videoUrl: "", // Will be filled by poll Metadata
+        channel: "",
+        selectedInterval: "None"
     };
     isDataLoadedForId = null; // Reset load tracker
     const timelineMarkers = document.getElementById('timeline-markers');
     if (timelineMarkers) timelineMarkers.innerHTML = '';
+
     const svgIcon = `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>`;
-    document.getElementById('screenshots-list').innerHTML = `<div class="empty-state">${svgIcon}<p>No screenshots taken yet.</p></div>`;
-    document.getElementById('toc-list').innerHTML = `<div class="empty-state"><p>No timeline markers added.</p></div>`;
 
-    // Clear transcript UI to prevent "ghost" data
-    const transcriptList = document.getElementById('transcript-content');
-    if (transcriptList) {
-        transcriptList.innerHTML = `<div class="empty-state"><p>Click "ðŸ“œ Transcript" to load the text for this video.</p></div>`;
-    }
+    // Use helper for safety
+    safeSetInnerHTML('screenshots-list', `<div class="empty-state">${svgIcon}<p>No screenshots taken yet.</p></div>`);
 
-    // setNotebookToggleState(false); // REMOVED: Persistence now global
+    safeSetInnerHTML('toc-list', `<div class="empty-state"><p>No timeline markers added.</p></div>`);
+
+    safeSetInnerHTML('transcript-content', `<div class="empty-state"><p>Click "📜 Transcript" to load the text for this video.</p></div>`);
+
+    // Reset toggle when video changes
+    setNotebookToggleState(false);
 }
 
 // ==========================================
@@ -2311,10 +3390,35 @@ function normalizeInlineStyleForExport(styleText, maxFontPx = 16) {
         'font-style',
         'text-decoration',
         'background-color',
+        'color',
         'text-align',
         'line-height',
         'white-space',
-        'font-size'
+        'font-size',
+        'border',
+        'border-top',
+        'border-bottom',
+        'border-left',
+        'border-right',
+        'border-collapse',
+        'padding',
+        'padding-top',
+        'padding-bottom',
+        'padding-left',
+        'padding-right',
+        'margin',
+        'margin-top',
+        'margin-bottom',
+        'margin-left',
+        'margin-right',
+        'width',
+        'height',
+        'min-width',
+        'min-height',
+        'max-width',
+        'max-height',
+        'display',
+        'vertical-align'
     ]);
 
     const output = [];
@@ -2331,13 +3435,17 @@ function normalizeInlineStyleForExport(styleText, maxFontPx = 16) {
         if (prop === 'font-size') {
             const px = parseFloat(val);
             if (Number.isFinite(px)) {
-                const clamped = Math.max(12, Math.min(maxFontPx, px));
+                // If maxFontPx is explicitly null or large, allow original size
+                const limit = maxFontPx || 500;
+                const clamped = Math.max(10, Math.min(limit, px));
                 output.push(`font-size:${clamped}px`);
             }
             continue;
         }
 
         if (allowedProps.has(prop)) {
+            // Block any URL/resource references that can taint the canvas
+            if (val.toLowerCase().includes('url(')) continue;
             output.push(`${prop}:${val}`);
         }
     }
@@ -2348,7 +3456,7 @@ function normalizeInlineStyleForExport(styleText, maxFontPx = 16) {
 function sanitizeHtmlForEditorAndExport(html, options = {}) {
     if (!html) return "";
 
-    const maxFontPx = Number.isFinite(options.maxFontPx) ? options.maxFontPx : 16;
+    const maxFontPx = ('maxFontPx' in options) ? options.maxFontPx : 16;
     const keepLinks = !!options.keepLinks;
 
     const parser = new DOMParser();
@@ -2361,10 +3469,13 @@ function sanitizeHtmlForEditorAndExport(html, options = {}) {
         'B', 'STRONG', 'I', 'EM', 'U', 'S', 'DEL',
         'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
         'P', 'DIV', 'BR', 'UL', 'OL', 'LI', 'SPAN',
-        'A', 'TABLE', 'THEAD', 'TBODY', 'TR', 'TD', 'TH',
+        'A', 'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TD', 'TH', 'CAPTION', 'COLGROUP', 'COL',
         'PRE', 'CODE', 'BLOCKQUOTE'
     ]);
-    const allowedAttrs = new Set(['style', 'href', 'colspan', 'rowspan', 'target', 'rel']);
+    const allowedAttrs = new Set([
+        'style', 'href', 'colspan', 'rowspan', 'target', 'rel',
+        'width', 'height', 'border', 'cellpadding', 'cellspacing', 'align', 'valign', 'bgcolor', 'color'
+    ]);
 
     root.querySelectorAll('*').forEach((el) => {
         if (!allowedTags.has(el.tagName)) {
@@ -2486,6 +3597,155 @@ function getScreenshotNoteHtml(shot) {
     return "";
 }
 
+function convertMarkdownToHtml(text) {
+    if (!text) return null;
+
+    // Heuristic strictly targeting common markdown symbols, now allowing leading whitespace
+    const hasMarkdown = /^\s*(#{1,6}\s|[-*]\s|\d+\.\s|>|\||```)/m.test(text) || /\*\*(.*?)\*\*/.test(text) || /__(.*?)__/.test(text) || /`(.*?)`/.test(text);
+    if (!hasMarkdown) return null;
+
+    const lines = text.split(/\r?\n/);
+    let inTable = false;
+    let inCodeBlock = false;
+    let inList = false;
+    let htmlOutput = [];
+
+    const formatInline = (str) => {
+        return str
+            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+            .replace(/__(.*?)__/g, '<strong>$1</strong>')
+            .replace(/\*(.*?)\*/g, '<em>$1</em>')
+            .replace(/_(.*?)_/g, '<em>$1</em>')
+            .replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px; font-family:monospace;">$1</code>');
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        let rawLine = lines[i]; // for code blocks
+
+        // 1. Code blocks
+        if (line.startsWith('```')) {
+            if (inList) { htmlOutput.push('</ul>'); inList = false; }
+            if (inTable) { htmlOutput.push('</tbody></table><br/>'); inTable = false; }
+
+            if (inCodeBlock) {
+                htmlOutput.push('</code></pre>');
+                inCodeBlock = false;
+            } else {
+                htmlOutput.push('<br/><pre style="background:#1e1e1e; color:#d4d4d4; padding:10px; border-radius:5px; overflow-x:auto;"><code>');
+                inCodeBlock = true;
+            }
+            continue;
+        }
+
+        if (inCodeBlock) {
+            htmlOutput.push(escapeHtmlForExport(rawLine) + '\n');
+            continue;
+        }
+
+        // 2. Tables
+        const isTableDivider = /^[\|\s\-:]+$/.test(line) && line.includes('-') && line.includes('|');
+        const isTableRow = line.includes('|') && (line.startsWith('|') || line.endsWith('|'));
+
+        if (isTableRow || isTableDivider) {
+            if (inList) { htmlOutput.push('</ul>'); inList = false; }
+
+            let nextLineIsDivider = false;
+            if (!inTable && i + 1 < lines.length) {
+                const nl = lines[i + 1].trim();
+                nextLineIsDivider = /^[\|\s\-:]+$/.test(nl) && nl.includes('-') && nl.includes('|');
+            }
+
+            if (inTable || nextLineIsDivider || isTableDivider) {
+                if (isTableDivider) {
+                    if (inTable && htmlOutput.length > 0) {
+                        const lastLine = htmlOutput.pop();
+                        const cleanHeaderLine = lastLine.replace(/^<tr>/, '').replace(/<\/tr>$/, '');
+                        const headerHtml = cleanHeaderLine.replace(/<td[^>]*>/g, '<th style="border: 1px solid #555; padding: 6px; background: rgba(255,255,255,0.08); font-weight:bold;">').replace(/<\/td>/g, '</th>');
+                        htmlOutput.push('<thead><tr>' + headerHtml + '</tr></thead><tbody style="border-top: 1px solid #555;">');
+                    }
+                    inTable = true;
+                    continue;
+                }
+
+                let cleanLine = line.replace(/^\|/, '').replace(/\|$/, '');
+                const cells = cleanLine.split('|').map(c => c.trim());
+                const rowHtml = '<tr>' + cells.map(c => {
+                    return `<td style="border: 1px solid #444; padding: 4px 8px;">${formatInline(escapeHtmlForExport(c))}</td>`;
+                }).join('') + '</tr>';
+
+                if (!inTable) {
+                    htmlOutput.push('<br/><table style="border-collapse: collapse; width: 100%; border: 1px solid #444; margin: 8px 0;"><tbody>');
+                    inTable = true;
+                }
+                htmlOutput.push(rowHtml);
+                continue;
+            }
+        }
+
+        if (inTable) {
+            htmlOutput.push('</tbody></table><br/>');
+            inTable = false;
+        }
+
+        // 3. Headers
+        const headerMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headerMatch) {
+            if (inList) { htmlOutput.push('</ul>'); inList = false; }
+            const level = headerMatch[1].length;
+            const content = formatInline(escapeHtmlForExport(headerMatch[2]));
+            // Add appropriate bottom padding depending on header size
+            const size = [32, 24, 18, 16, 14, 12][level - 1] + 'px';
+            htmlOutput.push(`<h${level} style="margin-top: 14px; margin-bottom: 8px; font-size: ${size};">${content}</h${level}>`);
+            continue;
+        }
+
+        // 4. Blockquotes
+        if (line.startsWith('>')) {
+            if (inList) { htmlOutput.push('</ul>'); inList = false; }
+            let content = line.startsWith('> ') ? line.substring(2) : line.substring(1);
+            content = formatInline(escapeHtmlForExport(content.trim()));
+            htmlOutput.push(`<blockquote style="border-left: 3px solid #63b3ed; margin-left: 0; margin-top: 6px; margin-bottom: 6px; padding-left: 12px; color: #aaa; font-style: italic;">${content}</blockquote>`);
+            continue;
+        }
+
+        // 5. Lists
+        const listMatch = line.match(/^([*\-+]|\d+\.)\s+(.*)$/);
+        if (listMatch) {
+            if (!inList) {
+                htmlOutput.push('<ul style="margin-top: 4px; margin-bottom: 4px; padding-left: 24px;">');
+                inList = true;
+            }
+            let content = listMatch[2];
+            // Render basic pseudo-checkboxes for task lists
+            if (content.toLowerCase().startsWith('[ ] ')) {
+                content = '&#9744; ' + content.substring(4);
+            } else if (content.toLowerCase().startsWith('[x] ')) {
+                content = '&#9745; ' + content.substring(4);
+            }
+            htmlOutput.push(`<li style="margin-bottom: 2px;">${formatInline(escapeHtmlForExport(content))}</li>`);
+            continue;
+        }
+
+        // Blank lines
+        if (line === '') {
+            if (inList) { htmlOutput.push('</ul>'); inList = false; }
+            htmlOutput.push('<br/>');
+            continue;
+        }
+
+        // Normal text
+        if (inList) { htmlOutput.push('</ul>'); inList = false; }
+        htmlOutput.push(formatInline(escapeHtmlForExport(line)) + '<br/>');
+    }
+
+    if (inList) { htmlOutput.push('</ul>'); }
+    if (inTable) { htmlOutput.push('</tbody></table><br/>'); }
+    if (inCodeBlock) { htmlOutput.push('</code></pre>'); }
+
+    return htmlOutput.join('\n');
+}
+
 function handleNoteEditorPaste(event, editor, shot) {
     event.preventDefault();
     const clipboard = event.clipboardData || window.clipboardData;
@@ -2495,9 +3755,19 @@ function handleNoteEditorPaste(event, editor, shot) {
     const text = clipboard.getData('text/plain') || "";
 
     let insertHtml = "";
-    if (html && html.trim()) {
-        insertHtml = sanitizeHtmlForEditorAndExport(html, { maxFontPx: 16, keepLinks: true });
+
+    const mkHtml = convertMarkdownToHtml(text);
+
+    // If the HTML version literally contains markdown symbols like '###' or '> ', 
+    // it's a "bad" HTML flavor and we should force the markdown parser.
+    const htmlHasLiteralMarkdown = html && (html.includes('###') || html.includes('&gt; ') || html.includes('| ---'));
+
+    if (mkHtml && (htmlHasLiteralMarkdown || !html || !html.toLowerCase().includes('<table'))) {
+        insertHtml = sanitizeHtmlForEditorAndExport(mkHtml, { maxFontPx: null, keepLinks: true });
+    } else if (html && html.trim()) {
+        insertHtml = sanitizeHtmlForEditorAndExport(html, { maxFontPx: null, keepLinks: true });
     }
+
     if (!insertHtml) {
         insertHtml = plainTextToEditorHtml(text);
     }
@@ -2510,6 +3780,52 @@ function handleNoteEditorPaste(event, editor, shot) {
         stateEntry.noteHtml = editor.innerHTML;
     }
     saveVideoState(currentVideoId);
+}
+
+/**
+ * Handles Enter key to automatically continue "Arrow List" (→) or "Check List" (✓).
+ */
+function handleNoteEditorKeydown(event, editor, shot) {
+    if (event.key !== 'Enter') return;
+
+    const selection = window.getSelection();
+    if (!selection.rangeCount) return;
+
+    const range = selection.getRangeAt(0);
+    const container = range.startContainer;
+
+    // Find the text node or element containing the current line start
+    const lineText = container.textContent || "";
+    const caretOffset = range.startOffset;
+
+    // Detect if the current line starts with our special markers
+    const markers = ["→", "✓"];
+    let activeMarker = null;
+
+    for (const m of markers) {
+        if (lineText.trim().startsWith(m)) {
+            activeMarker = m;
+            break;
+        }
+    }
+
+    if (activeMarker) {
+        // If the line has ONLY the marker, clear it (exit list)
+        if (lineText.trim() === activeMarker) {
+            event.preventDefault();
+            // Clear current line text
+            if (container.nodeType === Node.TEXT_NODE) {
+                container.textContent = "";
+            } else {
+                container.innerHTML = "";
+            }
+            return;
+        }
+
+        // Otherwise, continue the list on next line
+        event.preventDefault();
+        document.execCommand('insertHTML', false, `<br>${activeMarker} &nbsp;`);
+    }
 }
 
 function loadImageFromDataUrl(dataUrl) {
@@ -2705,24 +4021,26 @@ async function renderRichTextToCanvas(html, widthPx = 600, options = {}) {
                 </svg>`);
 
             const img = new Image();
-            let svgUrl = null;
             img.onload = () => {
-                ctx.drawImage(img, 0, 0);
-                if (svgUrl) URL.revokeObjectURL(svgUrl);
-                cleanup();
-                resolve(canvas.toDataURL('image/png'));
+                try {
+                    ctx.drawImage(img, 0, 0);
+                    cleanup();
+                    resolve(canvas.toDataURL('image/png'));
+                } catch (err) {
+                    console.error("Canvas export failed (tainted):", err);
+                    cleanup();
+                    resolve(null); // Fallback to plain text
+                }
             };
             img.onerror = () => {
-                if (svgUrl) URL.revokeObjectURL(svgUrl);
                 cleanup();
                 resolve(null);
             };
             try {
-                const svgBlob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
-                svgUrl = URL.createObjectURL(svgBlob);
-                img.src = svgUrl;
-            } catch (blobErr) {
-                console.error("Failed to build SVG blob for PDF text rendering:", blobErr);
+                const encodedSvg = btoa(unescape(encodeURIComponent(svg)));
+                img.src = `data:image/svg+xml;base64,${encodedSvg}`;
+            } catch (err) {
+                console.error("Failed to base64 encode SVG for PDF rendering:", err);
                 cleanup();
                 resolve(null);
             }
@@ -2794,7 +4112,12 @@ async function renderPlainTextToCanvas(text, widthPx = 1200, options = {}) {
         y += lineHeightPx;
     }
 
-    return canvas.toDataURL('image/png');
+    try {
+        return canvas.toDataURL('image/png');
+    } catch (err) {
+        console.error("Plain text canvas export failed:", err);
+        return null; // Fallback to jsPDF native
+    }
 }
 
 async function addImageDataToPdfWithPaging(doc, imageDataUrl, xMm, startYMm, widthMm, options = {}) {
@@ -2840,7 +4163,13 @@ async function addImageDataToPdfWithPaging(doc, imageDataUrl, xMm, startYMm, wid
         );
 
         const sliceHeightMm = slicePx / pxPerMm;
-        doc.addImage(sliceCanvas.toDataURL('image/png'), 'PNG', xMm, yMm, widthMm, sliceHeightMm, undefined, compression);
+        try {
+            const sliceData = sliceCanvas.toDataURL('image/png');
+            doc.addImage(sliceData, 'PNG', xMm, yMm, widthMm, sliceHeightMm, undefined, compression);
+        } catch (err) {
+            console.error("Paging slice failed (tainted):", err);
+            // If we can't slice, we just skip this slice to avoid crashing the whole PDF
+        }
 
         offsetPx += slicePx;
         yMm += sliceHeightMm;
@@ -2862,18 +4191,18 @@ async function addRichBlockToPdf(doc, html, xMm, yMm, widthMm, options = {}) {
 
 async function generatePDFDoc(progressCallback = null) {
     if (state.screenshots.length === 0 && state.toc.length === 0) {
-        alert("Nothing to export yet!");
+        await showAlert("Nothing to export yet!");
         return null;
     }
 
     if (!window.jspdf && !window.jsPDF) {
-        alert("PDF Library not loaded properly.");
+        await showAlert("PDF Library not loaded properly.");
         return null;
     }
 
     const jsPDFBuilder = window.jspdf ? window.jspdf.jsPDF : window.jsPDF;
     if (!jsPDFBuilder) {
-        alert("Could not initialize JS PDF builder.");
+        await showAlert("Could not initialize JS PDF builder.");
         return null;
     }
 
@@ -2912,14 +4241,71 @@ async function generatePDFDoc(progressCallback = null) {
 
     report("Preparing document...");
 
+    const PDF_BRAND_NAME = "Clip Notes";
+    const PDF_ICON_URL = chrome.runtime.getURL("assets/icons/icon128.png");
+
+    const sanitizeForPdfSafe = (str) => {
+        if (!str) return "";
+        // Replace non-ASCII and common encoding artifacts with a space or empty
+        return str.replace(/[^\x00-\x7F]/g, " ").replace(/\s+/g, " ").trim();
+    };
+
     const doc = new jsPDFBuilder({
         orientation: 'p',
         unit: 'mm',
         format: 'a4',
+        putOnlyUsedFonts: true,
         compress: true
     });
 
-    const title = document.getElementById('video-title').textContent || "YouTube Notes";
+    let appIconDataUrl = null;
+    let thumbnailDataUrl = null;
+
+    const fetchThumbnailDataUrl = async (vid) => {
+        if (!vid) return null;
+        const urls = [
+            `https://img.youtube.com/vi/${vid}/maxresdefault.jpg`,
+            `https://img.youtube.com/vi/${vid}/hqdefault.jpg`,
+            `https://img.youtube.com/vi/${vid}/0.jpg`
+        ];
+        for (const url of urls) {
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) continue;
+                const blob = await resp.blob();
+                return await new Promise(resolve => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.readAsDataURL(blob);
+                });
+            } catch (e) {
+                console.warn("Thumnail fetch failed:", url, e);
+            }
+        }
+        return null;
+    };
+
+    try {
+        const iconResp = await fetch(PDF_ICON_URL);
+        const iconBlob = await iconResp.blob();
+        appIconDataUrl = await new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.readAsDataURL(iconBlob);
+        });
+    } catch (e) {
+        console.warn("Could not load app icon for PDF:", e);
+    }
+
+    try {
+        report("Fetching video thumbnail...");
+        thumbnailDataUrl = await fetchThumbnailDataUrl(state.metadata.videoId);
+    } catch (e) {
+        console.warn("Could not load thumbnail:", e);
+    }
+
+    const rawTitle = document.getElementById('video-title').textContent || "Clip Notes";
+    const title = sanitizeForPdfSafe(rawTitle);
     const durationText = document.getElementById('time-display').textContent || "";
     const totalDuration = durationText.split('/')[1]?.trim() || "Unknown";
     const generatedAt = new Date().toLocaleString();
@@ -2933,15 +4319,34 @@ async function generatePDFDoc(progressCallback = null) {
         (Array.isArray(state.toc) ? state.toc : []).map((entry, idx) => normalizeTOCRecord(entry, idx))
     ).filter(entry => String(entry.title || "").trim().length > 0);
 
+    // Hierarchical Numbering
+    let h1Count = 0;
+    let h2Count = 0;
+    let h3Count = 0;
+    sortedTocEntries.forEach(entry => {
+        const level = normalizeTOCLevel(entry.level);
+        if (level === 'H1') {
+            h1Count++; h2Count = 0; h3Count = 0;
+            entry.numPrefix = `${h1Count}. `;
+        } else if (level === 'H2') {
+            h2Count++; h3Count = 0;
+            entry.numPrefix = `${h1Count}.${h2Count}. `;
+        } else {
+            h3Count++;
+            entry.numPrefix = `${h1Count}.${h2Count}.${h3Count}. `;
+        }
+    });
+
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
     const margin = 12;
     const contentWidth = pageWidth - (margin * 2);
+
     const mmToPx = 96 / 25.4;
     const noteRenderWidthPx = Math.max(560, Math.round(contentWidth * mmToPx));
     const slotGap = 8;
     const firstPageSlotsTop = 40;
-    const normalPageSlotsTop = margin;
+    const normalPageSlotsTop = margin; // Start exactly at margin now that branding is removed
 
     const getSlotLayout = (isFirstPage) => {
         const slotsTop = isFirstPage ? firstPageSlotsTop : normalPageSlotsTop;
@@ -2952,71 +4357,323 @@ async function generatePDFDoc(progressCallback = null) {
         };
     };
 
-    const drawMetadataHeader = () => {
-        doc.setFillColor(246, 248, 251);
-        doc.setDrawColor(221, 227, 235);
-        doc.roundedRect(margin, margin, contentWidth, 22, 2, 2, 'FD');
+    // --- Pre-calculate Page Destinations for Links & Bookmarks ---
+    const shotDestinations = new Map(); // shotIndex -> pageNumber
+    let currentDryPage = 1;
 
-        doc.setFontSize(13);
-        doc.setFont(undefined, 'bold');
-        doc.setTextColor(23, 50, 74);
-        doc.text(title.length > 96 ? `${title.substring(0, 96)}...` : title, margin + 2, margin + 6);
+    // 1. Calculate TOC page count
+    const tocPages = (() => {
+        if (sortedTocEntries.length === 0) return 0;
+        let count = 1;
+        const bottomLimit = pageHeight - margin - 15;
+        let y = margin + 24; // drawTOCHeading(margin+12) + 12mm
+        for (const entry of sortedTocEntries) {
+            const level = normalizeTOCLevel(entry.level);
+            const lineHeight = level === 'H1' ? 5.2 : (level === 'H2' ? 4.8 : 4.6);
+            const label = (entry.numPrefix || "") + entry.title; // Includes numbering
+            const lines = doc.splitTextToSize(label, contentWidth - (level === 'H1' ? 0 : (level === 'H2' ? 6 : 12)));
+            const required = (lines.length * lineHeight) + 1.4;
+            if (y + required > bottomLimit) {
+                count++;
+                y = margin + 16;
+            }
+            y += required;
+        }
+        return count;
+    })();
 
-        doc.setFontSize(9);
-        doc.setFont(undefined, 'normal');
-        doc.setTextColor(90, 105, 120);
-        doc.text(`Generated: ${generatedAt}`, margin + 2, margin + 12);
-        doc.text(`Total Screenshots: ${sortedShots.length}`, margin + 2, margin + 16);
-        doc.text(`Video Duration: ${totalDuration}`, margin + 62, margin + 16);
-        doc.text(`Source: ${state.metadata.videoUrl || "YouTube"}`, margin + 2, margin + 20);
+
+    const frontPagesCount = 1 + (sortedTocEntries.length > 0 ? tocPages : 0);
+
+    // 2. Pre-calculate destinations for ALL items (Shots and TOC Markers)
+    const unifiedItemsForSizing = [
+        ...sortedShots.map((s, idx) => ({ type: 'shot', data: s, index: idx + 1, time: s.timestampMs || 0 })),
+        ...sortedTocEntries.map(e => ({ type: 'toc', data: e, time: e.timestampMs || 0 }))
+    ].sort((a, b) => a.time - b.time);
+
+    const calculateShotHeight = (shot, isFullPage) => {
+        const noteHtml = getScreenshotNoteHtml(shot);
+        const noteText = getMeaningfulNoteText(noteHtml);
+        const lines = Math.max(1, Math.ceil(noteText.length / 85));
+        const notesH = noteText.length > 0 ? (10 + (lines * 4.5)) : 0;
+        const imgH = isFullPage ? 120 : 105; // Restored to 105mm for impactful visual size
+        return 5 + imgH + notesH + 4; // Header(5) + Image + Notes + Padding
     };
 
-    const drawTOCHeading = (isContinuation = false) => {
-        doc.setFontSize(13);
+    const isShotFullPage = (shot, yInPage, layout) => {
+        const noteText = getMeaningfulNoteText(getScreenshotNoteHtml(shot));
+        const estimatedLines = Math.ceil(noteText.length / 85);
+        const isVeryLong = noteText.length > 400 || estimatedLines > 8;
+        // If it's a fresh page and somewhat long, mark as full page to get better resolution
+        if (yInPage < layout.slotsTop + 10 && noteText.length > 260) return true;
+        if (isVeryLong) return true;
+        return false;
+    };
+
+    const getItemKey = (itemOrRecord) => {
+        if (!itemOrRecord) return "unknown";
+        if (itemOrRecord.type) {
+            // It's a wrapped item { type, data }
+            return itemOrRecord.type === 'shot'
+                ? `shot-${itemOrRecord.data.id}`
+                : `toc-${itemOrRecord.data.id}`;
+        }
+        // It's a direct record (shot or TOC entry)
+        if (itemOrRecord.level !== undefined || itemOrRecord.numPrefix !== undefined) {
+            return `toc-${itemOrRecord.id}`;
+        }
+        return `shot-${itemOrRecord.id}`;
+    };
+
+    const itemDestinations = new Map();
+    const itemLayoutCache = new Map(); // Store fullPage and estH to prevent drift
+    let currentCalcPage = frontPagesCount + 1;
+    const layout = getSlotLayout(false);
+    let yInCalcPage = layout.slotsTop;
+    let slotCount = 0;
+
+    for (let i = 0; i < unifiedItemsForSizing.length; i++) {
+        const item = unifiedItemsForSizing[i];
+        const itemKey = getItemKey(item);
+
+        if (item.type === 'toc') {
+            // Marker required space is 22mm. Sync threshold with rendering exactly.
+            if (yInCalcPage + 22 > pageHeight - margin) {
+                currentCalcPage++;
+                yInCalcPage = layout.slotsTop;
+                slotCount = 0;
+            }
+            itemDestinations.set(itemKey, { page: currentCalcPage, y: yInCalcPage });
+            yInCalcPage += 22;
+            continue;
+        }
+
+        // Shot sizing pass
+        const shot = item.data;
+        const useFullPage = isShotFullPage(shot, yInCalcPage, layout);
+        const estH = calculateShotHeight(shot, useFullPage);
+
+        // Cache these decisions for the rendering pass
+        itemLayoutCache.set(itemKey, { useFullPage, estH });
+
+        if (useFullPage) {
+            // Sync fullPage break condition: (slotCount > 0 or y > top+20)
+            if (slotCount !== 0 || yInCalcPage > layout.slotsTop + 20) {
+                currentCalcPage++;
+                yInCalcPage = layout.slotsTop;
+                slotCount = 0;
+            }
+            itemDestinations.set(itemKey, { page: currentCalcPage, y: yInCalcPage });
+            yInCalcPage += estH + slotGap;
+            slotCount++;
+            continue;
+        }
+
+        // Standard slot sizing
+        if (yInCalcPage + estH > pageHeight - margin) {
+            currentCalcPage++;
+            yInCalcPage = layout.slotsTop;
+            slotCount = 0;
+        }
+        itemDestinations.set(itemKey, { page: currentCalcPage, y: yInCalcPage });
+        yInCalcPage += estH + slotGap;
+        slotCount++;
+    }
+
+    const getItemDestination = (itemOrRecord) => {
+        const key = getItemKey(itemOrRecord);
+        return itemDestinations.get(key) || { page: frontPagesCount + 1, y: layout.slotsTop };
+    };
+
+    // --- Outline / Bookmarks (PDF Sidebar) ---
+    if (doc.outline) {
+        const topNode = doc.outline.add(null, "Video Notes");
+        if (sortedTocEntries.length > 0) {
+            const tocNode = doc.outline.add(topNode, "Table of Contents", { pageNumber: 1 });
+            let currentH1 = tocNode;
+            let currentH2 = tocNode;
+
+            sortedTocEntries.forEach(entry => {
+                const dest = getItemDestination(entry);
+                const destPage = dest.page;
+                const level = normalizeTOCLevel(entry.level);
+                const title = `[${entry.numPrefix || ""}] ${entry.title}`;
+
+                if (level === 'H1') {
+                    currentH1 = doc.outline.add(tocNode, title, { pageNumber: destPage });
+                    currentH2 = currentH1;
+                } else if (level === 'H2') {
+                    currentH2 = doc.outline.add(currentH1, title, { pageNumber: destPage });
+                } else {
+                    doc.outline.add(currentH2, title, { pageNumber: destPage });
+                }
+            });
+        }
+    }
+
+    const drawCoverPage = async (thumb) => {
+        // Page 1 Background
+        doc.setFillColor(249, 250, 251);
+        doc.rect(0, 0, pageWidth, pageHeight, 'F');
+
+        // Branding
+        if (appIconDataUrl) {
+            doc.addImage(appIconDataUrl, 'PNG', margin, margin, 12, 12);
+        }
+        doc.setFontSize(14);
         doc.setFont(undefined, 'bold');
-        doc.setTextColor(23, 50, 74);
-        doc.text(isContinuation ? "Table of Contents (cont.)" : "Table of Contents", margin, margin + 28);
+        doc.setTextColor(15, 23, 42);
+        doc.text(PDF_BRAND_NAME, appIconDataUrl ? margin + 15 : margin, margin + 8.5);
+
+        // Title block
+        const titleY = margin + 40;
+        doc.setFontSize(26);
+        doc.setTextColor(15, 23, 42);
+        const wrappedTitle = doc.splitTextToSize(title, contentWidth);
+        doc.text(wrappedTitle, margin, titleY);
+
+        let nextY = titleY + (wrappedTitle.length * 10) + 10;
+
+        // Thumbnail
+        if (thumb) {
+            const thumbWidth = contentWidth;
+            const thumbHeight = (thumbWidth * 9) / 16;
+            doc.setDrawColor(226, 232, 240);
+            doc.setLineWidth(0.5);
+            doc.roundedRect(margin - 1, nextY - 1, thumbWidth + 2, thumbHeight + 2, 2, 2, 'D');
+            doc.addImage(thumb, 'JPEG', margin, nextY, thumbWidth, thumbHeight);
+            nextY += thumbHeight + 20;
+        } else {
+            nextY += 20;
+        }
+
+        // Info Box
+        doc.setFillColor(255, 255, 255);
+        doc.setDrawColor(226, 232, 240);
+        const infoBoxHeight = 42;
+        doc.roundedRect(margin, nextY, contentWidth, infoBoxHeight, 3, 3, 'FD');
+
+        doc.setFontSize(11);
+        doc.setTextColor(71, 85, 105);
+        doc.setFont(undefined, 'bold');
+        doc.text("Complete Automated Video Report", margin + 8, nextY + 12);
+
+        doc.setFont(undefined, 'normal');
+        doc.setFontSize(10);
+        doc.setTextColor(100, 116, 139);
+        doc.text(`Channel: ${state.metadata.channel || "Unknown Channel"}`, margin + 8, nextY + 20);
+        doc.text(`Duration: ${totalDuration}`, margin + 8, nextY + 26);
+        doc.text(`Generated At: ${generatedAt}`, margin + 8, nextY + 32);
+        doc.text(`Original URL: ${state.metadata.videoUrl || "YouTube"}`, margin + 8, nextY + 38);
+
+        // Final aesthetic touch at bottom
+        doc.setFontSize(9);
+        doc.setTextColor(14, 165, 233);
+        doc.setFont(undefined, 'bold');
+        doc.text("Powered by Clip Notes • Intelligent Video Documentation", pageWidth / 2, pageHeight - 15, { align: 'center' });
+    };
+
+    const drawSimpleBranding = () => {
+        // [DELETED] Branding removed per user request for a cleaner look
+    };
+
+    const drawMetadataHeader = () => {
+        // [DELETED] detailed metadata header per user request to save space
+    };
+
+    const drawTOCHeading = (yPos, isContinuation = false) => {
+        const headingText = isContinuation ? "Table of Contents (cont.)" : "Table of Contents";
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.setTextColor(14, 165, 233); // Sky-500 professional blue
+        doc.text(headingText, margin, yPos);
+
+        // Underline
+        const textWidth = doc.getTextWidth(headingText);
+        doc.setDrawColor(14, 165, 233);
+        doc.setLineWidth(0.4);
+        doc.line(margin, yPos + 1.5, margin + textWidth, yPos + 1.5);
     };
 
     const drawTOCSection = () => {
         if (sortedTocEntries.length === 0) return;
 
-        const bottomLimit = pageHeight - margin - 8;
-        let y = margin + 34;
-        drawTOCHeading(false);
+        // Dedicated page(s) for TOC
+        doc.addPage();
+        const bottomLimit = pageHeight - margin - 15;
+        let y = margin + 12;
+        drawTOCHeading(y, false);
+        y += 12;
 
         for (const entry of sortedTocEntries) {
             const level = normalizeTOCLevel(entry.level);
             const indent = level === 'H1' ? 0 : (level === 'H2' ? 6 : 12);
-            const lineHeight = level === 'H1' ? 5.2 : (level === 'H2' ? 4.8 : 4.6);
+            const lineHeight = level === 'H1' ? 5.8 : (level === 'H2' ? 5.2 : 5);
 
             if (level === 'H1') {
-                doc.setFontSize(11.5);
+                doc.setFontSize(12);
                 doc.setFont(undefined, 'bold');
-                doc.setTextColor(21, 45, 68);
+                doc.setTextColor(15, 23, 42);
             } else if (level === 'H2') {
                 doc.setFontSize(10.5);
                 doc.setFont(undefined, 'bold');
-                doc.setTextColor(33, 56, 79);
+                doc.setTextColor(30, 41, 59);
             } else {
                 doc.setFontSize(10);
                 doc.setFont(undefined, 'normal');
-                doc.setTextColor(53, 72, 90);
+                doc.setTextColor(51, 65, 85);
             }
 
-            const label = `${entry.timeFormatted}  ${entry.title}`;
-            const lines = doc.splitTextToSize(label, contentWidth - indent);
-            const required = (lines.length * lineHeight) + 1.4;
+            const dest = getItemDestination(entry);
+            const destPage = dest.page;
+            const relativePageNum = Math.max(1, destPage - frontPagesCount);
+            const pageNumStr = String(relativePageNum);
+            const pageNumWidth = doc.getTextWidth(pageNumStr);
+            const titleStr = entry.title;
+            const fullTitle = (entry.numPrefix || "") + titleStr;
 
-            if (y + required > bottomLimit) {
+            // Calculate dots
+            const titleWidthLimit = contentWidth - indent - pageNumWidth - 8;
+            const truncatedTitleLines = doc.splitTextToSize(fullTitle, titleWidthLimit);
+            const requiredLinesHeight = (truncatedTitleLines.length * lineHeight);
+
+            if (y + requiredLinesHeight > bottomLimit) {
                 doc.addPage();
-                y = margin + 10;
-                drawTOCHeading(true);
-                y = margin + 16;
+                y = margin + 12;
+                drawTOCHeading(y, true);
+                y += 12;
             }
 
-            doc.text(lines, margin + indent, y);
-            y += required;
+            // Clickable link to exact marker destination for precise navigation
+            if (typeof doc.addDestination === 'function') {
+                const destKey = getItemKey(entry);
+                doc.link(margin + indent, y - 4, contentWidth - indent, requiredLinesHeight + 2, { destination: destKey });
+            } else {
+                doc.link(margin + indent, y - 4, contentWidth - indent, requiredLinesHeight + 2, { pageNumber: destPage });
+            }
+
+            // Draw Title Lines
+            doc.text(truncatedTitleLines, margin + indent, y);
+
+            // Draw Dots and Page Number (only on the last line of the title if multi-line)
+            const lastLineY = y + ((truncatedTitleLines.length - 1) * lineHeight);
+            const lastLineWidth = doc.getTextWidth(truncatedTitleLines[truncatedTitleLines.length - 1]);
+
+            doc.setFont(undefined, 'normal');
+            doc.setTextColor(148, 163, 184); // Muted dots
+            const dotsX = margin + indent + lastLineWidth + 2;
+            const dotsEnd = margin + contentWidth - pageNumWidth - 4;
+            if (dotsEnd > dotsX) {
+                const dotCount = Math.floor((dotsEnd - dotsX) / 1.5);
+                doc.text(".".repeat(dotCount), dotsX, lastLineY);
+            }
+
+            doc.setFont(undefined, 'bold');
+            doc.setTextColor(15, 23, 42);
+            doc.text(pageNumStr, margin + contentWidth, lastLineY, { align: 'right' });
+
+
+            y += requiredLinesHeight + 1.5;
         }
     };
 
@@ -3030,9 +4687,9 @@ async function generatePDFDoc(progressCallback = null) {
 
         let y = regionTop;
 
-        doc.setFontSize(11);
+        doc.setFontSize(9.5);
         doc.setFont(undefined, 'bold');
-        doc.setTextColor(11, 116, 222);
+        doc.setTextColor(71, 85, 105); // Muted slate color
         doc.text(`Screenshot ${shotIndex} - ${shot.timeFormatted || "00:00"}`, margin, y);
         doc.setFont(undefined, 'normal');
         y += 5;
@@ -3043,19 +4700,17 @@ async function generatePDFDoc(progressCallback = null) {
                 if (!shotImageMeta || !shotImageMeta.width || !shotImageMeta.height) {
                     throw new Error("Could not load screenshot image metadata.");
                 }
-                const maxHeight = fullPage ? 120 : 112;
+                const maxHeight = fullPage ? 120 : 105; // Synced with calculateShotHeight (restored from 85)
                 const minHeight = fullPage ? 48 : 34;
 
                 let reserveForNotes = 0;
                 if (hasNote) {
                     const estimatedNoteLines = Math.max(1, Math.ceil(noteText.length / 85));
-                    reserveForNotes = fullPage
-                        ? Math.min(80, 16 + (estimatedNoteLines * 4.2))
-                        : Math.min(52, 10 + (estimatedNoteLines * 4.5));
+                    reserveForNotes = 10 + (estimatedNoteLines * 4.5);
                 }
 
                 let availableForImage = regionBottom - y - reserveForNotes;
-                if (availableForImage < minHeight) availableForImage = minHeight;
+                if (availableForImage < 6) availableForImage = 6; // Minimum height for image to be drawn
 
                 const heightLimit = Math.min(maxHeight, availableForImage);
                 let fitted = fitImageWithinBox(
@@ -3131,24 +4786,24 @@ async function generatePDFDoc(progressCallback = null) {
                     }
                 }
 
-                    if (noteImg) {
-                        if (fullPage) {
-                            y = await addImageDataToPdfWithPaging(doc, noteImg, margin, y, contentWidth, {
-                                marginMm: margin,
-                                gapMm: 2,
-                                compression: 'NONE'
-                            });
-                        } else {
-                            const noteMeta = await loadImageFromDataUrl(noteImg);
-                            const noteNaturalHeight = (noteMeta.height * contentWidth) / noteMeta.width;
-                            const noteAllowedHeight = Math.max(0, regionBottom - y - 1);
+                if (noteImg) {
+                    if (fullPage) {
+                        y = await addImageDataToPdfWithPaging(doc, noteImg, margin, y, contentWidth, {
+                            marginMm: margin,
+                            gapMm: 2,
+                            compression: 'NONE'
+                        });
+                    } else {
+                        const noteMeta = await loadImageFromDataUrl(noteImg);
+                        const noteNaturalHeight = (noteMeta.height * contentWidth) / noteMeta.width;
+                        const noteAllowedHeight = Math.max(0, regionBottom - y - 1);
 
-                            if (noteAllowedHeight > 4) {
-                                const renderHeight = Math.min(noteNaturalHeight, noteAllowedHeight);
-                                doc.addImage(noteImg, 'PNG', margin, y, contentWidth, renderHeight, undefined, 'NONE');
-                                y += renderHeight + 1;
-                            }
+                        if (noteAllowedHeight > 4) {
+                            const renderHeight = Math.min(noteNaturalHeight, noteAllowedHeight);
+                            doc.addImage(noteImg, 'PNG', margin, y, contentWidth, renderHeight, undefined, 'NONE');
+                            y += renderHeight + 1;
                         }
+                    }
                 } else {
                     // Fallback 1: draw plain text through canvas so Unicode and spacing stay stable.
                     const plainNoteImg = await renderPlainTextToCanvas(noteTextForFallback || noteText, noteRenderWidthPx, {
@@ -3214,57 +4869,126 @@ async function generatePDFDoc(progressCallback = null) {
         return y;
     };
 
-    drawMetadataHeader();
+    const drawInFlowTOCMarker = (entry, y) => {
+        const level = normalizeTOCLevel(entry.level);
+        const indent = level === 'H1' ? 0 : (level === 'H2' ? 4 : 8);
+        const fontSize = level === 'H1' ? 12 : (level === 'H2' ? 10.5 : 9.5);
+
+        // Define named destination for precise linking
+        if (typeof doc.addDestination === 'function') {
+            // Unify with getItemKey (e.g., toc-12345) to ensure strings are safe and consistent.
+            // Zoom 1 (instead of 0/inherit) is often more reliable across PDF viewers.
+            const destKey = getItemKey(entry);
+            doc.addDestination(destKey, 'XYZ', 0, y - 2, 1);
+        }
+
+        // Background for marker
+        doc.setFillColor(240, 249, 255); // Sky-50 light blue
+        doc.setDrawColor(186, 230, 253); // Sky-200
+        doc.roundedRect(margin + indent, y, contentWidth - indent, 10, 1.5, 1.5, 'FD');
+
+        // Marker Tag
+        doc.setFillColor(14, 165, 233); // Sky-500
+        doc.roundedRect(margin + indent + 2, y + 2.5, 18, 5, 1, 1, 'F');
+        doc.setFontSize(7.5);
+        doc.setFont(undefined, 'bold');
+        doc.setTextColor(255, 255, 255);
+        doc.text(level, margin + indent + 11, y + 6.1, { align: 'center' });
+
+        // Prefix & Title 
+        doc.setFontSize(fontSize);
+        doc.setTextColor(15, 23, 42);
+        doc.setFont(undefined, 'bold');
+        const fullDisplay = (entry.numPrefix || "") + entry.title;
+        doc.text(fullDisplay, margin + indent + 22, y + 6.5);
+
+        return y + 22; // Increased from 18 to 22 to prevent overlap and match sizing
+    };
+
+    await drawCoverPage(thumbnailDataUrl);
+
     if (sortedTocEntries.length > 0) {
         report("Rendering table of contents...");
         drawTOCSection();
     }
 
-    if (sortedShots.length > 0) {
-        if (sortedTocEntries.length > 0) {
-            doc.addPage();
-        }
+    // --- Unified Rendering Loop ---
+    const allItems = [
+        ...sortedShots.map((s, idx) => ({ type: 'shot', data: s, index: idx + 1, time: s.timestampMs || 0 })),
+        ...sortedTocEntries.map(e => ({ type: 'toc', data: e, time: e.timestampMs || 0 }))
+    ].sort((a, b) => a.time - b.time);
 
-        let layout = getSlotLayout(sortedTocEntries.length === 0);
+    if (allItems.length > 0) {
+        doc.addPage();
+
+        let layout = getSlotLayout(false); // After cover/toc, always normal top
         let slotIndex = 0;
+        let yInPage = layout.slotsTop;
 
-        for (let i = 0; i < sortedShots.length; i++) {
-            const shot = sortedShots[i];
-            const noteText = getMeaningfulNoteText(getScreenshotNoteHtml(shot));
-            const estimatedLines = Math.ceil(noteText.length / 85);
-            const useFullPage = noteText.length > 260 || estimatedLines > 4;
+        // Initial branding for first content page
+        drawSimpleBranding();
 
-            report(`Rendering screenshot ${i + 1} of ${sortedShots.length}...`);
+        for (let i = 0; i < allItems.length; i++) {
+            const item = allItems[i];
 
-            if (useFullPage) {
-                if (slotIndex !== 0) {
+            if (item.type === 'toc') {
+                // Absolute Sync: use 22mm threshold matching sizing pass
+                if (yInPage + 22 > pageHeight - margin) {
                     doc.addPage();
                     layout = getSlotLayout(false);
+                    yInPage = layout.slotsTop;
                     slotIndex = 0;
+                    drawSimpleBranding();
                 }
-
-                const fullTop = layout.slotsTop;
-                const fullBottom = pageHeight - margin;
-                await drawShotCard(shot, i + 1, fullTop, fullBottom, { fullPage: true });
-
-                if (i < sortedShots.length - 1) {
-                    doc.addPage();
-                    layout = getSlotLayout(false);
-                    slotIndex = 0;
-                }
+                yInPage = drawInFlowTOCMarker(item.data, yInPage);
                 continue;
             }
 
-            const slotTop = layout.slotsTop + (slotIndex * (layout.slotHeight + slotGap));
-            const slotBottom = slotTop + layout.slotHeight;
-            await drawShotCard(shot, i + 1, slotTop, slotBottom, { fullPage: false });
+            // Also add destination for shot images if needed, but primarily markers
+            if (item.type === 'shot' && typeof doc.addDestination === 'function') {
+                doc.addDestination(`shot-${item.data.id}`, 'XYZ', 0, yInPage - 2, 0);
+            }
 
-            slotIndex += 1;
-            if (slotIndex >= 2 && i < sortedShots.length - 1) {
+            const shot = item.data;
+            const itemKey = getItemKey(item);
+            const cached = itemLayoutCache.get(itemKey) || { useFullPage: false, estH: 60 };
+            const useFullPage = cached.useFullPage;
+            const estH = cached.estH;
+
+            report(`Rendering screenshot ${item.index} of ${sortedShots.length}...`);
+
+            if (useFullPage) {
+                // Absolute Sync: check against 20mm threshold
+                if (slotIndex !== 0 || yInPage > layout.slotsTop + 20) {
+                    doc.addPage();
+                    layout = getSlotLayout(false);
+                    yInPage = layout.slotsTop;
+                    slotIndex = 0;
+                    drawSimpleBranding();
+                }
+
+                const fullTop = yInPage;
+                const fullBottom = yInPage + estH;
+                await drawShotCard(shot, item.index, fullTop, fullBottom, { fullPage: true });
+                yInPage = fullTop + estH + slotGap;
+                slotIndex++;
+                continue;
+            }
+
+            // Normal shot card rendering
+            if (yInPage + estH > pageHeight - margin) {
                 doc.addPage();
                 layout = getSlotLayout(false);
+                yInPage = layout.slotsTop;
                 slotIndex = 0;
+                drawSimpleBranding();
             }
+
+            const slotTop = yInPage;
+            const slotBottom = yInPage + estH;
+            await drawShotCard(shot, item.index, slotTop, slotBottom, { fullPage: false });
+            yInPage = slotTop + estH + slotGap;
+            slotIndex++;
         }
     }
 
@@ -3273,10 +4997,40 @@ async function generatePDFDoc(progressCallback = null) {
     const totalPages = doc.internal.getNumberOfPages();
     for (let i = 1; i <= totalPages; i++) {
         doc.setPage(i);
-        doc.setFontSize(9);
-        doc.setTextColor(146, 155, 165);
-        doc.text(`Page ${i} of ${totalPages}`, pageWidth - margin, pageHeight - 6, { align: 'right' });
-        doc.text("YouTube Notes Export", margin, pageHeight - 6);
+
+        // Hide page numbers on Cover and TOC pages
+        if (i <= frontPagesCount) {
+            // No footer on front matter
+        } else {
+            // Aesthetic Footer line
+            doc.setDrawColor(226, 232, 240);
+            doc.setLineWidth(0.2);
+            doc.line(margin, pageHeight - 10, pageWidth - margin, pageHeight - 10);
+
+            doc.setFontSize(8.5);
+            doc.setTextColor(100, 116, 139);
+            const relativePage = i - frontPagesCount;
+            const relativeTotal = totalPages - frontPagesCount;
+            doc.text(`Page ${relativePage} of ${relativeTotal}`, pageWidth - margin, pageHeight - 6, { align: 'right' });
+
+            // Brand and Icon in footer
+            if (appIconDataUrl) {
+                doc.addImage(appIconDataUrl, 'PNG', margin, pageHeight - 9, 4, 4);
+                doc.text(PDF_BRAND_NAME, margin + 5, pageHeight - 6);
+            } else {
+                doc.text(PDF_BRAND_NAME, margin, pageHeight - 6);
+            }
+
+            // "Back to TOC" link
+            if (sortedTocEntries.length > 0) {
+                doc.setTextColor(14, 165, 233); // Sky-500
+                const backText = "Back to Table of Contents";
+                doc.text(backText, margin + (contentWidth / 2), pageHeight - 6, { align: 'center' });
+                const backWidth = doc.getTextWidth(backText);
+                // Page 2 is always TOC start because Page 1 is Cover
+                doc.link(margin + (contentWidth / 2) - (backWidth / 2), pageHeight - 9, backWidth, 4, { pageNumber: 2 });
+            }
+        }
     }
 
     report("Ready to save...");
@@ -3300,7 +5054,7 @@ async function handleExportPDF() {
         const title = document.getElementById('video-title').textContent || "YouTube Notes";
         const pdfBlob = doc.output('blob');
         const safeTitle = title.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
-        const filename = `Notes_${safeTitle}_${Date.now().toString().slice(-4)}.pdf`;
+        const filename = `${safeTitle}_${Date.now().toString().slice(-4)}.pdf`;
 
         const saved = await FileSystemModule.saveFileAs(filename, pdfBlob);
         if (saved) {
@@ -3308,13 +5062,12 @@ async function handleExportPDF() {
         }
     } catch (err) {
         console.error("PDF export failed:", err);
-        alert("PDF export failed. Please try again.");
+        await showAlert("PDF export failed. Please try again.");
     } finally {
         hideExportProgressDialog();
     }
 }
 
-let previewBlobUrl = null;
 let previewObserver = null;
 let previewPageData = [];
 let previewRenderedPages = new Set();
@@ -3381,7 +5134,7 @@ function buildPreviewPagePlan() {
     sortedShots.forEach((shot, idx) => {
         const noteHtml = getScreenshotNoteHtml(shot);
         const noteText = getMeaningfulNoteTextForPreview(noteHtml);
-        const estimatedLines = Math.max(1, Math.ceil(noteText.length / 85));
+        const estimatedLines = Math.ceil(noteText.length / 85);
         const useFullPage = noteText.length > 260 || estimatedLines > 4;
 
         if (useFullPage) {
@@ -3469,20 +5222,29 @@ function renderPreviewPage(pageEl, page, pageIndex) {
             const shot = slot.shot;
             const shotWrap = document.createElement('div');
             shotWrap.className = 'preview-shot';
+            // Tag with ID for dynamic background rehydration updates
+            shotWrap.setAttribute('data-shot-id', shot.id || shot.filename);
 
             const title = document.createElement('div');
             title.className = 'preview-shot-title';
             title.textContent = `Screenshot ${slot.index} - ${shot.timeFormatted || "00:00"}`;
             shotWrap.appendChild(title);
 
+            const img = document.createElement('img');
+            img.className = 'preview-shot-image';
             if (shot.dataUrl) {
-                const img = document.createElement('img');
-                img.className = 'preview-shot-image';
                 img.src = shot.dataUrl;
-                img.alt = `Screenshot ${slot.index}`;
-                img.loading = 'lazy';
-                shotWrap.appendChild(img);
+            } else if (shot.missingOnDisk) {
+                img.src = MISSING_SCREENSHOT_PLACEHOLDER_DATA_URL;
+            } else {
+                // Placeholder while background rehydration works
+                img.src = TRANSPARENT_PIXEL_DATA_URL;
+                img.classList.add('loading');
             }
+            img.alt = `Screenshot ${slot.index}`;
+            img.loading = 'lazy';
+            shotWrap.appendChild(img);
+
 
             const noteHtml = getScreenshotNoteHtml(shot);
             const noteText = getMeaningfulNoteTextForPreview(noteHtml);
@@ -3551,23 +5313,140 @@ function closePdfPreviewModal() {
     if (container) container.innerHTML = '';
 }
 
+async function initPreviewMode() {
+    // Hide the main app container UI
+    const container = document.querySelector('.app-container');
+    if (container) container.style.display = 'none';
+
+    // Show the preview overlay (already in HTML)
+    const overlay = document.getElementById('pdf-preview-overlay');
+    if (overlay) {
+        overlay.classList.remove('hidden');
+        overlay.style.position = 'static'; // Allow it to take full page
+        overlay.style.height = '100vh';
+        overlay.style.backgroundColor = 'transparent';
+        overlay.style.backdropFilter = 'none';
+
+        const dialog = overlay.querySelector('.preview-modal');
+        if (dialog) {
+            dialog.style.width = '100%';
+            dialog.style.height = '100%';
+            dialog.style.maxWidth = 'none';
+            dialog.style.borderRadius = '0';
+        }
+
+        // Setup Close Button
+        const legacyCloseBtn = document.getElementById('btn-close-preview');
+        if (legacyCloseBtn) {
+            legacyCloseBtn.style.display = 'block';
+            legacyCloseBtn.onclick = () => {
+                closePDFPreview();
+            };
+        }
+    }
+
+
+    // Load data and render
+    const targetVideoId = initialPanelUrlParams.get('videoId');
+    const targetVideoTitle = initialPanelUrlParams.get('videoTitle');
+
+    if (targetVideoId && targetVideoTitle) {
+        currentVideoId = targetVideoId;
+        currentVideoTitle = targetVideoTitle;
+
+        // SKIP REDUNDANT SETUP: initFileSystem already called FileSystemModule.setup()
+        // we only need to verify it succeeded here.
+        if (!FileSystemModule.dirHandle) {
+            // Fallback just in case race condition
+            await FileSystemModule.setup();
+        }
+
+        if (!FileSystemModule.dirHandle) {
+            console.error("PDF Preview: File system not initialized. Handle is missing.");
+            showToast("Please reconnect your Save Folder in the side panel.");
+            return;
+        }
+
+        // Wait for system to load video state from disk
+        const pagesContainer = document.getElementById('pdf-preview-pages');
+        if (pagesContainer) {
+            pagesContainer.innerHTML = '<div class="preview-loading-msg">Fetching report structure...</div>';
+        }
+
+        // Wait for the JSON part of the state (now non-blocking for images if isPreview=true)
+        await loadVideoState(targetVideoId, targetVideoTitle, true);
+
+        // Trigger report build
+        previewPageData = buildPreviewPagePlan();
+        previewRenderedPages = new Set();
+
+        if (pagesContainer) {
+            pagesContainer.innerHTML = '';
+            if (previewPageData.length === 0) {
+                pagesContainer.innerHTML = '<div class="preview-empty-msg">No screenshots or notes found for this video.</div>';
+            } else {
+                renderPreviewPlaceholders(previewPageData);
+                setupPreviewObserver();
+            }
+        }
+    } else {
+        console.error("PDF Preview: Missing videoId or videoTitle in URL parameters.");
+    }
+}
+
 async function handlePreviewPDF() {
     if (state.screenshots.length === 0 && state.toc.length === 0) {
-        alert("Nothing to preview yet!");
+        showToast("Nothing to preview yet!");
         return;
     }
 
-    previewPageData = buildPreviewPagePlan();
-    previewRenderedPages = new Set();
-    renderPreviewPlaceholders(previewPageData);
-    openPdfPreviewModal();
-    setupPreviewObserver();
+    // Build the preview URL
+    const query = new URLSearchParams({
+        tabId: String(currentTabId),
+        videoId: String(currentVideoId),
+        videoTitle: currentVideoTitle || state.metadata?.videoTitle || "Unknown Video",
+        mode: 'preview'
+    });
+    const url = chrome.runtime.getURL(`sidepanel/panel.html?${query.toString()}`);
+
+    console.time("PDF_PREVIEW_OPEN");
+
+    // Open as a real popup window instead of an iframe.
+    // The iframe approach is blocked by Brave Shields. A chrome.windows.create popup
+    // is a first-class browser window that cannot be blocked by content blockers.
+    try {
+        const screen = await new Promise((resolve) => {
+            chrome.tabs.sendMessage(currentTabId, { action: 'getScreenInfo' }, (res) => {
+                resolve(chrome.runtime.lastError ? null : res);
+            });
+        });
+
+        const width = Math.round((screen?.availWidth || 1920) * 0.65);
+        const height = screen?.availHeight || 1080;
+        const left = Math.round(((screen?.availWidth || 1920) - width) / 2);
+        const top = screen?.availTop || 0;
+
+        chrome.windows.create({
+            url,
+            type: 'popup',
+            width,
+            height,
+            left,
+            top
+        });
+    } catch (e) {
+        console.warn("PDF Preview: Could not get screen info, falling back to default size.", e);
+        chrome.windows.create({ url, type: 'popup', width: 1000, height: 850 });
+    }
+
+    console.timeEnd("PDF_PREVIEW_OPEN");
 }
 
 function closePDFPreview() {
-    // This function is now deprecated as we use a new tab, but kept empty for safety
-    // if any old listeners still try to call it.
+    // With popup windows, the user closes the window directly — nothing to do from panel.
+    // This is kept as a stub in case it's called from old code paths.
 }
+
 
 // ==========================================
 // Utils
@@ -3581,7 +5460,12 @@ function buildStateSnapshot(forVideoId, forTitle = null, lastTimeMs = 0) {
     const targetUrl = state.metadata?.videoUrl || fallbackUrl;
 
     return {
-        screenshots: Array.isArray(state.screenshots) ? state.screenshots : [],
+        // Strip base64 dataUrl from screenshots to prevent O(n^2) JSON stringify memory bloat
+        // Fix #14: Optimize snapshot - avoid full map duplication if not needed
+        screenshots: state.screenshots.map(shot => {
+            const { dataUrl, missingOnDisk, ...rest } = shot;
+            return rest;
+        }),
         toc: Array.isArray(state.toc) ? state.toc : [],
         metadata: {
             ...state.metadata,
@@ -3595,9 +5479,28 @@ function buildStateSnapshot(forVideoId, forTitle = null, lastTimeMs = 0) {
     };
 }
 
+// Fix #8: Debounced save state to prevent race conditions & disk thrashing
+let saveVideoStateTimer = null;
 async function saveVideoState(forVideoId = null, forTitle = null) {
+    if (saveVideoStateTimer) clearTimeout(saveVideoStateTimer);
+    saveVideoStateTimer = setTimeout(async () => {
+        try {
+            await saveVideoStateExecution(forVideoId, forTitle);
+        } catch (err) {
+            console.error("Delayed saveVideoState failed:", err);
+        }
+    }, 500);
+}
+
+async function saveVideoStateExecution(forVideoId = null, forTitle = null) {
     const targetVideoId = forVideoId || currentVideoId || state.metadata?.videoId;
     if (!FileSystemModule.dirHandle || !targetVideoId) return;
+
+    // STRICT: Don't create folders or save files unless the user manually enabled the notebook for this video.
+    if (!isNotebookEnabled) {
+        console.log("Sidepanel: Skipping saveVideoState because Notebook is OFF for this video.");
+        return;
+    }
 
     try {
         const videoTitle = forTitle || currentVideoTitle || state.metadata?.videoTitle || "Unknown Video";
@@ -3621,7 +5524,13 @@ async function saveVideoState(forVideoId = null, forTitle = null) {
         const blob = new Blob([data], { type: 'application/json' });
         const saved = await FileSystemModule.saveFile(VIDEO_STATE_FILENAME, blob, subFolder);
         if (!saved) {
-            showFolderPermissionBannerIfNeeded();
+            if (FileSystemModule.permissionNeedsUserGesture) {
+                showFolderPermissionBannerIfNeeded();
+            } else if (!FileSystemModule.dirHandle) {
+                console.warn("saveVideoState: Failed because folder is missing.");
+            } else {
+                console.warn("saveVideoState: Failed (likely quota or lock).");
+            }
             return;
         }
 
@@ -3637,21 +5546,22 @@ function getDisplayPath(fullPath) {
     return fullPath.split('\\').pop().split('/').pop();
 }
 
-async function loadVideoState(forVideoId, forTitle) {
-    if (!FileSystemModule.dirHandle || !forVideoId || !forTitle) return;
-
-    // Ensure we are still on the same video that we started loading for
-    if (forVideoId !== currentVideoId) return;
-
-    // Check if we actually have permission before trying to read (it won't prompt without a gesture)
-    const options = { mode: 'readwrite' };
-    if ((await FileSystemModule.dirHandle.queryPermission(options)) !== 'granted') {
-        FileSystemModule.permissionNeedsUserGesture = true;
-        showFolderPermissionBannerIfNeeded();
-        return;
-    }
-
+async function loadVideoState(forVideoId, forTitle, isPreview = false) {
+    // console.log("[STABILITY_V3] loadVideoState starting for:", forVideoId, "isPreview:", isPreview);
     try {
+        if (!FileSystemModule.dirHandle || !forVideoId || !forTitle) return;
+
+        // Ensure we are still on the same video that we started loading for
+        if (forVideoId !== currentVideoId) return;
+
+        // Check if we actually have permission before trying to read (it won't prompt without a gesture)
+        const options = { mode: 'readwrite' };
+        if ((await FileSystemModule.dirHandle.queryPermission(options)) !== 'granted') {
+            FileSystemModule.permissionNeedsUserGesture = true;
+            if (!isPreview) showFolderPermissionBannerIfNeeded();
+            return;
+        }
+
         // Final sanity check before the slow FS operations
         if (forVideoId !== currentVideoId) return;
 
@@ -3659,13 +5569,11 @@ async function loadVideoState(forVideoId, forTitle) {
         // Passing forVideoId allows ID-level verification to prevent mismatches
         const subFolder = await FileSystemModule.getVideoFolderHandle(forTitle, false, forVideoId);
         if (!subFolder) {
-            // No folder exists yet -> Definitely OFF? NO, global state now.
-            // setNotebookToggleState(false); // REMOVED: Persistence now global
             return;
         }
 
-        // FOLDER EXISTS -> This video is opted-in
-        // setNotebookToggleState(true); // REMOVED: Persistence now global
+        // FOLDER EXISTS -> This video has internal data, so it IS a notebook
+        if (!isPreview) setNotebookToggleState(true);
 
         // Final sanity check
         if (forVideoId !== currentVideoId) return;
@@ -3683,10 +5591,12 @@ async function loadVideoState(forVideoId, forTitle) {
         }
 
         // Keep root history index in sync with legacy or manually edited state files.
-        try {
-            await upsertHistoryIndexEntry(loadedState, subFolder.name);
-        } catch (historyErr) {
-            console.warn("History index sync failed during load:", historyErr);
+        if (!isPreview) {
+            try {
+                await upsertHistoryIndexEntry(loadedState, subFolder.name);
+            } catch (historyErr) {
+                console.warn("History index sync failed during load:", historyErr);
+            }
         }
 
         // CRITICAL: Verify the loaded state belongs to the video we want.
@@ -3700,6 +5610,108 @@ async function loadVideoState(forVideoId, forTitle) {
         if (loadedState && loadedState.screenshots && loadedState.screenshots.length > 0) {
             // Batch load screenshots into state
             state.screenshots = loadedState.screenshots.map((shot, idx) => normalizeScreenshotRecord(shot, idx));
+
+            const missingFilesDuringRehydration = [];
+            const removedMissingShotIds = [];
+            const permissionDeniedDuringRehydration = [];
+            const otherRehydrationFailures = [];
+
+            // PARALLEL REHYDRATION (Fix #15): Better error handling and concurrency control
+            const rehydratePromises = state.screenshots.map(async (shot) => {
+                if (!shot.dataUrl && shot.filename) {
+                    try {
+                        const imgHandle = await subFolder.getFileHandle(shot.filename);
+                        const imgFile = await imgHandle.getFile();
+                        const blobUrl = URL.createObjectURL(imgFile);
+                        shot.dataUrl = blobUrl;
+                        delete shot.missingOnDisk;
+                        state.blobUrls.add(blobUrl);
+
+                        if (isPreview) {
+                            const shotIdAttr = shot.id || shot.filename;
+                            const previewImgs = document.querySelectorAll(`[data-shot-id="${shotIdAttr}"] .preview-shot-image`);
+                            previewImgs.forEach(img => {
+                                img.src = blobUrl;
+                                img.classList.remove('loading');
+                            });
+                        }
+                    } catch (e) {
+                        if (isMissingFileSystemEntryError(e)) {
+                            removedMissingShotIds.push(shot.id);
+                            missingFilesDuringRehydration.push(shot.filename);
+                            return;
+                        }
+                        if (isPermissionDeniedFileSystemError(e)) {
+                            permissionDeniedDuringRehydration.push(shot.filename);
+                            return;
+                        }
+
+                        const errName = String(e?.name || "UnknownError");
+                        const errMsg = String(e?.message || e || "Unknown rehydration failure");
+                        otherRehydrationFailures.push(`${shot.filename}: ${errName} - ${errMsg}`);
+                    }
+                }
+            });
+
+            // If it's a preview, we want the structure to show INSTANTLY.
+            // Don't await the rehydration; let it happen in background.
+            if (isPreview) {
+                // Kick off but return early
+                Promise.all(rehydratePromises).then(() => {
+                    console.log("PDF Preview: Background image rehydration complete.");
+                }).catch(err => {
+                    console.warn("PDF Preview: Background image rehydration failed:", err);
+                });
+            } else {
+                // If main app opening, wait for it so the UI doesn't pop in too much
+                await Promise.all(rehydratePromises);
+            }
+
+            if (removedMissingShotIds.length > 0) {
+                const removedSet = new Set(removedMissingShotIds);
+                state.screenshots = state.screenshots.filter((shot) => !removedSet.has(shot.id));
+
+                if (isPreview) {
+                    removedSet.forEach((shotId) => {
+                        const previewWrap = document.querySelector(`[data-shot-id="${shotId}"]`);
+                        if (previewWrap) previewWrap.remove();
+                    });
+                }
+            }
+
+            if (missingFilesDuringRehydration.length > 0) {
+                if (ENABLE_REHYDRATION_DEBUG_LOGS) {
+                    console.info(
+                        `[REHYDRATION] Removed ${missingFilesDuringRehydration.length} screenshot record(s) because files are missing on disk.`,
+                        missingFilesDuringRehydration
+                    );
+                }
+                if (!isPreview) {
+                    // Persist cleanup immediately so stale entries do not reappear on next open.
+                    await saveVideoStateExecution(forVideoId, forTitle);
+                }
+            }
+
+            if (permissionDeniedDuringRehydration.length > 0) {
+                if (ENABLE_REHYDRATION_DEBUG_LOGS) {
+                    console.warn(
+                        `[REHYDRATION] Permission denied for ${permissionDeniedDuringRehydration.length} screenshot file(s).`
+                    );
+                }
+                if (!isPreview) {
+                    showFolderPermissionBannerIfNeeded();
+                }
+            }
+
+            if (otherRehydrationFailures.length > 0) {
+                if (ENABLE_REHYDRATION_DEBUG_LOGS) {
+                    console.warn(
+                        `[REHYDRATION] ${otherRehydrationFailures.length} screenshot file(s) could not be rehydrated.`,
+                        otherRehydrationFailures
+                    );
+                }
+            }
+
             // Sort by capture order
             state.screenshots.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
         }
@@ -3710,8 +5722,8 @@ async function loadVideoState(forVideoId, forTitle) {
             state.toc = sortTOCByCreated(state.toc);
         }
 
-        // Resume video position
-        if (loadedState && loadedState.metadata && loadedState.metadata.lastTimeMs > 0) {
+        // Resume video position (skip for preview)
+        if (!isPreview && loadedState && loadedState.metadata && loadedState.metadata.lastTimeMs > 0) {
             console.log("Sidepanel: Resuming video at", loadedState.metadata.lastTimeMs);
             setTimeout(() => {
                 seekActiveYouTubeTab(loadedState.metadata.lastTimeMs);
@@ -3719,12 +5731,24 @@ async function loadVideoState(forVideoId, forTitle) {
         }
 
         // Single render call for everything
-        renderMainGallery();
-        generateIntervalMarkers();
-        renderTOCList();
+        if (!isPreview) {
+            debugLog("Sidepanel: Triggering UI renders...");
+            try {
+                renderMainGallery();
+            } catch (e) { console.error("Sidepanel: renderMainGallery failed", e); }
+
+            try {
+                generateIntervalMarkers();
+            } catch (e) { console.error("Sidepanel: generateIntervalMarkers failed", e); }
+
+            try {
+                renderTOCList();
+            } catch (e) { console.error("Sidepanel: renderTOCList failed", e); }
+        }
 
     } catch (err) {
         console.log("No previous state found to load or error reading file. Fresh slate.");
+        console.error("Failed to load video state", err); // Added error logging for clarity
     }
 }
 
@@ -3746,10 +5770,92 @@ function setNotebookToggleState(isOn) {
     try {
         localStorage.setItem('ynNotebookEnabled', isNotebookEnabled.toString());
     } catch (err) {
-        console.warn("Failed to persist notebook toggle state:", err);
+        console.warn("localStorage failed:", err);
     }
 
-    syncNotebookStateToContent(isNotebookEnabled);
+    syncNotebookStateToContent(isOn);
+}
+
+function setAutoOpenToggleState(isOn) {
+    isAutoOpenEnabled = isOn;
+    const toggle = document.getElementById('toggle-auto-open');
+    const text = document.getElementById('toggle-auto-open-text');
+    if (toggle && text) {
+        toggle.checked = isOn;
+        if (isOn) {
+            text.textContent = 'On';
+            text.classList.add('active');
+        } else {
+            text.textContent = 'Off';
+            text.classList.remove('active');
+        }
+    }
+
+    try {
+        chrome.storage.local.set({ isAutoOpenEnabled: isOn });
+    } catch (err) {
+        console.warn("Failed to save Auto-Open state:", err);
+    }
+}
+
+async function initAutoOpenToggle() {
+    const toggle = document.getElementById('toggle-auto-open');
+    if (!toggle) return;
+
+    try {
+        const result = await chrome.storage.local.get('isAutoOpenEnabled');
+        // Default to true if not set
+        const isOn = result.isAutoOpenEnabled !== false;
+        setAutoOpenToggleState(isOn);
+    } catch (err) {
+        console.warn("Failed to load Auto-Open state:", err);
+        setAutoOpenToggleState(true);
+    }
+
+    toggle.addEventListener('change', (e) => {
+        setAutoOpenToggleState(!!e.target.checked);
+    });
+}
+
+function setCCToggleState(isOn) {
+    isCaptionEnabled = isOn;
+    const toggle = document.getElementById('toggle-cc-capture');
+    const text = document.getElementById('toggle-cc-text');
+    if (toggle && text) {
+        toggle.checked = isOn;
+        if (isOn) {
+            text.textContent = 'On';
+            text.classList.add('active');
+        } else {
+            text.textContent = 'Off';
+            text.classList.remove('active');
+        }
+    }
+
+    try {
+        chrome.storage.local.set({ isCaptionEnabled: isOn });
+    } catch (err) {
+        console.warn("Failed to save CC toggle state:", err);
+    }
+}
+
+async function initCCToggle() {
+    const toggle = document.getElementById('toggle-cc-capture');
+    if (!toggle) return;
+
+    try {
+        const result = await chrome.storage.local.get('isCaptionEnabled');
+        // Default to false (clean screenshots) if not set
+        const isOn = !!result.isCaptionEnabled;
+        setCCToggleState(isOn);
+    } catch (err) {
+        console.warn("Failed to load CC toggle state:", err);
+        setCCToggleState(false);
+    }
+
+    toggle.addEventListener('change', (e) => {
+        setCCToggleState(!!e.target.checked);
+    });
 }
 
 // Reset UI specifically to clear data on video change
@@ -3758,23 +5864,63 @@ function setNotebookToggleState(isOn) {
 // ==========================================
 // Transcript Feature
 // ==========================================
+
+function initTranscriptRangeSettings() {
+    const inputBefore = document.getElementById('transcript-before');
+    const inputAfter = document.getElementById('transcript-after');
+
+    if (!inputBefore || !inputAfter) return;
+
+    // Load from storage
+    chrome.storage.local.get(['transcriptRangePre', 'transcriptRangePost'], (data) => {
+        if (data.transcriptRangePre !== undefined) inputBefore.value = data.transcriptRangePre;
+        if (data.transcriptRangePost !== undefined) inputAfter.value = data.transcriptRangePost;
+    });
+
+    // Save on change
+    const save = () => {
+        const pre = parseInt(inputBefore.value) || 0;
+        const post = parseInt(inputAfter.value) || 0;
+        chrome.storage.local.set({ transcriptRangePre: pre, transcriptRangePost: post });
+    };
+
+    inputBefore.addEventListener('input', save);
+    inputAfter.addEventListener('input', save);
+}
+
+async function getCachedTranscript(force = false) {
+    if (cachedTranscriptSegments && !force) return cachedTranscriptSegments;
+    const tabId = await resolveActiveYouTubeTabId();
+    if (!Number.isInteger(tabId)) return null;
+
+    const response = await sendMessageWithRetry(tabId, { action: 'getTranscript' }, 2, 250);
+    if (response?.success && response.segments) {
+        cachedTranscriptSegments = normalizeTranscriptSegmentsForDisplay(response.segments);
+        return cachedTranscriptSegments;
+    }
+    return null;
+}
+
 async function refreshTranscript() {
-    const list = document.getElementById('transcript-content');
+    if (!safeSetInnerHTML('transcript-content', '')) return;
     const tabId = await resolveActiveYouTubeTabId();
     if (!Number.isInteger(tabId)) {
-        list.innerHTML = `<div class="empty-state"><p>Please open a YouTube watch page first.</p></div>`;
+        safeSetInnerHTML('transcript-content', `<div class="empty-state"><p>Please open a YouTube watch page first.</p></div>`);
         return;
     }
-    list.innerHTML = `<div class="empty-state"><p>Loading transcript...</p></div>`;
+
+    safeSetInnerHTML('transcript-content', `<div class="empty-state"><p>Loading transcript...</p></div>`);
 
     const attempts = 3;
     const errors = [];
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
         const response = await sendMessageWithRetry(tabId, { action: 'getTranscript' }, 2, 250);
-        const segments = normalizeTranscriptSegmentsForDisplay(response?.segments);
-
-        if (response?.success && segments.length > 0) {
+        // Fix #17: Redundant normalization removed - it's already done in getCachedTranscript 
+        // which refreshTranscript should use or mirror.
+        if (response?.success && response.segments) {
+            const segments = normalizeTranscriptSegmentsForDisplay(response.segments);
+            cachedTranscriptSegments = segments; // Synchronize cache
             displayTranscript(segments);
             return;
         }
@@ -3788,20 +5934,20 @@ async function refreshTranscript() {
         }
 
         if (attempt < attempts) {
-            list.innerHTML = `<div class="empty-state"><p>Retrying transcript (${attempt}/${attempts})...</p></div>`;
+            safeSetInnerHTML('transcript-content', `<div class="empty-state"><p>Retrying transcript (${attempt}/${attempts})...</p></div>`);
             await new Promise(r => setTimeout(r, 650 * attempt));
         }
     }
 
     const uniqueErrors = Array.from(new Set(errors.filter(Boolean)));
     const errorMsg = uniqueErrors.slice(-2).join(' | ') || "Transcript is unavailable right now.";
-    list.innerHTML = `
+    safeSetInnerHTML('transcript-content', `
         <div class="empty-state">
             <p style="color: var(--status-error);">${errorMsg}</p>
             <p style="font-size: 11px; margin-top: 8px; opacity: 0.75;">
                 Tip: Keep the video playing for 2-3 seconds after seek/resize, then retry transcript.
             </p>
-        </div>`;
+        </div>`);
 }
 
 function splitTranscriptTextForDisplay(text, maxChars = 120) {
@@ -3893,8 +6039,10 @@ function normalizeTranscriptSegmentsForDisplay(segments) {
 }
 
 function displayTranscript(segments) {
+    if (!safeSetInnerHTML('transcript-content', '')) return;
+
     const list = document.getElementById('transcript-content');
-    list.innerHTML = '';
+    if (!list) return;
 
     const normalizedSegments = normalizeTranscriptSegmentsForDisplay(segments);
     if (!normalizedSegments.length) {
@@ -3965,11 +6113,6 @@ function parseTimeToMs(timeStr) {
     return ms;
 }
 
-// Helper for display path
-function getDisplayPath(fullPath) {
-    if (!fullPath) return "";
-    return fullPath.split('\\').pop().split('/').pop();
-}
 
 // ==========================================
 // Time Formatter
@@ -4058,13 +6201,13 @@ function initDurationCalculator() {
 async function openDurationCalculator() {
     const tabId = await resolveActiveYouTubeTabId();
     if (!Number.isInteger(tabId)) {
-        alert("Please open and play a YouTube video first.");
+        await showAlert("Please open and play a YouTube video first.");
         return;
     }
 
     const stateResp = await sendMessageWithRetry(tabId, { action: 'getState' }, 3, 500);
     if (!stateResp || !stateResp.durationMs) {
-        alert("Could not get video state. Ensure the video is loaded and try again.");
+        await showAlert("Could not get video state. Ensure the video is loaded and try again.");
         return;
     }
 
@@ -4198,7 +6341,7 @@ function updateDurationCalculations() {
     const opt1Res = document.getElementById('calc-opt1-result');
     const hoursPerDay = parseFloat(document.getElementById('calc-hours-input').value) || 1.0;
     if (hoursPerDay > 0) {
-        let tbl = `<p class="fw-bold mb-2">ðŸ“… Completion Timeline for ${hoursPerDay}h daily:</p>
+        let tbl = `<p class="fw-bold mb-2">\u{1F4C5} Completion Timeline for ${hoursPerDay}h daily:</p>
                    <table class="comp-table">`;
         calcState.speeds.forEach(speed => {
             const adjHours = totalHours / speed;
@@ -4219,7 +6362,7 @@ function updateDurationCalculations() {
     const opt2Res = document.getElementById('calc-opt2-result');
     const targetDays = parseInt(document.getElementById('calc-days-input').value, 10) || 7;
     if (targetDays > 0) {
-        let tbl = `<p class="fw-bold mb-2">â° Daily Hours Required to Complete in ${targetDays}d:</p>
+        let tbl = `<p class="fw-bold mb-2">\u23F0 Daily Hours Required to Complete in ${targetDays}d:</p>
                    <table class="comp-table">`;
         calcState.speeds.forEach(speed => {
             const adjHours = totalHours / speed;
@@ -4276,7 +6419,7 @@ async function handleSetInterval() {
                     saveVideoState();
                 }
             } else {
-                alert("Invalid format! Use numbers followed by s, m, or h (e.g., 5m, 1h).");
+                showToast("Invalid format! Use 5m, 1h, etc.", "error");
             }
         }
     } else {
@@ -4289,28 +6432,46 @@ async function handleSetInterval() {
 function generateIntervalMarkers() {
     const intervalStr = state.metadata.selectedInterval;
     const container = document.getElementById('timeline-markers');
-    if (!container) return;
+    if (!container) {
+        console.warn("Sidepanel: timeline-markers container not found in DOM");
+        return;
+    }
 
     container.innerHTML = '';
+    // Clear previous density classes
+    container.classList.remove('compact-flags', 'mini-flags', 'micro-flags');
     state.intervalMarkers = [];
 
-    if (!intervalStr || intervalStr === "None") return;
+    if (!intervalStr || intervalStr === "None") {
+        console.log("Sidepanel: Markers disabled (interval is None)");
+        return;
+    }
 
     const intervalSecs = parseInt(intervalStr);
     const durationMs = state.metadata.durationMs || 0;
 
-    // If duration isn't loaded yet, we can't generate markers. 
-    // updateTimeline will call this once duration is detected.
+    console.log(`Sidepanel: generateIntervalMarkers - Requesting markers for ${intervalStr}s. Duration: ${durationMs}ms`);
+
     if (durationMs <= 0 || isNaN(intervalSecs)) {
-        console.log("Sidepanel: Delaying marker generation (no duration yet)");
+        console.log("Sidepanel: Delaying marker generation (no duration or invalid interval yet)");
         return;
     }
 
     const intervalMs = intervalSecs * 1000;
+    const totalMarkersRequested = Math.floor(durationMs / intervalMs);
+
+    // Adaptive Density Logic
+    if (totalMarkersRequested > 100) {
+        container.classList.add('micro-flags');
+    } else if (totalMarkersRequested > 40) {
+        container.classList.add('mini-flags');
+    } else if (totalMarkersRequested > 15) {
+        container.classList.add('compact-flags');
+    }
+
     const colors = ["#e74c3c", "#8e44ad", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22", "#16a085", "#c0392b", "#d35400"];
 
     let count = 1;
-    // Start from the first interval
     for (let time = intervalMs; time < durationMs; time += intervalMs) {
         const percentage = (time / durationMs) * 100;
         const color = colors[(count - 1) % colors.length];
@@ -4321,6 +6482,7 @@ function generateIntervalMarkers() {
         marker.className = 'timeline-marker';
         marker.style.left = `${percentage}%`;
         marker.style.setProperty('--marker-color', color);
+        marker.title = `Interval ${count}: ${formatTime(time)}`;
 
         marker.innerHTML = `
             <div class="flag">
@@ -4332,10 +6494,557 @@ function generateIntervalMarkers() {
         container.appendChild(marker);
         count++;
 
-        if (count > 500) break; // Extended safety limit for long videos
+        if (count > 800) { // Increased safety limit slightly
+            console.warn("Sidepanel: Reached safety limit of 800 markers");
+            break;
+        }
     }
 
-    console.log(`Sidepanel: Generated ${count - 1} interval markers for ${intervalStr}s interval`);
+    console.log(`Sidepanel: Success! Generated ${count - 1} interval markers for ${intervalStr}s interval`);
 }
 
+// ==========================================
+// Action: Watch Later
+// ==========================================
+function initWatchLaterTab() {
+    const sortSelect = document.getElementById('sort-watch-later');
+    if (sortSelect) {
+        sortSelect.addEventListener('change', () => {
+            renderWatchLaterList();
+        });
+    }
+}
 
+async function loadWatchLaterList() {
+    if (!FileSystemModule.dirHandle) return;
+    try {
+        const fileHandle = await FileSystemModule.dirHandle.getFileHandle(WATCH_LATER_FILENAME, { create: false });
+        const file = await fileHandle.getFile();
+        const text = await file.text();
+        const data = JSON.parse(text);
+        if (Array.isArray(data)) {
+            state.watchLaterList = data;
+            renderWatchLaterList();
+        }
+    } catch (err) {
+        if (err.name !== 'NotFoundError') {
+            console.error("Failed to load Watch Later list:", err);
+        }
+    }
+}
+
+async function saveWatchLaterList() {
+    if (!FileSystemModule.dirHandle) return false;
+    try {
+        const json = JSON.stringify(state.watchLaterList, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        const saved = await FileSystemModule.saveFile(WATCH_LATER_FILENAME, blob);
+        if (!saved && !FileSystemModule.permissionNeedsUserGesture) {
+            console.warn("saveWatchLaterList: Save failed without gesture needed.");
+        }
+        return saved;
+    } catch (err) {
+        console.error("Failed to save Watch Later list:", err);
+        return false;
+    }
+}
+
+async function handleAddWatchLaterRequest(providedMetadata = null) {
+    console.log("Sidepanel: handleAddWatchLaterRequest starting. currentVideoId:", currentVideoId);
+
+    // If variables missing, try to recover from providedMetadata
+    if ((!currentVideoId || !currentVideoTitle) && providedMetadata) {
+        console.log("Sidepanel: Recovering metadata from message:", providedMetadata);
+        currentVideoId = providedMetadata.videoId;
+        currentVideoTitle = providedMetadata.title;
+        state.metadata.videoId = providedMetadata.videoId;
+        state.metadata.videoTitle = providedMetadata.title;
+        state.metadata.videoUrl = providedMetadata.url;
+        state.metadata.channel = providedMetadata.channel;
+    }
+
+    // Safety check: Ensure watchLaterList exists (prevents TypeError)
+    if (!state.watchLaterList) {
+        console.error("Sidepanel: watchLaterList missing from state! Re-initializing.");
+        state.watchLaterList = [];
+        await loadWatchLaterList();
+    }
+
+    if (!currentVideoId || !currentVideoTitle) {
+        console.warn("Sidepanel: Cannot add to watch later - missing video metadata", { currentVideoId, currentVideoTitle });
+        showToast("No video detected to add.", "warning");
+        return;
+    }
+
+    // Check if already in list
+    const existing = state.watchLaterList.find(item => item.videoId === currentVideoId);
+    if (existing) {
+        showToast("Video already in Watch Later list.", "info");
+        return;
+    }
+
+    // Show Priority Choice Dialog
+    const priorityChoices = [
+        { label: "1 (Critical)", value: "1", icon: "\u{1F525}" },
+        { label: "2 (High)", value: "2", icon: "\u2B50" },
+        { label: "3 (Medium)", value: "3", icon: "\u{1F4CD}" },
+        { label: "4 (Low)", value: "4", icon: "\u23F2" },
+        { label: "5 (Optional)", value: "5", icon: "\u{1F4A1}" }
+    ];
+
+    const result = await showPrompt("Select Priority Level:", "", priorityChoices);
+    if (!result) return; // Cancelled
+
+    const priority = parseInt(result);
+    const thumbnail = `https://i.ytimg.com/vi/${currentVideoId}/mqdefault.jpg`;
+
+    // Progress estimation from current UI or 0
+    let progress = 0;
+    const progressFill = document.getElementById('progress-fill');
+    if (progressFill) {
+        progress = parseFloat(progressFill.style.width) || 0;
+    }
+
+    const newItem = {
+        videoId: currentVideoId,
+        title: currentVideoTitle,
+        thumbnail: thumbnail,
+        addedAt: Date.now(),
+        priority: priority,
+        progressPercentage: Math.round(progress),
+        completed: progress >= 95
+    };
+
+    state.watchLaterList.unshift(newItem); // Add to top
+    const saved = await saveWatchLaterList();
+    if (saved) {
+        renderWatchLaterList();
+        showToast("Added to Watch Later!", "success");
+    } else {
+        // Rollback state if save failed
+        state.watchLaterList.shift();
+        if (FileSystemModule.permissionNeedsUserGesture) {
+            showFolderPermissionBannerIfNeeded();
+        } else {
+            showToast("Failed to save Watch Later list. Check permissions.", "error");
+        }
+    }
+}
+
+function renderWatchLaterList() {
+    const list = document.getElementById('watch-later-list');
+    if (!list) return;
+
+    if (state.watchLaterList.length === 0) {
+        list.innerHTML = `
+            <div class="empty-state">
+                <p>No videos added to Watch Later yet.</p>
+                <p class="text-xs">Click the + icon in the YouTube player to add one.</p>
+            </div>
+        `;
+        return;
+    }
+
+    // Sorting
+    const sortVal = document.getElementById('sort-watch-later')?.value || 'date';
+    const sorted = [...state.watchLaterList].sort((a, b) => {
+        if (sortVal === 'priority') {
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            return b.addedAt - a.addedAt;
+        }
+        return b.addedAt - a.addedAt; // Default: newest first
+    });
+
+    list.innerHTML = '';
+    sorted.forEach(item => {
+        const card = document.createElement('div');
+        card.className = `watch-later-item wl-priority-${item.priority}`;
+
+        const dateStr = new Date(item.addedAt).toLocaleDateString();
+
+        card.innerHTML = `
+            <div class="wl-main-info">
+                <div class="wl-thumb-container">
+                    <img src="${item.thumbnail}" class="wl-thumb" loading="lazy">
+                    <div class="wl-priority-badge">${item.priority}</div>
+                </div>
+                <div class="wl-details">
+                    <div class="wl-title" title="${item.title}">${item.title}</div>
+                    <div class="wl-meta">Added: ${dateStr} • Priority: ${item.priority}</div>
+                    <div class="wl-progress" title="${item.progressPercentage}% watched">
+                        <div class="wl-progress-fill" style="width: ${item.progressPercentage}%"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="wl-actions">
+                <button class="wl-action-btn delete" title="Remove">Delete</button>
+                <button class="wl-action-btn play" title="Play Now">Play</button>
+            </div>
+        `;
+
+        card.querySelector('.delete').onclick = async () => {
+            const originalList = [...state.watchLaterList];
+            state.watchLaterList = state.watchLaterList.filter(i => i.videoId !== item.videoId);
+            const saved = await saveWatchLaterList();
+            if (saved) {
+                renderWatchLaterList();
+                showToast("Removed from Watch Later.", "info");
+            } else {
+                state.watchLaterList = originalList;
+                if (FileSystemModule.permissionNeedsUserGesture) {
+                    showFolderPermissionBannerIfNeeded();
+                } else {
+                    showToast("Failed to update Watch Later list.", "error");
+                }
+            }
+        };
+
+        card.querySelector('.play').onclick = () => {
+            const url = `https://www.youtube.com/watch?v=${item.videoId}`;
+            if (currentTabId) {
+                chrome.tabs.update(currentTabId, { url: url });
+            } else {
+                window.open(url, '_blank');
+            }
+        };
+
+        list.appendChild(card);
+    });
+}
+
+// ==========================================
+// Action: Countdown Manager
+// ==========================================
+
+async function loadCountdowns() {
+    if (!FileSystemModule.dirHandle) return;
+    try {
+        const fileHandle = await FileSystemModule.dirHandle.getFileHandle(COUNTDOWN_FILENAME, { create: false });
+        const file = await fileHandle.getFile();
+        const text = await file.text();
+        const data = JSON.parse(text);
+        if (Array.isArray(data)) {
+            state.countdowns = data;
+            renderCountdowns();
+        }
+    } catch (err) {
+        if (err.name !== 'NotFoundError') {
+            console.error("Failed to load Countdowns list:", err);
+        }
+    }
+}
+
+async function saveCountdowns() {
+    if (!FileSystemModule.dirHandle) return false;
+    try {
+        const json = JSON.stringify(state.countdowns, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        const saved = await FileSystemModule.saveFile(COUNTDOWN_FILENAME, blob);
+        return saved;
+    } catch (err) {
+        console.error("Failed to save Countdowns list:", err);
+        return false;
+    }
+}
+
+async function handleAddCountdownPrompt() {
+    if (!FileSystemModule.dirHandle) {
+        showToast("Please select a Save Folder first to save countdowns.", "warning");
+        return;
+    }
+
+    // Quick prompt flow since we don't have a complex forms library
+    const title = await showPrompt("Enter Countdown Title:", "New Goal");
+    if (!title) return;
+
+    // We'll calculate end date based on duration for simplicity, or user can put YYYY-MM-DD
+    const durationInput = await showPrompt("Enter Duration in Days (or exact End Date YYYY-MM-DD):", "30");
+    if (!durationInput) return;
+
+    const today = new Date();
+    const startDateStr = today.toISOString().split('T')[0];
+    let endDateStr = "";
+
+    if (!isNaN(parseInt(durationInput))) {
+        // It's a number (duration in days)
+        const days = parseInt(durationInput);
+        const endDate = new Date(today);
+        endDate.setDate(today.getDate() + days);
+        endDateStr = endDate.toISOString().split('T')[0];
+    } else {
+        // Assume it's a date string
+        endDateStr = durationInput;
+        // Validate
+        if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(endDateStr)) {
+            showToast("Invalid date format. Use YYYY-MM-DD.", "error");
+            return;
+        }
+    }
+
+    const newId = Date.now();
+    state.countdowns.push({
+        id: newId,
+        title: title,
+        startDate: startDateStr,
+        endDate: endDateStr,
+        isTransparent: false
+    });
+
+    const saved = await saveCountdowns();
+    if (saved) {
+        renderCountdowns();
+        showToast("Countdown added!", "success");
+    } else {
+        state.countdowns.pop();
+        if (FileSystemModule.permissionNeedsUserGesture) {
+            showFolderPermissionBannerIfNeeded();
+        } else {
+            showToast("Failed to save countdown. Check permissions.", "error");
+        }
+    }
+}
+
+// Fix #16: Batch DOM creation in renderTOCList using DocumentFragment
+function renderTOCList() {
+    const list = document.getElementById('toc-list');
+    if (!list) return;
+
+    list.innerHTML = "";
+    if (!state.toc || state.toc.length === 0) {
+        list.innerHTML = '<div class="empty-state">No markers yet. Use the timeline or click a screenshot button to add.</div>';
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    state.toc.forEach(entry => {
+        const item = createTOCGalleryElement(entry);
+        fragment.appendChild(item);
+    });
+    list.appendChild(fragment);
+}
+
+function renderCountdowns() {
+    const list = document.getElementById('countdown-list');
+    if (!list) return;
+
+    if (state.countdowns.length === 0) {
+        list.innerHTML = `
+            <div class="empty-state">
+                <p>No countdowns created yet.</p>
+                <p class="text-xs">Click + Add to create a new goal / countdown.</p>
+            </div>
+        `;
+        return;
+    }
+
+    list.innerHTML = '';
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); // Normalize to start of day
+
+    state.countdowns.forEach(c => {
+        const card = document.createElement('div');
+        card.className = "countdown-item";
+
+        let parseError = false;
+        let start, end, totalDays, passedDays, remainingDays, progress = 0;
+
+        try {
+            start = new Date(c.startDate);
+            start.setMinutes(start.getMinutes() + start.getTimezoneOffset()); // Fix timezone shift
+
+            end = new Date(c.endDate);
+            end.setMinutes(end.getMinutes() + end.getTimezoneOffset());
+
+            totalDays = Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1;
+            passedDays = Math.round((today - start) / (1000 * 60 * 60 * 24));
+            remainingDays = Math.round((end - today) / (1000 * 60 * 60 * 24)) + 1;
+
+            progress = Math.min(100, Math.max(0, Math.round((passedDays / totalDays) * 100)));
+            if (isNaN(progress)) progress = 0;
+        } catch (e) {
+            parseError = true;
+        }
+
+        if (parseError) {
+            card.innerHTML = `<div class="cd-error">Error parsing dates for ${c.title}</div>`;
+            list.appendChild(card);
+            return;
+        }
+
+        // Determine styles based on urgency
+        let progressColor = "var(--primary-color)";
+        let alertBadge = "";
+
+        if (remainingDays <= 0) {
+            progressColor = "#e74c3c"; // Red
+            alertBadge = `<span class="cd-badge critical"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:3px"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg> Deadline Passed</span>`;
+            progress = 100; // Cap
+        } else if (progress >= 100) {
+            progressColor = "#2ecc71"; // Green
+            alertBadge = `<span class="cd-badge success"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" style="margin-right:3px"><polyline points="20 6 9 17 4 12"></polyline></svg> Completed</span>`;
+        } else if (remainingDays <= 3) {
+            progressColor = "#e67e22"; // Orange
+            alertBadge = `<span class="cd-badge warning"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:3px"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg> Only ${remainingDays} days left</span>`;
+        } else {
+            alertBadge = `<span class="cd-badge info">${remainingDays} days left</span>`;
+        }
+
+        const isTransparent = c.isTransparent === true;
+
+        let html = `
+            <div class="cd-header">
+                <div class="cd-title">${c.title}</div>
+                <div class="cd-header-actions">
+                    <label class="cd-transparency-toggle" title="Transparency Mode">
+                        <input type="checkbox" class="cd-trans-check" data-id="${c.id}" ${isTransparent ? 'checked' : ''}>
+                        <span class="cd-toggle-text">Clear</span>
+                    </label>
+                    <button class="cd-mini-btn" data-id="${c.id}">Mini View</button>
+                    <button class="cd-delete-btn" data-id="${c.id}" title="Delete">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                    </button>
+                </div>
+            </div>
+            
+            <div class="cd-meta">
+                <span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg> ${c.startDate} - ${c.endDate}</span>
+                <span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg> ${totalDays} days total</span>
+                ${alertBadge}
+            </div>
+            
+            <div class="cd-progress-container">
+                <div class="cd-progress-text">Progress: ${progress}%</div>
+                <div class="cd-progress-track">
+                    <div class="cd-progress-fill" style="width: ${progress}%; background-color: ${progressColor};"></div>
+                </div>
+            </div>
+            
+            <div class="cd-grid">
+        `;
+
+        // Checkboxes Grid (Max 30 days displayed to prevent lag if huge)
+        const displayDays = Math.min(totalDays, 100);
+        for (let i = 0; i < displayDays; i++) {
+            const dayDate = new Date(start);
+            dayDate.setDate(dayDate.getDate() + i);
+            const isDone = dayDate <= today;
+            const isToday = i === passedDays;
+
+            let btnClass = "cd-day";
+            let label = i + 1;
+            if (isDone) {
+                btnClass += " done";
+                label = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+            } else if (isToday) {
+                btnClass += " today";
+            }
+
+            html += `<div class="${btnClass}">${label}</div>`;
+        }
+
+        html += `</div>`;
+
+
+
+        card.innerHTML = html;
+
+        // Bind delete action
+        card.querySelector('.cd-delete-btn').addEventListener('click', async () => {
+            if (await showConfirm(`Delete countdown "${c.title}"?`)) {
+                const original = [...state.countdowns];
+                state.countdowns = state.countdowns.filter(item => item.id !== c.id);
+                if (state.activeMiniViewId === c.id) closeMiniView();
+                
+                const saved = await saveCountdowns();
+                if (saved) {
+                    renderCountdowns();
+                } else {
+                    state.countdowns = original;
+                    if (FileSystemModule.permissionNeedsUserGesture) {
+                        showFolderPermissionBannerIfNeeded();
+                    } else {
+                        showToast("Failed to delete countdown. Check permissions.", "error");
+                    }
+                }
+            }
+        });
+
+        // Bind mini view toggle
+        const miniBtn = card.querySelector('.cd-mini-btn');
+        if (miniBtn) {
+            miniBtn.addEventListener('click', () => toggleMiniView(c.id));
+        }
+
+        // Bind transparency toggle
+        const transCheck = card.querySelector('.cd-trans-check');
+        if (transCheck) {
+            transCheck.addEventListener('change', async (e) => {
+                const checked = e.target.checked;
+                const cdItem = state.countdowns.find(item => item.id === c.id);
+                if (cdItem) {
+                    const originalVal = cdItem.isTransparent;
+                    cdItem.isTransparent = checked;
+                    const saved = await saveCountdowns();
+                    if (saved) {
+                        // If this is the active mini view, refresh it
+                        if (state.activeMiniViewId === c.id) {
+                            chrome.storage.local.set({ activeCountdownMiniView: cdItem });
+                        }
+                    } else {
+                        cdItem.isTransparent = originalVal;
+                        e.target.checked = originalVal;
+                        if (FileSystemModule.permissionNeedsUserGesture) {
+                            showFolderPermissionBannerIfNeeded();
+                        } else {
+                            showToast("Failed to update transparency.", "error");
+                        }
+                    }
+                }
+            });
+        }
+
+        list.appendChild(card);
+    });
+
+    // Auto-restore mini view if active
+    if (state.activeMiniViewId) {
+        toggleMiniView(state.activeMiniViewId, true);
+    }
+}
+
+// ---------------------------------------------------------
+// Mini View Overlay Logic
+// ---------------------------------------------------------
+
+function toggleMiniView(id, forceRestore = false) {
+    // If clicking same active ID, close it
+    if (state.activeMiniViewId === id && !forceRestore) {
+        closeMiniView();
+        return;
+    }
+
+    const cd = state.countdowns.find(c => c.id === id);
+    if (!cd) {
+        closeMiniView();
+        return;
+    }
+
+    state.activeMiniViewId = id;
+
+    // Save to chrome.storage.local so the content script can display the overlay on the YouTube page
+    chrome.storage.local.set({ activeCountdownMiniView: cd });
+}
+
+function closeMiniView() {
+    state.activeMiniViewId = null;
+    chrome.storage.local.remove(['activeCountdownMiniView', 'activeCountdownMiniViewPos']);
+}
+
+// Listen for the content-script closing the mini view
+chrome.storage.onChanged.addListener((changes, namespace) => {
+    if (namespace === 'local' && changes.activeCountdownMiniView) {
+        if (!changes.activeCountdownMiniView.newValue) {
+            state.activeMiniViewId = null;
+        }
+    }
+});

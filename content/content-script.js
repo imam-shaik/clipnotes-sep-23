@@ -1,6 +1,19 @@
 // content/content-script.js
 
-class YouTubeController {
+const TIMEOUT_CONFIG = {
+    BRIDGE_DATA_MAX_WAIT: 4000,   // Increased from 3000ms for high-latency systems
+    ANIMATION_FEEDBACK: 150,
+    PLAYER_POLL_RATE: 500,
+    NAV_FALLBACK_POLL: 5000,
+    RETRY_DELAY_BASE: 200,
+    ENABLE_DEBUG: false
+};
+
+function debugLog(...args) {
+    if (TIMEOUT_CONFIG.ENABLE_DEBUG) console.log("[DEBUG]", ...args);
+}
+
+class YouTubeNotesContent {
     constructor() {
         this.video = null;
         this.videoId = this.extractVideoId();
@@ -10,20 +23,89 @@ class YouTubeController {
         this.isPanelOpen = false;
         this.panelStatePollTimer = null;
         this.storageListenerAttached = false;
+        this._playerInterval = null;
+        this._playerIntervalRate = 500;
         this.setupPlayerObserver();
+        this._navInterval = null;
+        this._playerInjectionInterval = null;
+        this._messageListener = null;
+        this._storageChangeListener = null;
+        this._miniViewStorageChangeListener = null;
+        this._keyboardListener = null;
+        this._miniViewDragCleanup = null;
+        this._destroyed = false;
         this.setupNavigationObserver();
+        this.injectCSS();
         this.removeLegacyActivationPrompt();
         this.setupActivationLauncher();
         this.setupMessageListener();
         this.setupKeyboardShortcuts();
-        console.log("YouTube Notes Extension: Content Script Initialized.");
+        this.setupMiniViewListener();
+        // console.log("YouTube Notes Extension: Content Script Initialized.");
+    }
+
+    isRuntimeAvailable() {
+        try {
+            return !!chrome.runtime?.id;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    destroy() {
+        this._destroyed = true;
+
+        if (this._navInterval) clearInterval(this._navInterval);
+        if (this._playerInjectionInterval) clearInterval(this._playerInjectionInterval);
+        if (this._playerInterval) clearTimeout(this._playerInterval);
+        if (this.panelStatePollTimer) clearInterval(this.panelStatePollTimer);
+
+        this._navInterval = null;
+        this._playerInjectionInterval = null;
+        this._playerInterval = null;
+        this.panelStatePollTimer = null;
+
+        if (this._keyboardListener) {
+            window.removeEventListener('keydown', this._keyboardListener, true);
+            this._keyboardListener = null;
+        }
+
+        const safelyRemoveListener = (parent, listener) => {
+            if (!listener || !parent?.removeListener) return;
+            try {
+                parent.removeListener(listener);
+            } catch (e) {
+                // Ignore "Extension context invalidated" errors
+            }
+        };
+
+        safelyRemoveListener(chrome?.runtime?.onMessage, this._messageListener);
+        this._messageListener = null;
+
+        safelyRemoveListener(chrome?.storage?.onChanged, this._storageChangeListener);
+        this._storageChangeListener = null;
+        this.storageListenerAttached = false;
+
+        safelyRemoveListener(chrome?.storage?.onChanged, this._miniViewStorageChangeListener);
+        this._miniViewStorageChangeListener = null;
+
+        if (typeof this._miniViewDragCleanup === 'function') {
+            try { this._miniViewDragCleanup(); } catch (_) { }
+            this._miniViewDragCleanup = null;
+        }
+
+        this.removeMiniView();
+        this.closeFloatingReport();
+        if (this.activationLauncher?.parentNode) {
+            this.activationLauncher.remove();
+        }
     }
 
     // Request player + timedtext bridge data from the MAIN-world script.
     getBridgeData() {
         return new Promise((resolve) => {
-            const timeout = setTimeout(() => resolve(null), 3000);
-            document.addEventListener('__yt_notes_player_response__', function handler(e) {
+            let timeout;
+            const handler = function (e) {
                 clearTimeout(timeout);
                 document.removeEventListener('__yt_notes_player_response__', handler);
                 try {
@@ -31,39 +113,85 @@ class YouTubeController {
                 } catch (err) {
                     resolve(null);
                 }
-            }, { once: true });
+            };
+            timeout = setTimeout(() => {
+                document.removeEventListener('__yt_notes_player_response__', handler);
+                resolve(null);
+            }, TIMEOUT_CONFIG.BRIDGE_DATA_MAX_WAIT);
+            document.addEventListener('__yt_notes_player_response__', handler, { once: true });
             document.dispatchEvent(new Event('__yt_notes_get_player_response__'));
         });
     }
 
-    // High-frequency check for URL changes (SPA Navigation)
+    // Event-driven check for URL changes (SPA Navigation)
     setupNavigationObserver() {
+        if (this._navCleanup) this._navCleanup();
+        
+        const handleNav = () => {
+            if (!this.isRuntimeAvailable()) return;
+            const currentUrl = window.location.href;
+            if (this.lastUrl !== currentUrl) {
+                const oldUrl = this.lastUrl;
+                this.lastUrl = currentUrl;
+                this.onPageTransition(oldUrl, currentUrl);
+            }
+        };
+
+        window.addEventListener('yt-navigate-finish', handleNav);
+        window.addEventListener('yt-page-data-updated', handleNav);
+        
+        // Very slow fallback poll (5s) for extreme stability
         this._navInterval = setInterval(() => {
-            // GUARD: Stop polling if the extension was reloaded/unloaded
-            if (!chrome.runtime?.id) {
-                clearInterval(this._navInterval);
+            if (!this.isRuntimeAvailable()) {
+                this.destroy();
                 return;
             }
-            const urlChanged = this.lastUrl !== window.location.href;
-            if (urlChanged) {
-                this.lastUrl = window.location.href;
-                this.removeLegacyActivationPrompt();
-                this.refreshActivationLauncherFromStorage();
-                this.refreshPanelOpenState();
-            }
-            const newId = this.extractVideoId();
-            if (newId && newId !== this.videoId) {
-                console.log("YouTube Notes: Navigation detected via URL polling:", newId);
-                this.videoId = newId;
-                this.video = null;
-                this.setupPlayerObserver();
-                try {
-                    chrome.runtime.sendMessage({ action: 'contentScriptReady', videoId: this.videoId }, () => {
-                        if (chrome.runtime.lastError) { /* normal */ }
-                    });
-                } catch (e) { /* Extension context invalidated */ }
-            }
-        }, 200);
+            handleNav();
+        }, TIMEOUT_CONFIG.NAV_FALLBACK_POLL);
+
+        this._navCleanup = () => {
+            window.removeEventListener('yt-navigate-finish', handleNav);
+            window.removeEventListener('yt-page-data-updated', handleNav);
+            if (this._navInterval) clearInterval(this._navInterval);
+        };
+    }
+
+    onPageTransition(oldUrl, newUrl) {
+        // console.log("YouTube Notes: SPA Navigation detected.");
+
+        // 1. Video ID Change logic
+        const newId = this.extractVideoId();
+        if (newId && newId !== this.videoId) {
+            debugLog("YouTube Notes: New video ID:", newId);
+            this.videoId = newId;
+            this.video = null;
+
+            // Proper reset for the new video
+            if (this._playerInterval) clearTimeout(this._playerInterval);
+            this._playerInterval = null;
+            this._playerIntervalRate = 500;
+            this.setupPlayerObserver();
+
+            chrome.runtime.sendMessage({ action: 'contentScriptReady', videoId: this.videoId }, () => {
+                if (chrome.runtime.lastError) { /* normal */ }
+            });
+        }
+
+        // 2. UI Cleanup / Refresh
+        this.removeLegacyActivationPrompt();
+        this.refreshActivationLauncherFromStorage();
+        this.refreshPanelOpenState();
+
+        // 3. Navigation away from watch page
+        if (!this.isWatchPage()) {
+            console.log("YouTube Notes: Navigated away from watch page. Cleaning up watch-specific tasks.");
+            if (this._playerInterval) clearTimeout(this._playerInterval);
+            this._playerInterval = null;
+            if (this._playerInjectionInterval) clearInterval(this._playerInjectionInterval);
+            this._playerInjectionInterval = null;
+            this.setActivationLauncherVisible(false);
+            this.closeFloatingReport();
+        }
     }
 
     isWatchPage() {
@@ -76,7 +204,7 @@ class YouTubeController {
         this.setActivationLauncherVisible(true);
         this.attachStorageListener();
         this.refreshActivationLauncherFromStorage();
-        this.startPanelStatePolling();
+        this.refreshPanelOpenState(); // Initial check
     }
 
     removeLegacyActivationPrompt() {
@@ -99,14 +227,24 @@ class YouTubeController {
     }
 
     attachStorageListener() {
-        if (this.storageListenerAttached || !chrome?.storage?.onChanged) return;
-        chrome.storage.onChanged.addListener((changes, areaName) => {
+        if (!chrome?.storage?.onChanged) return;
+
+        // Idempotency: Remove existing listener if any
+        if (this._storageChangeListener) {
+            try {
+                chrome.storage.onChanged.removeListener(this._storageChangeListener);
+            } catch (e) { /* Extension context might be invalidated */ }
+        }
+
+        this._storageChangeListener = (changes, areaName) => {
             if (areaName !== 'local') return;
             if (Object.prototype.hasOwnProperty.call(changes, 'ynNotebookEnabled')) {
                 this.notebookEnabled = changes.ynNotebookEnabled?.newValue === true;
                 this.setActivationLauncherVisible(true);
             }
-        });
+        };
+
+        chrome.storage.onChanged.addListener(this._storageChangeListener);
         this.storageListenerAttached = true;
     }
 
@@ -149,15 +287,8 @@ class YouTubeController {
         this.activationLauncher.classList.toggle('visible', show);
     }
 
-    startPanelStatePolling() {
-        if (this.panelStatePollTimer) {
-            clearInterval(this.panelStatePollTimer);
-        }
-        this.refreshPanelOpenState();
-        this.panelStatePollTimer = setInterval(() => {
-            this.refreshPanelOpenState();
-        }, 1500);
-    }
+    // Replaced with message-based sync for performance
+    startPanelStatePolling() {}
 
     refreshPanelOpenState() {
         if (!chrome.runtime?.id) return;
@@ -212,30 +343,41 @@ class YouTubeController {
     }
 
     setupPlayerObserver() {
-        // Prevent interval accumulation across SPA navigation and re-initialization.
+        if (this._destroyed) return;
+
+        // Prevent accumulation across SPA navigation and re-initialization.
         if (this._playerInterval) {
-            clearInterval(this._playerInterval);
+            clearTimeout(this._playerInterval);
             this._playerInterval = null;
         }
 
-        // High frequency check until we find a stable video element
-        this._playerInterval = setInterval(() => {
+        const runObserver = () => {
+            if (this._destroyed) return;
+
             const v = this.findVideoElement();
             if (v && v.videoWidth > 0) {
+                // Periodically ensure the player button is present
+                this.injectPlayerButton();
+
                 // If we found a NEW video element (e.g. ad ended, or navigation)
                 if (this.video !== v) {
                     console.log("YouTube Notes: New/Better video element detected:", v);
                     this.video = v;
                     this.onVideoFound();
                 }
-                // We keep polling at a slower rate to detect swaps (ads -> video)
+
+                // If we found a valid video, we can slow down the polling
                 if (this._playerIntervalRate !== 2000) {
-                    clearInterval(this._playerInterval);
                     this._playerIntervalRate = 2000;
-                    this.setupPlayerObserver();
                 }
             }
-        }, this._playerIntervalRate || 500);
+
+            // Schedule the next check
+            this._playerInterval = setTimeout(runObserver, this._playerIntervalRate || TIMEOUT_CONFIG.PLAYER_POLL_RATE);
+        };
+
+        // Start the first check
+        this._playerInterval = setTimeout(runObserver, this._playerIntervalRate || TIMEOUT_CONFIG.PLAYER_POLL_RATE);
     }
 
     onVideoFound() {
@@ -265,25 +407,191 @@ class YouTubeController {
         };
     }
 
-    captureFrame() {
+    captureFrameAsync(includeCaptions = true) {
         // ALWAYS re-verify the best video element before capture to avoid ad-locks
         const currentV = this.findVideoElement();
         if (currentV) this.video = currentV;
 
-        if (!this.video || this.video.videoWidth === 0) return null;
-        try {
-            const canvas = document.createElement('canvas');
-            canvas.width = this.video.videoWidth;
-            canvas.height = this.video.videoHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(this.video, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/png', 0.95);
-            if (dataUrl === "data:,") return null;
-            return dataUrl;
-        } catch (e) {
-            console.error("Canvas capture failed:", e);
-            return null;
+        if (!this.video || this.video.videoWidth === 0) return Promise.resolve(null);
+
+        // YouTube CC/subtitle selector — hide before canvas draw if requested
+        const CC_SELECTORS = [
+            '.ytp-caption-window-container',
+            '.ytp-subtitles-container',
+            '.caption-window',
+        ];
+
+        const hiddenEls = [];
+        if (!includeCaptions) {
+            CC_SELECTORS.forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => {
+                    if (el.style.visibility !== 'hidden') {
+                        el.style.visibility = 'hidden';
+                        hiddenEls.push(el);
+                    }
+                });
+            });
         }
+
+        return new Promise((resolve) => {
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = this.video.videoWidth;
+                canvas.height = this.video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(this.video, 0, 0, canvas.width, canvas.height);
+
+                // Restore captions immediately after draw
+                hiddenEls.forEach(el => el.style.visibility = '');
+
+                // Use high-quality JPEG (0.9) and async toBlob to avoid Main Thread blocking
+                canvas.toBlob((blob) => {
+                    if (!blob) {
+                        resolve(null);
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const dataUrl = reader.result;
+                        if (!dataUrl || dataUrl === "data:,") resolve(null);
+                        else resolve(dataUrl);
+
+                        // Clean up canvas immediately
+                        canvas.width = 0;
+                        canvas.height = 0;
+                    };
+                    reader.onerror = () => {
+                        console.error("FileReader failed");
+                        resolve(null);
+                    };
+                    reader.readAsDataURL(blob);
+                }, 'image/jpeg', 0.90);
+            } catch (e) {
+                // Restore captions on error too
+                hiddenEls.forEach(el => el.style.visibility = '');
+                console.error("Canvas capture failed:", e);
+                resolve(null);
+            }
+        });
+    }
+
+    setupPlayerUIInjection() {
+        // Obsolete: Combined into setupPlayerObserver
+    }
+
+    injectCSS() {
+        if (document.getElementById('yt-notes-player-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'yt-notes-player-styles';
+        style.textContent = `
+            .yt-notes-player-button, .yt-notes-player-watch-later-button {
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                width: 36px !important;
+                height: 36px !important;
+                padding: 0 !important;
+                opacity: 0.9 !important;
+                transition: transform 0.1s, opacity 0.2s !important;
+                cursor: pointer !important;
+                margin: 0 !important;
+            }
+            .yt-notes-player-button:hover, .yt-notes-player-watch-later-button:hover {
+                opacity: 1 !important;
+            }
+            .yt-notes-player-button svg, .yt-notes-player-watch-later-button svg {
+                width: 22px !important;
+                height: 22px !important;
+                pointer-events: none !important;
+            }
+            .yt-notes-player-watch-later-button svg {
+                width: 30px !important;
+                height: 30px !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    injectPlayerButton() {
+        if (!this.isWatchPage()) return;
+
+        // Use a more specific class for detection to handle YouTube re-renders better
+        if (document.querySelector('.yt-notes-player-button')) return;
+
+        const rightControls = document.querySelector('.ytp-right-controls');
+        if (!rightControls) return;
+
+        // 1. Screenshot Button
+        const shotBtn = document.createElement('button');
+        shotBtn.id = 'yt-notes-player-screenshot-btn';
+        shotBtn.className = 'ytp-button yt-notes-player-button';
+        shotBtn.title = 'Take Note Screenshot (S)';
+        shotBtn.setAttribute('aria-label', 'Take Note Screenshot');
+        shotBtn.innerHTML = `
+            <svg width="100%" height="100%" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 12m-3.2 0a3.2 3.2 0 1 0 6.4 0a3.2 3.2 0 1 0 -6.4 0"></path>
+                <path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5s5 2.24 5 5s-2.24 5-5 5z"></path>
+            </svg>
+        `;
+        shotBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.triggerCapture();
+        });
+
+        // 2. Watch Later Button (+)
+        const watchLaterBtn = document.createElement('button');
+        watchLaterBtn.id = 'yt-notes-player-watch-later-btn';
+        watchLaterBtn.className = 'ytp-button yt-notes-player-watch-later-button';
+        watchLaterBtn.title = 'Add to Watch Later (+)';
+        watchLaterBtn.setAttribute('aria-label', 'Add to Watch Later');
+        watchLaterBtn.innerHTML = `
+            <svg width="100%" height="100%" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"></path>
+            </svg>
+        `;
+        watchLaterBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.triggerWatchLater();
+        });
+
+        // Inject them both (Watch Later first, so it ends up to the right of Screenshot)
+        rightControls.prepend(watchLaterBtn);
+        rightControls.prepend(shotBtn);
+    }
+
+    triggerWatchLater() {
+        if (!this.isRuntimeAvailable()) {
+            return;
+        }
+        console.log("ContentScript: triggerWatchLater called");
+        try {
+            const metadata = this.getVideoMetadata();
+            chrome.runtime.sendMessage({
+                action: 'shortcutPressed',
+                key: '+',
+                metadata: metadata
+            });
+            console.log("ContentScript: Message sent for Watch Later (+) with metadata");
+        } catch (e) {
+            console.error("ContentScript: Failed to send watch later message:", e);
+        }
+    }
+
+
+    triggerCapture() {
+        if (!chrome.runtime?.id) return;
+        try {
+            chrome.runtime.sendMessage({ action: 'shortcutPressed', key: 's' });
+
+            // Visual feedback on the button itself if possible
+            const btn = document.querySelector('.yt-notes-player-button');
+            if (btn) {
+                btn.style.transform = 'scale(0.85)';
+                setTimeout(() => btn.style.transform = '', TIMEOUT_CONFIG.ANIMATION_FEEDBACK);
+            }
+        } catch (err) { /* context invalidated */ }
     }
 
     getVideoMetadata() {
@@ -304,19 +612,43 @@ class YouTubeController {
     }
 
     setupMessageListener() {
-        chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (!chrome?.runtime?.onMessage) return;
+        if (this._messageListener) {
+            try {
+                chrome.runtime.onMessage.removeListener(this._messageListener);
+            } catch (e) { /* Context invalidated */ }
+        }
+
+        this._messageListener = (message, sender, sendResponse) => {
             if (message.action === 'getState') {
                 sendResponse(this.getState());
             } else if (message.action === 'seekTo') {
                 this.seekToMs(message.timeMs);
                 sendResponse({ success: true });
             } else if (message.action === 'captureScreenshot') {
-                const imageData = this.captureFrame();
-                if (!imageData) {
-                    sendResponse({ success: false, error: "Canvas capture failed or blocked." });
-                } else {
-                    sendResponse({ success: true, imageData: imageData, ...this.getState() });
-                }
+                this.captureFrameAsync(message.includeCaptions !== false).then((imageData) => {
+                    if (!imageData) {
+                        sendResponse({ success: false, error: "Canvas capture failed or blocked." });
+                    } else {
+                        sendResponse({ success: true, imageData: imageData, ...this.getState() });
+                    }
+                });
+                return true;
+            } else if (message.action === 'hideCaptions') {
+                // Temporarily hide CC for captureVisibleTab fallback
+                this._ccHidden = [];
+                ['.ytp-caption-window-container', '.ytp-subtitles-container', '.caption-window'].forEach(sel => {
+                    document.querySelectorAll(sel).forEach(el => {
+                        el.style.visibility = 'hidden';
+                        this._ccHidden.push(el);
+                    });
+                });
+                sendResponse({ success: true });
+            } else if (message.action === 'showCaptions') {
+                // Restore hidden CCs
+                (this._ccHidden || []).forEach(el => el.style.visibility = '');
+                this._ccHidden = [];
+                sendResponse({ success: true });
             } else if (message.action === 'startAreaSelection') {
                 this.startAreaSelection(sendResponse);
                 return true; // Keep channel open
@@ -329,9 +661,67 @@ class YouTubeController {
                 this.notebookEnabled = !!message.enabled;
                 this.setActivationLauncherVisible(true);
                 sendResponse({ success: true });
+            } else if (message.action === 'getScreenInfo') {
+                sendResponse({
+                    availWidth: window.screen.availWidth,
+                    availHeight: window.screen.availHeight,
+                    availLeft: window.screen.availLeft || 0,
+                    availTop: window.screen.availTop || 0
+                });
+            } else if (message.action === 'TAB_PANEL_OPENED') {
+                this.isPanelOpen = true;
+                this.setActivationLauncherVisible(true);
+                sendResponse({ success: true });
+            } else if (message.action === 'TAB_PANEL_CLOSED') {
+                this.isPanelOpen = false;
+                this.setActivationLauncherVisible(true);
+                sendResponse({ success: true });
+            } else if (message.action === 'OPEN_FLOATING_REPORT') {
+                this.showFloatingReport(message.url);
+                sendResponse({ success: true });
+            } else if (message.action === 'CLOSE_FLOATING_REPORT') {
+                this.closeFloatingReport();
+                sendResponse({ success: true });
             }
             return true;
-        });
+        };
+
+        chrome.runtime.onMessage.addListener(this._messageListener);
+    }
+
+    showFloatingReport(url) {
+        this.closeFloatingReport(); // Ensure old ones are removed
+
+        const overlay = document.createElement('div');
+        overlay.id = 'yt-notes-report-overlay';
+        overlay.className = 'yt-notes-report-overlay';
+
+        const container = document.createElement('div');
+        container.className = 'yt-notes-report-container';
+
+        const iframe = document.createElement('iframe');
+        iframe.src = url;
+        iframe.className = 'yt-notes-report-iframe';
+        iframe.setAttribute('frameborder', '0');
+
+        container.appendChild(iframe);
+        overlay.appendChild(container);
+
+        // Close on overlay click (optional, but keep it for UX)
+        overlay.onclick = (e) => {
+            if (e.target === overlay) this.closeFloatingReport();
+        };
+
+        document.body.appendChild(overlay);
+        document.body.style.overflow = 'hidden'; // Prevent page scroll
+    }
+
+    closeFloatingReport() {
+        const overlay = document.getElementById('yt-notes-report-overlay');
+        if (overlay) {
+            overlay.remove();
+        }
+        document.body.style.overflow = '';
     }
 
     startAreaSelection(sendResponse) {
@@ -390,6 +780,7 @@ class YouTubeController {
             const rect = selectionBox.getBoundingClientRect();
             document.body.removeChild(overlay);
             document.removeEventListener('keydown', onEsc);
+            window.removeEventListener('mousemove', onMouseMove);
 
             if (rect.width < 5 || rect.height < 5) {
                 sendResponse({ success: false, error: "Selection too small." });
@@ -404,6 +795,7 @@ class YouTubeController {
             if (e.key === 'Escape') {
                 document.body.removeChild(overlay);
                 document.removeEventListener('keydown', onEsc);
+                window.removeEventListener('mousemove', onMouseMove);
                 sendResponse({ success: false, error: "Cancelled" });
             }
         };
@@ -436,12 +828,23 @@ class YouTubeController {
 
             ctx.drawImage(this.video, sourceX, sourceY, sourceW, sourceH, 0, 0, sourceW, sourceH);
 
-            const dataUrl = canvas.toDataURL('image/png', 0.95);
-            if (dataUrl === "data:,") {
-                sendResponse({ success: false, error: "Crop failed." });
-            } else {
-                sendResponse({ success: true, imageData: dataUrl, ...this.getState() });
-            }
+            canvas.toBlob((blob) => {
+                if (!blob) {
+                    sendResponse({ success: false, error: "Crop failed." });
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const dataUrl = reader.result;
+                    if (dataUrl === "data:,") {
+                        sendResponse({ success: false, error: "Crop failed." });
+                    } else {
+                        sendResponse({ success: true, imageData: dataUrl, ...this.getState() });
+                    }
+                };
+                reader.onerror = () => sendResponse({ success: false, error: "Crop read failed." });
+                reader.readAsDataURL(blob);
+            }, 'image/png', 0.95);
         } catch (e) {
             console.error("Area capture failed:", e);
             sendResponse({ success: false, error: e.message });
@@ -705,15 +1108,43 @@ class YouTubeController {
         if (!trimmed) return [];
 
         const hint = (hintedFmt || '').toLowerCase();
-        if (hint === 'json3') return this.finalizeTranscriptSegments(this.parseJson3Transcript(trimmed));
-        if (hint === 'srv3' || hint === 'srv2' || hint === 'srv1' || hint === 'ttml' || hint === 'xml') {
-            return this.finalizeTranscriptSegments(this.parseXmlTranscript(trimmed));
+        console.log(`[DEBUG] parseTranscriptPayload called with hint: ${hint}`);
+        if (hint === 'json3') {
+            const res = this.finalizeTranscriptSegments(this.parseJson3Transcript(trimmed));
+            console.log(`[DEBUG] parsed json3 -> ${res.length} segments`);
+            return res;
         }
-        if (hint === 'vtt') return this.finalizeTranscriptSegments(this.parseVttTranscript(trimmed));
+        // Specific hint for the new InnerTube transcript endpoint
+        if (hint === 'youtubei') {
+             try {
+                const data = JSON.parse(trimmed);
+                const res = this.finalizeTranscriptSegments(this.parseYoutubeiTranscript(data));
+                console.log(`[DEBUG] parsed youtubei -> ${res.length} segments`);
+                return res;
+            } catch (_) { return []; }
+        }
+
+        if (hint === 'srv3' || hint === 'srv2' || hint === 'srv1' || hint === 'ttml' || hint === 'xml') {
+            const res = this.finalizeTranscriptSegments(this.parseXmlTranscript(trimmed));
+            console.log(`[DEBUG] parsed xml (${hint}) -> ${res.length} segments`);
+            return res;
+        }
+        if (hint === 'vtt') {
+            const res = this.finalizeTranscriptSegments(this.parseVttTranscript(trimmed));
+            console.log(`[DEBUG] parsed vtt -> ${res.length} segments`);
+            return res;
+        }
 
         if (trimmed.startsWith('{')) {
-            const jsonSegments = this.parseJson3Transcript(trimmed);
-            if (jsonSegments.length) return this.finalizeTranscriptSegments(jsonSegments);
+            try {
+                const data = JSON.parse(trimmed);
+                // Try Youtubei first for JSON as it's more common for newer POST requests
+                let segments = this.parseYoutubeiTranscript(data);
+                if (segments.length === 0) {
+                    segments = this.parseJson3Transcript(trimmed);
+                }
+                if (segments.length > 0) return this.finalizeTranscriptSegments(segments);
+            } catch (_) { }
         }
         if (trimmed.startsWith('WEBVTT') || trimmed.includes('-->')) {
             const vttSegments = this.parseVttTranscript(trimmed);
@@ -725,12 +1156,20 @@ class YouTubeController {
         }
 
         // Last-resort parser attempts.
+        try {
+            const data = JSON.parse(trimmed);
+            const youtubeiFallback = this.parseYoutubeiTranscript(data);
+            if (youtubeiFallback.length) return this.finalizeTranscriptSegments(youtubeiFallback);
+        } catch (_) { }
+
         const jsonFallback = this.parseJson3Transcript(trimmed);
         if (jsonFallback.length) return this.finalizeTranscriptSegments(jsonFallback);
         const xmlFallback = this.parseXmlTranscript(trimmed);
         if (xmlFallback.length) return this.finalizeTranscriptSegments(xmlFallback);
         const vttFallback = this.parseVttTranscript(trimmed);
         if (vttFallback.length) return this.finalizeTranscriptSegments(vttFallback);
+
+        console.warn(`[DEBUG] Failed to parse payload with length ${trimmed.length} and hint ${hint}`);
         return [];
     }
 
@@ -739,11 +1178,18 @@ class YouTubeController {
         const dedupe = new Set();
         const preferredBase = (preferredLanguageCode || '').split('-')[0].toLowerCase();
 
-        for (const rawUrl of urls || []) {
+        for (const item of urls || []) {
+            if (!item) continue;
+            const rawUrl = typeof item === 'string' ? item : item.url;
             if (!rawUrl || dedupe.has(rawUrl)) continue;
             dedupe.add(rawUrl);
 
             let score = 0;
+            // HUGE boost if we already intercepted the literal response text!
+            if (typeof item === 'object' && item.responseText) {
+                score += 100;
+            }
+
             try {
                 const url = new URL(rawUrl, window.location.origin);
                 const lang = (url.searchParams.get('lang') || '').toLowerCase();
@@ -757,68 +1203,134 @@ class YouTubeController {
                 if (fmt === 'srv3' || fmt === 'vtt') score += 1;
             } catch (_) { }
 
-            scored.push({ rawUrl, score });
+            scored.push({ item, score });
         }
 
         scored.sort((a, b) => b.score - a.score);
-        return scored.map(item => item.rawUrl);
+        return scored.map(s => s.item);
     }
 
     async fetchTranscriptFromDirectUrls(directUrls) {
         const failures = [];
         const requestQueue = [];
         const dedupe = new Set();
+        const candidatePayloads = [];
 
-        for (const originalUrl of directUrls || []) {
-            if (!originalUrl) continue;
+        // 1. Initial Pass: Normalize payloads and catch early pre-cached text
+        for (const payload of (directUrls || [])) {
+            if (!payload) continue;
+            let p = {
+                url: typeof payload === 'string' ? payload : payload.url,
+                method: payload.method || 'GET',
+                body: payload.body || null,
+                preCachedText: payload.responseText || null,
+                fmtHint: ''
+            };
+            if (!p.url) continue;
             try {
-                const original = new URL(originalUrl, window.location.origin);
-                const originalFmt = original.searchParams.get('fmt') || '';
-                const originalString = original.toString();
-                if (!dedupe.has(originalString)) {
-                    dedupe.add(originalString);
-                    requestQueue.push({ url: originalString, fmtHint: originalFmt || '' });
-                }
+                const urlObj = new URL(p.url, window.location.origin);
+                p.url = urlObj.toString();
+                const isIterative = urlObj.pathname.includes('/youtubei/v1/get_transcript');
+                p.fmtHint = isIterative ? 'youtubei' : (urlObj.searchParams.get('fmt') || '');
+                p.isIterative = isIterative;
+                candidatePayloads.push(p);
+            } catch (_) { continue; }
+        }
 
-                for (const fmt of ['json3', 'srv3', 'vtt']) {
-                    const variant = new URL(originalString);
-                    variant.searchParams.set('fmt', fmt);
-                    const variantString = variant.toString();
-                    if (!dedupe.has(variantString)) {
-                        dedupe.add(variantString);
-                        requestQueue.push({ url: variantString, fmtHint: fmt });
+        if (candidatePayloads.length === 0) return { error: "No valid URLs" };
+
+        // 2. Shared Polling Phase: Wait for bridge data without nested closures
+        const pollWait = (ms) => new Promise(r => setTimeout(r, ms));
+        
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            const bridgeData = await this.getBridgeData();
+            const timedtextUrls = bridgeData?.timedtextUrls || [];
+            
+            let foundInAttempt = false;
+            for (const p of candidatePayloads) {
+                if (p.preCachedText) continue;
+                const matching = timedtextUrls.find(u => u.url === p.url);
+                if (matching?.responseText) {
+                    p.preCachedText = matching.responseText;
+                    foundInAttempt = true;
+                }
+            }
+
+            if (foundInAttempt) {
+                for (const p of candidatePayloads) {
+                    if (p.preCachedText) {
+                        const parsed = this.parseTranscriptPayload(p.preCachedText, p.fmtHint);
+                        if (parsed && parsed.length > 0) return { segments: parsed, sourceFormat: p.fmtHint || 'cached' };
                     }
                 }
-            } catch (_) {
-                // Keep going for any malformed URL.
+            }
+
+            if (attempt < 4) await pollWait(TIMEOUT_CONFIG.RETRY_DELAY_BASE);
+        }
+
+        // 3. Network Fetch Phase
+        for (const p of candidatePayloads) {
+            // Final check of what we have before direct fetch
+            if (p.preCachedText) {
+                const parsed = this.parseTranscriptPayload(p.preCachedText, p.fmtHint);
+                if (parsed && parsed.length > 0) return { segments: parsed, sourceFormat: p.fmtHint || 'cached' };
+            }
+
+            if (!dedupe.has(p.url)) {
+                dedupe.add(p.url);
+                requestQueue.push({ url: p.url, fmtHint: p.fmtHint, method: p.method, body: p.body });
+            }
+
+            if (!p.isIterative) {
+                for (const fmt of ['json3', 'srv3', 'vtt']) {
+                    try {
+                        const variant = new URL(p.url);
+                        variant.searchParams.set('fmt', fmt);
+                        const vStr = variant.toString();
+                        if (!dedupe.has(vStr)) {
+                            dedupe.add(vStr);
+                            requestQueue.push({ url: vStr, fmtHint: fmt, method: p.method, body: p.body });
+                        }
+                    } catch (_) { }
+                }
             }
         }
 
         for (const item of requestQueue) {
             try {
-                const response = await fetch(item.url, {
+                const fetchOptions = {
+                    method: item.method || 'GET',
                     credentials: 'include',
-                    headers: { 'Accept': '*/*' }
-                });
-                if (!response.ok) {
-                    failures.push(`direct: HTTP ${response.status}`);
-                    continue;
+                    headers: { 'Accept': '*/*', 'User-Agent': navigator.userAgent }
+                };
+
+                if (item.method === 'POST') {
+                    if (item.body) {
+                        if (typeof item.body === 'string') {
+                            fetchOptions.body = item.body;
+                            fetchOptions.headers['Content-Type'] = 'application/json';
+                        }
+                    } else if (item.url.includes('/youtubei/v1/')) {
+                        continue;
+                    }
                 }
 
-                const rawText = await response.text();
+                const resp = await fetch(item.url, fetchOptions);
+                if (!resp.ok) {
+                    failures.push(`${item.fmtHint}: ${resp.status}`);
+                    continue;
+                }
+                const rawText = await resp.text();
                 if (!rawText || !rawText.trim()) {
-                    failures.push('direct: empty response');
+                    failures.push(`${item.fmtHint}: empty`);
                     continue;
                 }
 
                 const segments = this.parseTranscriptPayload(rawText, item.fmtHint);
-                if (segments.length > 0) {
-                    return { segments, sourceFormat: item.fmtHint || 'direct' };
-                }
-
-                failures.push(`direct: parsed but no text (${item.fmtHint || 'unknown fmt'})`);
+                if (segments.length > 0) return { segments, sourceFormat: item.fmtHint || 'direct' };
+                failures.push(`${item.fmtHint}: parsed no data`);
             } catch (err) {
-                failures.push(`direct: ${err.message}`);
+                failures.push(`${item.fmtHint}: ${err.message}`);
             }
         }
 
@@ -873,7 +1385,7 @@ class YouTubeController {
     // Extract transcript using internal YouTube player data.
     async getTranscript() {
         try {
-            console.log("YouTube Notes: Fetching transcript via page bridge...");
+            // console.log("YouTube Notes: Fetching transcript via page bridge...");
 
             const bridgeData = await this.getBridgeData();
             const playerResponse = bridgeData?.playerResponse || null;
@@ -882,7 +1394,7 @@ class YouTubeController {
                 : [];
             const hasPotUrls = bridgeData?.hasPotUrls === true;
 
-            console.log(`YouTube Notes: Bridge data received. Intercepted URLs: ${observedTimedtextUrls.length}, hasPot: ${hasPotUrls}`);
+            debugLog(`YouTube Notes: Bridge data received. Intercepted URLs: ${observedTimedtextUrls.length}, hasPot: ${hasPotUrls}`);
 
             // STRATEGY 1 (PRIORITY): Use intercepted URLs from the page bridge.
             // These contain fresh `pot` tokens and are YouTube's "approved" requests.
@@ -950,26 +1462,217 @@ class YouTubeController {
     }
 
     setupKeyboardShortcuts() {
-        window.addEventListener('keydown', (e) => {
+        if (this._keyboardListener) {
+            window.removeEventListener('keydown', this._keyboardListener, true);
+        }
+
+        this._keyboardListener = (e) => {
+            if (e.repeat) return;
             // Ignore if user is typing in an input/textarea/contenteditable
             const tag = document.activeElement?.tagName?.toLowerCase();
             const isEditable = tag === 'input' || tag === 'textarea' || document.activeElement?.isContentEditable;
             if (isEditable) return;
 
             const key = e.key.toLowerCase();
-            if (key === 's' || key === 'z' || key === 't' || key === 'a') {
+            if (key === 's' || key === 'z' || key === 't' || key === 'a' || key === 'e') {
                 // Prevent default specifically for these keys to avoid YouTube conflict
-                if (key === 's' || key === 't' || key === 'a') e.preventDefault();
+                if (key === 's' || key === 'z' || key === 't' || key === 'a' || key === 'e') e.preventDefault();
 
+                if (!this.isRuntimeAvailable()) return;
                 console.log("YouTube Notes: Shortcut triggered globally:", key);
-                if (!chrome.runtime?.id) return;
                 try {
                     chrome.runtime.sendMessage({ action: 'shortcutPressed', key: key });
                 } catch (e) { /* Extension context invalidated */ }
             }
-        }, true); // Use capture phase
+        };
+
+        window.addEventListener('keydown', this._keyboardListener, true); // Use capture phase
     }
 
+    // ==========================================
+    // Mini View Overlay Logic
+    // ==========================================
+    setupMiniViewListener() {
+        if (!chrome?.storage?.onChanged) return;
+
+        chrome.storage.local.get(['activeCountdownMiniView', 'activeCountdownMiniViewPos'], (result) => {
+            if (result.activeCountdownMiniView) {
+                this.renderMiniView(result.activeCountdownMiniView, result.activeCountdownMiniViewPos);
+            }
+        });
+
+        if (this._miniViewStorageChangeListener) {
+            try {
+                chrome.storage.onChanged.removeListener(this._miniViewStorageChangeListener);
+            } catch (e) { /* Context invalidated */ }
+        }
+
+        this._miniViewStorageChangeListener = (changes, areaName) => {
+            if (areaName !== 'local') return;
+
+            if (changes.activeCountdownMiniView) {
+                const cd = changes.activeCountdownMiniView.newValue;
+                if (cd) {
+                    chrome.storage.local.get(['activeCountdownMiniViewPos'], (posRes) => {
+                        this.renderMiniView(cd, posRes.activeCountdownMiniViewPos);
+                    });
+                } else {
+                    this.removeMiniView();
+                }
+            }
+        };
+
+        chrome.storage.onChanged.addListener(this._miniViewStorageChangeListener);
+    }
+
+    removeMiniView() {
+        const existing = document.getElementById('yt-notes-mini-view');
+        if (existing) existing.remove();
+        if (typeof this._miniViewDragCleanup === 'function') {
+            this._miniViewDragCleanup();
+            this._miniViewDragCleanup = null;
+        }
+    }
+
+    renderMiniView(cd, pos) {
+        this.removeMiniView();
+
+        const container = document.createElement('div');
+        container.id = 'yt-notes-mini-view';
+        container.className = 'cd-mini-view-container';
+        if (cd.isTransparent) container.classList.add('transparent');
+
+        if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+            container.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)`;
+        }
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const start = new Date(cd.startDate);
+        start.setMinutes(start.getMinutes() + start.getTimezoneOffset());
+        const end = new Date(cd.endDate);
+        end.setMinutes(end.getMinutes() + end.getTimezoneOffset());
+
+        const totalDays = Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1;
+        const passedDays = Math.round((today - start) / (1000 * 60 * 60 * 24));
+        const remainingDays = Math.round((end - today) / (1000 * 60 * 60 * 24)) + 1;
+
+        let progress = Math.min(100, Math.max(0, Math.round((passedDays / totalDays) * 100)));
+        if (isNaN(progress)) progress = 0;
+
+        let alertClass = 'info';
+        let alertText = `${remainingDays}d left`;
+        let barColor = 'var(--yt-spec-call-to-action, #065fd4)';
+
+        if (remainingDays <= 0) {
+            alertClass = 'critical';
+            alertText = '\u26A0 Passed';
+            barColor = '#e74c3c';
+            progress = 100;
+        } else if (progress >= 100) {
+            alertClass = 'success';
+            alertText = '\u2705 Done';
+            barColor = '#2ecc71';
+        } else if (remainingDays <= 3) {
+            alertClass = 'warning';
+            alertText = `\u26A0 ${remainingDays}d`;
+            barColor = '#e67e22';
+        }
+
+        // Compact Grid logic for Mini View
+        let gridHtml = '<div class="cd-mini-grid">';
+        const displayDays = Math.min(totalDays, 25); // Limit to 25 dots for mini view
+        for (let i = 0; i < displayDays; i++) {
+            const dayDate = new Date(start);
+            dayDate.setDate(dayDate.getDate() + i);
+            const isDone = dayDate <= today;
+            const isToday = i === passedDays;
+
+            let dotClass = "cd-mini-dot";
+            let dotContent = i + 1;
+            if (isDone) {
+                dotClass += " done";
+                dotContent = "\u2713";
+            } else if (isToday) {
+                dotClass += " today";
+            }
+            gridHtml += `<div class="${dotClass}">${dotContent}</div>`;
+        }
+        if (totalDays > 25) {
+            gridHtml += `<div class="cd-mini-dot-more">+${totalDays - 25}</div>`;
+        }
+        gridHtml += '</div>';
+
+        container.innerHTML = `
+            <div class="cd-mini-header" id="yt-notes-cd-header">
+                <span class="cd-mini-title" title="${(cd.title || '').replace(/"/g, '&quot;')}">${cd.title || 'Goal'}</span>
+                <button class="cd-mini-close" title="Close Overlay">\u00D7</button>
+            </div>
+            <div class="cd-mini-content">
+                <div class="cd-mini-meta">
+                    <span>${alertText}</span>
+                    <div class="cd-mini-progress-section">
+                        <span>${progress}%</span>
+                    </div>
+                </div>
+                <div class="cd-progress-track">
+                    <div class="cd-progress-fill" style="width: ${progress}%; background-color: ${barColor}"></div>
+                </div>
+                ${gridHtml}
+            </div>
+        `;
+
+        container.querySelector('.cd-mini-close').onclick = () => {
+            chrome.storage.local.remove(['activeCountdownMiniView', 'activeCountdownMiniViewPos']);
+        };
+
+        const header = container.querySelector('#yt-notes-cd-header');
+        let isDragging = false;
+        let currentX;
+        let currentY;
+        let initialX;
+        let initialY;
+        let xOffset = pos?.x || 0;
+        let yOffset = pos?.y || 0;
+
+        const dragStart = (e) => {
+            if (e.target.closest('.cd-mini-close')) return;
+            initialX = e.clientX - xOffset;
+            initialY = e.clientY - yOffset;
+            isDragging = true;
+        };
+
+        const dragEnd = () => {
+            if (!isDragging) return;
+            initialX = currentX;
+            initialY = currentY;
+            isDragging = false;
+            chrome.storage.local.set({ activeCountdownMiniViewPos: { x: currentX, y: currentY } });
+        };
+
+        const drag = (e) => {
+            if (isDragging) {
+                e.preventDefault();
+                currentX = e.clientX - initialX;
+                currentY = e.clientY - initialY;
+                xOffset = currentX;
+                yOffset = currentY;
+                container.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
+            }
+        };
+
+        header.addEventListener('mousedown', dragStart);
+        document.addEventListener('mouseup', dragEnd);
+        document.addEventListener('mousemove', drag);
+
+        this._miniViewDragCleanup = () => {
+            header.removeEventListener('mousedown', dragStart);
+            document.removeEventListener('mouseup', dragEnd);
+            document.removeEventListener('mousemove', drag);
+        };
+
+        document.body.appendChild(container);
+    }
 }
 
 // Helper for transcript timing
@@ -986,4 +1689,13 @@ function formatTimeHelper(ms) {
     return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 }
 
-const currentController = new YouTubeController();
+(function bootstrapYouTubeController() {
+    const key = '__ytNotesController__';
+    const existing = window[key];
+    if (existing && typeof existing.destroy === 'function') {
+        try {
+            existing.destroy();
+        } catch (_) { }
+    }
+    window[key] = new YouTubeController();
+})();

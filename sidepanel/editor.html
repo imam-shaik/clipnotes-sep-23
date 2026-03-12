@@ -129,12 +129,12 @@
         .workspace {
             flex: 1;
             background: #0d0d0d;
-            overflow: auto;
+            overflow: hidden;
             position: relative;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 60px;
+            padding: clamp(12px, 2vw, 22px);
             background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
             background-size: 25px 25px;
         }
@@ -144,6 +144,9 @@
             background: #000;
             box-shadow: 0 40px 100px rgba(0, 0, 0, 0.7);
             border-radius: 4px;
+            max-width: 100%;
+            max-height: 100%;
+            overflow: hidden;
         }
 
         canvas {
@@ -258,7 +261,7 @@
     <div class="editor-toolbar">
         <div class="tool-group">
             <button class="tool-btn active" data-tool="pen">
-                <span>✏️</span>
+                <span>&#x270F;&#xFE0F;</span>
                 <div class="tooltip">Pen</div>
             </button>
             <button class="tool-btn" data-tool="eraser">
@@ -269,26 +272,26 @@
 
         <div class="tool-group">
             <button class="tool-btn" data-tool="rect">
-                <span>⬜</span>
+                <span>&#x2B1C;</span>
                 <div class="tooltip">Rectangle</div>
             </button>
             <button class="tool-btn" data-tool="circle">
-                <span>⭕</span>
+                <span>&#x2B55;</span>
                 <div class="tooltip">Circle</div>
             </button>
             <button class="tool-btn" data-tool="arrow">
-                <span>↗️</span>
+                <span>&#x2197;&#xFE0F;</span>
                 <div class="tooltip">Arrow</div>
             </button>
         </div>
 
         <div class="tool-group">
             <button class="tool-btn" id="undo-btn" disabled>
-                <span>↩️</span>
+                <span>&#x21A9;&#xFE0F;</span>
                 <div class="tooltip">Undo (Ctrl+Z)</div>
             </button>
             <button class="tool-btn" id="redo-btn" disabled>
-                <span>↪️</span>
+                <span>&#x21AA;&#xFE0F;</span>
                 <div class="tooltip">Redo (Ctrl+Y)</div>
             </button>
         </div>
@@ -314,7 +317,7 @@
         <div style="flex: 1"></div>
 
         <button class="tool-btn" id="clear-btn" style="width: auto; padding: 0 15px; gap: 8px;">
-            <span>🗑️</span> <span style="font-size: 13px; font-weight: 500;">Clear</span>
+            <span>&#x1F5D1;&#xFE0F;</span> <span style="font-size: 13px; font-weight: 500;">Clear</span>
         </button>
     </div>
 
@@ -331,7 +334,22 @@
         <button class="btn btn-primary" id="save-edit">Save Changes</button>
     </div>
 
+    <div id="custom-prompt-overlay" class="modal-overlay hidden">
+        <div class="modal-content">
+            <h3 id="custom-prompt-message" class="modal-message">Prompt Message</h3>
+            <input type="text" id="custom-prompt-input" class="modal-input" autocomplete="off">
+            <div id="custom-prompt-choices" class="modal-choices hidden">
+                <!-- Choice buttons injected here -->
+            </div>
+            <div class="modal-actions">
+                <button id="custom-prompt-cancel" class="btn btn-secondary" style="padding: 10px 24px;">Cancel</button>
+                <button id="custom-prompt-confirm" class="btn btn-primary" style="padding: 10px 24px;">OK</button>
+            </div>
+        </div>
+    </div>
+
     <script src="editor.js"></script>
+
 </body>
 
 </html>

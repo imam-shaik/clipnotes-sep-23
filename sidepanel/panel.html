@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YouTube Notes Pro</title>
+    <title>Clip Notes</title>
     <link rel="stylesheet" href="panel.css">
 </head>
 
@@ -14,7 +14,7 @@
         <!-- Header -->
         <header class="app-header">
             <div class="video-info">
-                <h2 id="video-title" class="video-title">YouTube Notes Pro</h2>
+                <h2 id="video-title" class="video-title">Clip Notes</h2>
                 <span id="video-details" class="video-details">Connect to a video...</span>
             </div>
             <div class="header-actions">
@@ -22,6 +22,15 @@
                 <button id="btn-select-folder" class="icon-btn" title="Select Local Windows Folder to Auto-Save">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                </button>
+                <!-- Delete All Button (Moved to header) -->
+                <button id="btn-delete-all-screenshots" class="icon-btn danger"
+                    title="Delete All Screenshots (Current Video)">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
                     </svg>
                 </button>
                 <!-- Theme Toggle Button -->
@@ -38,43 +47,88 @@
                         <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
                     </svg>
                 </button>
-                <button id="btn-close-panel" class="icon-btn" title="Close Notes Panel">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" stroke-linejoin="round">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
             </div>
         </header>
 
         <!-- Folder Status Alert -->
         <div id="folder-status-banner" class="status-banner warning">
-            ⚠️ No Save Folder Selected. Click the Folder Icon to auto-save files directly to Windows.
+            &#x26A0;&#xFE0F; No Save Folder Selected. Click the Folder Icon to auto-save files directly to Windows.
         </div>
 
         <!-- Opt-in Bar (New Feature) -->
         <div class="optin-bar" id="optin-bar">
-            <label class="switch-block">
-                <span class="switch-label">Notebook for this Video:</span>
+            <label class="switch-block" title="Enable/Disable Notebook for this specific video">
+                <span class="switch-label">
+                    <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+                    </svg>
+                    <span class="label-text">Notebook:</span>
+                </span>
                 <div class="switch">
                     <input type="checkbox" id="toggle-notebook">
                     <span class="slider round"></span>
                 </div>
                 <span class="switch-text" id="toggle-text">Off</span>
             </label>
+            <div class="divider-v"></div>
+            <label class="switch-block" title="Automatically open panel when you visit a YouTube video">
+                <span class="switch-label">
+                    <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
+                    </svg>
+                    <span class="label-text">Auto-Open:</span>
+                </span>
+                <div class="switch">
+                    <input type="checkbox" id="toggle-auto-open">
+                    <span class="slider round"></span>
+                </div>
+                <span class="switch-text" id="toggle-auto-open-text">Off</span>
+            </label>
+            <div class="divider-v"></div>
+            <label class="switch-block" title="Include captions/subtitles in screenshots">
+                <span class="switch-label">
+                    <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    <span class="label-text">CC:</span>
+                </span>
+                <div class="switch">
+                    <input type="checkbox" id="toggle-cc-capture">
+                    <span class="slider round"></span>
+                </div>
+                <span class="switch-text" id="toggle-cc-text">Off</span>
+            </label>
+            <div class="divider-v"></div>
+            <div class="range-settings" title="Transcript range (seconds before and after the screenshot)">
+                <span class="switch-label">
+                    <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <polyline points="12 6 12 12 16 14"></polyline>
+                    </svg>
+                    <span class="label-text">Range:</span>
+                </span>
+                <div class="range-inputs-wrap">
+                    <input type="number" id="transcript-before" class="range-input" min="0" max="60" value="4">
+                    <span class="range-label">s Pre</span>
+                    <input type="number" id="transcript-after" class="range-input" min="0" max="60" value="5">
+                    <span class="range-label">s Post</span>
+                </div>
+            </div>
         </div>
 
         <!-- Quick Actions Grid -->
         <div class="quick-actions">
-            <button id="btn-capture-full" class="action-card primary" title="Take Full Screenshot">
+            <!-- Manual Screenshots -->
+            <button id="btn-capture-full" class="action-card" title="Take Full Screenshot (Shortcut: S)">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
-                    <polyline points="21 15 16 10 5 21"></polyline>
+                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+                    <circle cx="12" cy="13" r="4"></circle>
                 </svg>
                 <span>Shot</span>
             </button>
+
+            <!-- Export Actions -->
             <button id="btn-export-pdf" class="action-card outline" title="Export Notes as PDF">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
@@ -91,6 +145,8 @@
                 </svg>
                 <span>Preview</span>
             </button>
+
+            <!-- Media Actions -->
             <button id="btn-add-image" class="action-card outline" title="Add External Local Image">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
@@ -109,17 +165,21 @@
                 </svg>
                 <span>Board</span>
             </button>
-            <button id="btn-capture-area" class="action-card icon-only" title="Area Shot (Select Region)">
+
+            <!-- Utility Icons -->
+            <button id="btn-capture-area" class="action-card icon-only" title="Area Shot (Shortcut: A)">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <path d="M3 3v6M3 15v6h6M15 21h6v-6M21 9V3h-6"></path>
                     <path d="M9 9h6v6H9z"></path>
                 </svg>
             </button>
-            <button id="btn-auto-screenshot" class="action-card icon-only" title="Auto Screenshot (Countdown)">
+            <button id="btn-countdown-manager" class="action-card icon-only" title="Countdown Manager">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="10"></circle>
-                    <polyline points="12 6 12 12 16 14"></polyline>
+                    <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="16" y1="2" x2="16" y2="6"></line>
+                    <line x1="8" y1="2" x2="8" y2="6"></line>
+                    <line x1="3" y1="10" x2="21" y2="10"></line>
                 </svg>
             </button>
             <button id="btn-duration-calc" class="action-card icon-only" title="Duration & Stats">
@@ -135,6 +195,14 @@
                     stroke-linecap="round" stroke-linejoin="round">
                     <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path>
                     <line x1="4" y1="22" x2="4" y2="15"></line>
+                </svg>
+            </button>
+            <button id="btn-capture-auto" class="action-card icon-only" title="Toggle Auto Screenshot">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+                    <circle cx="12" cy="13" r="2"></circle>
+                    <path d="M12 7a6 6 0 1 1-6 6"></path>
+                    <polyline points="6 10 6 7 9 7"></polyline>
                 </svg>
             </button>
         </div>
@@ -155,10 +223,43 @@
 
         <!-- Tabs Navigation -->
         <div class="tabs-nav">
-            <button class="tab-btn active" data-tab="tab-screenshots">📸 Screenshots</button>
-            <button class="tab-btn" data-tab="tab-toc">📑 Timeline</button>
-            <button class="tab-btn" data-tab="tab-history">🕒 History</button>
-            <button class="tab-btn" data-tab="tab-transcript">📜 Transcript</button>
+            <button class="tab-btn active" data-tab="tab-screenshots">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+                    <circle cx="12" cy="13" r="4"></circle>
+                </svg>
+                Screenshots
+            </button>
+            <button class="tab-btn" data-tab="tab-countdown">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                </svg>
+                Countdowns
+            </button>
+            <button class="tab-btn" data-tab="tab-history">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                History
+            </button>
+            <button class="tab-btn" data-tab="tab-transcript">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                    <polyline points="10 9 9 9 8 9"></polyline>
+                </svg>
+                Transcript
+            </button>
+            <button class="tab-btn" data-tab="tab-watch-later" title="Watch Later List">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path>
+                    <line x1="4" y1="22" x2="4" y2="15"></line>
+                </svg>
+                WatchLater
+            </button>
         </div>
 
         <!-- Main Content Area -->
@@ -168,6 +269,7 @@
             <div id="tab-screenshots" class="tab-pane active scrollable">
                 <div id="screenshots-list" class="gallery-list">
                     <!-- Screenshot Cards will be dynamically injected here -->
+                    <div id="toc-list" style="display: none;"></div> <!-- Safety fallback -->
                     <div class="empty-state">
                         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="1" opacity="0.3">
@@ -180,12 +282,23 @@
                 </div>
             </div>
 
-            <!-- Table of Contents Tab -->
-            <div id="tab-toc" class="tab-pane scrollable">
-                <div id="toc-list" class="toc-list">
-                    <!-- TOC Entries injected here -->
+            <!-- Countdown Manager Tab -->
+            <div id="tab-countdown" class="tab-pane">
+                <div class="countdown-header">
+                    <h3>Countdown Manager</h3>
+                    <button id="btn-add-countdown" class="action-btn-small">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2.5" style="margin-right:2px">
+                            <line x1="12" y1="5" x2="12" y2="19"></line>
+                            <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                        Add
+                    </button>
+                </div>
+                <!-- Countdown List -->
+                <div id="countdown-list" class="countdown-list scrollable">
                     <div class="empty-state">
-                        <p>No table of contents entries added.</p>
+                        <p>No countdowns created yet.</p>
                     </div>
                 </div>
             </div>
@@ -204,11 +317,37 @@
             <div id="tab-transcript" class="tab-pane">
                 <div class="transcript-header">
                     <h3>Video Transcript</h3>
-                    <button id="btn-copy-transcript" class="action-btn-small">Copy All</button>
+                    <button id="btn-copy-transcript" class="action-btn-small">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" style="margin-right:2px">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                        Copy All
+                    </button>
                 </div>
                 <div id="transcript-content" class="scrollable">
                     <div class="empty-state">
                         <p>Click "📜 Transcript" to load the text for this video.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Watch Later Tab -->
+            <div id="tab-watch-later" class="tab-pane">
+                <div class="watch-later-header">
+                    <h3>Watch Later List</h3>
+                    <div class="header-tools">
+                        <select id="sort-watch-later" class="small-select">
+                            <option value="date">Sort by Date</option>
+                            <option value="priority">Sort by Priority</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="watch-later-list" class="watch-later-list scrollable">
+                    <div class="empty-state">
+                        <p>No videos added to Watch Later yet.</p>
+                        <p class="text-xs">Click the + icon in the YouTube player to add one.</p>
                     </div>
                 </div>
             </div>
@@ -269,7 +408,7 @@
 
                 <!-- Speeds Grid -->
                 <div class="calc-section">
-                    <h4>⏱ Playback Duration at Different Speeds</h4>
+                    <h4>&#x23F1;&#xFE0F; Playback Duration at Different Speeds</h4>
                     <div id="calc-speed-grid" class="speed-grid">
                         <!-- Injected via JS -->
                     </div>
@@ -339,14 +478,15 @@
         <div class="modal-content preview-modal">
             <div class="modal-header">
                 <h3>PDF Preview</h3>
-                <button id="btn-close-preview" class="modal-close-btn" title="Close">x</button>
+                <div class="header-actions">
+                </div>
             </div>
+
             <div class="preview-body">
                 <div id="pdf-preview-pages" class="pdf-preview-pages"></div>
             </div>
         </div>
     </div>
-
 
     <!-- Scripts -->
     <script src="../lib/jspdf.umd.min.js"></script>

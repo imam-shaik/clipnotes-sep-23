@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "YouTube Video Notes Pro",
+  "name": "Clip Notes",
   "version": "1.0.0",
   "description": "Take screenshots, vector notes, and create TOC for YouTube videos with local saving",
   "permissions": [
@@ -9,11 +9,11 @@
     "scripting",
     "sidePanel",
     "downloads",
-    "contextMenus"
+    "contextMenus",
+    "windows"
   ],
   "host_permissions": [
-    "https://www.youtube.com/*",
-    "https://youtube.com/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background/service-worker.js"
@@ -48,7 +48,7 @@
     "default_path": "sidepanel/panel.html"
   },
   "action": {
-    "default_title": "Open YouTube Notes",
+    "default_title": "Open Clip Notes",
     "default_icon": {
       "16": "assets/icons/icon16.png",
       "48": "assets/icons/icon48.png",

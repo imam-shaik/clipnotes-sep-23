@@ -2,9 +2,14 @@
 // Runs in MAIN world to safely read YouTube page globals.
 
 (function () {
+    const pageBridgeGuardKey = '__YT_NOTES_PAGE_BRIDGE_READY__';
+    if (window[pageBridgeGuardKey]) return;
+    window[pageBridgeGuardKey] = true;
+
     const MAX_TRACKED_TIMEDTEXT_URLS = 80;
     // url -> { ts: eviction score, hasPot: boolean, seenAt: timestamp }
     const timedtextUrlMap = new Map();
+    let lastVideoIdForMap = null;
 
     function parseMaybeJson(value) {
         if (!value) return null;
@@ -25,20 +30,38 @@
         }
     }
 
-    // KEY FIX: Store whether URL has pot token; pot-bearing URLs get a priority boost
-    function rememberTimedtextUrl(inputUrl) {
+    // KEY FIX: Store method, body, and actual response payload if captured.
+    function rememberTimedtextUrl(inputUrl, method = 'GET', body = null) {
         if (!inputUrl) return;
         try {
             const url = new URL(inputUrl, window.location.origin);
-            if (!url.pathname.includes('/api/timedtext')) return;
+            const isTimedtext = url.pathname.includes('/api/timedtext');
+            const isGetTranscript = url.pathname.includes('/youtubei/v1/get_transcript');
+            if (!isTimedtext && !isGetTranscript) return;
 
-            const hasPot = url.searchParams.has('pot');
+            // CLEAR MAP ON NEW VIDEO: If we see a new video ID, reset the map to prevent leaks
+            const currentVid = getCurrentVideoId();
+            if (currentVid && currentVid !== lastVideoIdForMap) {
+                timedtextUrlMap.clear();
+                lastVideoIdForMap = currentVid;
+            }
+
+            const hasPot = url.searchParams.has('pot') || (body && body.includes('"pot"'));
             const normalized = url.toString();
             const seenAt = Date.now();
+            const existing = timedtextUrlMap.get(normalized);
 
-            // pot-bearing URLs get a boost of 1e12 so they always outlast others
+            // pot-bearing URLs get a boost of 1e12
             const ts = hasPot ? seenAt + 1e12 : seenAt;
-            timedtextUrlMap.set(normalized, { ts, hasPot, seenAt });
+
+            timedtextUrlMap.set(normalized, {
+                ts: Math.max(ts, existing?.ts || 0),
+                hasPot: hasPot || !!existing?.hasPot,
+                seenAt: existing?.seenAt || seenAt,
+                method: method !== 'GET' ? method : (existing?.method || 'GET'),
+                body: body || existing?.body || null,
+                responseText: existing?.responseText || null
+            });
 
             // Evict the lowest-priority entry if over limit
             if (timedtextUrlMap.size > MAX_TRACKED_TIMEDTEXT_URLS) {
@@ -68,30 +91,35 @@
         seedTimedtextUrlsFromPerformance();
         const currentVideoId = getCurrentVideoId();
 
-        // Sort: pot-bearing URLs first (highest ts), then by recency
+        // Sort: pot-bearing URLs or cached responses first (highest ts), then by recency
         const allEntries = Array.from(timedtextUrlMap.entries())
             .sort((a, b) => b[1].ts - a[1].ts)
-            .map(([url]) => url);
+            .map(([url, meta]) => ({
+                url,
+                method: meta.method || 'GET',
+                body: meta.body || null,
+                responseText: meta.responseText || null
+            }));
 
         if (!currentVideoId) return allEntries.slice(0, 20);
 
         const matchingVideoUrls = [];
         const recentNoVideoUrls = [];
         const now = Date.now();
-        for (const raw of allEntries) {
+        for (const entry of allEntries) {
             try {
-                const url = new URL(raw);
+                const url = new URL(entry.url);
                 const vParam = url.searchParams.get('v');
                 if (vParam === currentVideoId) {
-                    matchingVideoUrls.push(raw);
+                    matchingVideoUrls.push(entry);
                     continue;
                 }
                 // Some app/PWA requests may omit `v`; allow only very recent no-`v` URLs.
                 if (!vParam) {
-                    const meta = timedtextUrlMap.get(raw);
+                    const meta = timedtextUrlMap.get(entry.url);
                     const age = now - Number(meta?.seenAt || 0);
                     if (Number.isFinite(age) && age <= 25000) {
-                        recentNoVideoUrls.push(raw);
+                        recentNoVideoUrls.push(entry);
                     }
                 }
             } catch (_) { }
@@ -163,16 +191,49 @@
                 const nativeFetch = window.fetch.bind(window);
                 window.fetch = function (...args) {
                     const firstArg = args[0];
+                    let urlStr = '';
+                    let method = 'GET';
+                    let body = null;
+
                     if (typeof firstArg === 'string') {
-                        rememberTimedtextUrl(firstArg);
+                        urlStr = firstArg;
                     } else if (firstArg && typeof firstArg.url === 'string') {
-                        rememberTimedtextUrl(firstArg.url);
+                        urlStr = firstArg.url;
+                        method = firstArg.method || 'GET';
                     }
+
+                    if (args[1]) {
+                        method = args[1].method || method;
+                        if (args[1].body && typeof args[1].body === 'string') {
+                            body = args[1].body;
+                        }
+                    }
+
+                    if (urlStr) rememberTimedtextUrl(urlStr, method, body);
 
                     const result = nativeFetch(...args);
                     Promise.resolve(result).then((response) => {
-                        // Also capture the final response URL (after redirects)
-                        if (response?.url) rememberTimedtextUrl(response.url);
+                        const resUrl = response?.url || urlStr;
+                        // Capture the final response URL (after redirects)
+                        if (resUrl) rememberTimedtextUrl(resUrl, method, body);
+
+                        // Capture response text if it's a successful timedtext/transcript request
+                        const isTranscriptApi = resUrl && (resUrl.includes('/api/timedtext') || resUrl.includes('/youtubei/v1/get_transcript'));
+                        if (isTranscriptApi && response.ok) {
+                            try {
+                                response.clone().text().then(text => {
+                                    if (text && text.trim().length > 0) {
+                                        const meta = timedtextUrlMap.get(resUrl);
+                                        if (meta) {
+                                            meta.responseText = text;
+                                            meta.ts = Date.now() + 2e12; // Massive boost for cached response
+                                        }
+                                    }
+                                }).catch(() => { });
+                            } catch (cloneErr) {
+                                // Clone can fail if response is already used or stream is closed
+                            }
+                        }
                     }).catch(() => { });
                     return result;
                 };
@@ -184,14 +245,34 @@
             const nativeSend = XMLHttpRequest.prototype.send;
 
             XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+                this.__ytNotesMethod = method;
                 this.__ytNotesRequestUrl = url;
-                rememberTimedtextUrl(url);
                 return nativeOpen.call(this, method, url, ...rest);
             };
 
             XMLHttpRequest.prototype.send = function (...args) {
+                let body = args[0];
+                if (typeof body !== 'string') body = null;
+                const method = this.__ytNotesMethod || 'GET';
+                const url = this.__ytNotesRequestUrl;
+
+                if (url) rememberTimedtextUrl(url, method, body);
+
                 this.addEventListener('loadend', () => {
-                    rememberTimedtextUrl(this.responseURL || this.__ytNotesRequestUrl);
+                    const finalUrl = this.responseURL || url;
+                    if (finalUrl) rememberTimedtextUrl(finalUrl, method, body);
+
+                    const isTranscriptApi = finalUrl && (finalUrl.includes('/api/timedtext') || finalUrl.includes('/youtubei/v1/get_transcript'));
+                    if (isTranscriptApi && this.status === 200) {
+                        const text = this.responseText;
+                        if (text && text.trim().length > 0) {
+                            const meta = timedtextUrlMap.get(finalUrl);
+                            if (meta) {
+                                meta.responseText = text;
+                                meta.ts = Date.now() + 2e12; // massive boost
+                            }
+                        }
+                    }
                 }, { once: true });
                 return nativeSend.apply(this, args);
             };
@@ -199,12 +280,24 @@
 
         try {
             if (typeof PerformanceObserver === 'function') {
+                // Fix #13: Disconnect PerformanceObserver after initial load/discovery
                 const observer = new PerformanceObserver((list) => {
-                    for (const entry of list.getEntries()) {
-                        if (entry?.name) rememberTimedtextUrl(entry.name);
+                    const entries = list.getEntries();
+                    for (const entry of entries) {
+                        if (entry.name && (entry.name.includes('/api/timedtext') || entry.name.includes('/youtubei/v1/get_transcript'))) {
+                            const url = entry.name;
+                            if (!timedtextUrlMap.has(url)) {
+                                timedtextUrlMap.set(url, { ts: Date.now(), seenAt: Date.now() });
+                            }
+                        }
                     }
                 });
                 observer.observe({ type: 'resource', buffered: true });
+
+                // Disconnect after 30 seconds to prevent background overhead
+                setTimeout(() => {
+                    try { observer.disconnect(); } catch (_) { }
+                }, 30000);
             }
         } catch (_) { }
     }
@@ -220,8 +313,14 @@
             // Intercepted URLs are preferred as they carry fresh pot tokens
             timedtextUrls: interceptedUrls,
             // Signal whether we have pot-bearing URLs available
-            hasPotUrls: interceptedUrls.some(u => {
-                try { return new URL(u).searchParams.has('pot'); } catch (_) { return false; }
+            hasPotUrls: interceptedUrls.some((entry) => {
+                const rawUrl = typeof entry === 'string' ? entry : entry?.url;
+                if (!rawUrl) return false;
+                try {
+                    return new URL(rawUrl, window.location.origin).searchParams.has('pot');
+                } catch (_) {
+                    return false;
+                }
             })
         };
 
