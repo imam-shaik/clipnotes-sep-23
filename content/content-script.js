@@ -1,5 +1,4 @@
-// content/content-script.js
-
+(function() {
 const TIMEOUT_CONFIG = {
     BRIDGE_DATA_MAX_WAIT: 4000,   // Increased from 3000ms for high-latency systems
     ANIMATION_FEEDBACK: 150,
@@ -65,6 +64,9 @@ class YouTubeNotesContent {
         this._playerInterval = null;
         this.panelStatePollTimer = null;
 
+        // Clean up navigation listeners
+        if (this._navCleanup) this._navCleanup();
+
         if (this._keyboardListener) {
             window.removeEventListener('keydown', this._keyboardListener, true);
             this._keyboardListener = null;
@@ -90,7 +92,9 @@ class YouTubeNotesContent {
         this._miniViewStorageChangeListener = null;
 
         if (typeof this._miniViewDragCleanup === 'function') {
-            try { this._miniViewDragCleanup(); } catch (_) { }
+            try { this._miniViewDragCleanup(); } catch (e) {
+                console.debug('[ContentScript] MiniViewDragCleanup failed:', e);
+            }
             this._miniViewDragCleanup = null;
         }
 
@@ -1144,7 +1148,9 @@ class YouTubeNotesContent {
                     segments = this.parseJson3Transcript(trimmed);
                 }
                 if (segments.length > 0) return this.finalizeTranscriptSegments(segments);
-            } catch (_) { }
+            } catch (e) {
+                console.debug('[ContentScript] Failed to parse JSON transcript:', e);
+            }
         }
         if (trimmed.startsWith('WEBVTT') || trimmed.includes('-->')) {
             const vttSegments = this.parseVttTranscript(trimmed);
@@ -1160,7 +1166,9 @@ class YouTubeNotesContent {
             const data = JSON.parse(trimmed);
             const youtubeiFallback = this.parseYoutubeiTranscript(data);
             if (youtubeiFallback.length) return this.finalizeTranscriptSegments(youtubeiFallback);
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[ContentScript] Failed to parse JSON fallback:', e);
+        }
 
         const jsonFallback = this.parseJson3Transcript(trimmed);
         if (jsonFallback.length) return this.finalizeTranscriptSegments(jsonFallback);
@@ -1201,7 +1209,9 @@ class YouTubeNotesContent {
                 if (kind !== 'asr') score += 1;
                 if (fmt === 'json3') score += 2;
                 if (fmt === 'srv3' || fmt === 'vtt') score += 1;
-            } catch (_) { }
+            } catch (e) {
+                console.debug('[ContentScript] Failed to parse URL for scoring:', rawUrl, e);
+            }
 
             scored.push({ item, score });
         }
@@ -1291,7 +1301,9 @@ class YouTubeNotesContent {
                             dedupe.add(vStr);
                             requestQueue.push({ url: vStr, fmtHint: fmt, method: p.method, body: p.body });
                         }
-                    } catch (_) { }
+                    } catch (e) {
+                        console.debug('[ContentScript] Failed to create URL variant:', p.url, e);
+                    }
                 }
             }
         }
@@ -1327,10 +1339,12 @@ class YouTubeNotesContent {
                 }
 
                 const segments = this.parseTranscriptPayload(rawText, item.fmtHint);
-                if (segments.length > 0) return { segments, sourceFormat: item.fmtHint || 'direct' };
-                failures.push(`${item.fmtHint}: parsed no data`);
+                if (segments && segments.length > 0) return { segments, sourceFormat: item.fmtHint || 'direct' };
+                
+                const reason = (!segments) ? "parsing error" : "no segments found";
+                failures.push(`${item.fmtHint}: ${reason}`);
             } catch (err) {
-                failures.push(`${item.fmtHint}: ${err.message}`);
+                failures.push(`${item.fmtHint}: ${err.name} - ${err.message}`);
             }
         }
 
@@ -1364,20 +1378,21 @@ class YouTubeNotesContent {
 
                 const segments = this.parseTranscriptPayload(rawText, fmt);
 
-                if (segments.length > 0) {
+                if (segments && segments.length > 0) {
                     return { segments, sourceFormat: fmt };
                 }
 
-                failures.push(`${fmt}: parsed but no text`);
+                const reason = (!segments) ? "parsing error" : "no text found";
+                failures.push(`${fmt}: ${reason}`);
             } catch (err) {
-                failures.push(`${fmt}: ${err.message}`);
+                failures.push(`${fmt}: ${err.name} - ${err.message}`);
             }
         }
 
         return {
             segments: [],
             error: failures.length
-                ? `Could not parse transcript from YouTube captions (${failures.join(' | ')}).`
+                ? `Captions found but could not be read (${failures.join(' | ')}).`
                 : 'Transcript content is unavailable.'
         };
     }
@@ -1695,7 +1710,9 @@ function formatTimeHelper(ms) {
     if (existing && typeof existing.destroy === 'function') {
         try {
             existing.destroy();
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[ContentScript] Failed to destroy existing controller:', e);
+        }
     }
-    window[key] = new YouTubeController();
+    window[key] = new YouTubeNotesContent();
 })();

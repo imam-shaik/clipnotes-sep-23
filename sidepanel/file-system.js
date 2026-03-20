@@ -226,6 +226,54 @@ const FileSystemModule = {
         }
     },
 
+    /**
+     * Get a file handle from the root directory with robust permission checks.
+     */
+    async getFile(filename, create = false) {
+        if (!this.dirHandle) return null;
+
+        // Verify root health
+        const rootState = await this.isRootHandleAlive();
+        if (!rootState.alive) {
+            console.warn("FileSystem: Root folder missing or inaccessible.");
+            this.dirHandle = null;
+            return null;
+        }
+
+        if (rootState.reason === 'needs_permission') {
+            this.permissionNeedsUserGesture = true;
+            return null;
+        }
+
+        try {
+            return await this.dirHandle.getFileHandle(filename, { create });
+        } catch (err) {
+            if (err.name === 'NotFoundError') return null;
+            
+            if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+                this.permissionNeedsUserGesture = true;
+            } else {
+                console.error(`FileSystem: Error getting file ${filename}:`, err);
+            }
+            return null;
+        }
+    },
+
+    /**
+     * Get the text content of a file. Returns null if file missing or error.
+     */
+    async getFileText(filename) {
+        try {
+            const fileHandle = await this.getFile(filename, false);
+            if (!fileHandle) return null;
+            const file = await fileHandle.getFile();
+            return await file.text();
+        } catch (err) {
+            console.error(`FileSystem: Error reading file ${filename}:`, err);
+            return null;
+        }
+    },
+
     async saveFile(filename, blobData, subFolderHandle = null, withPrompt = false) {
         const targetHandle = subFolderHandle || this.dirHandle;
 
@@ -278,7 +326,7 @@ const FileSystemModule = {
 
                 // Retry for generic transient errors (e.g. "The user aborted a request" or lock issues)
                 if (attempt < maxAttempts) {
-                    const delay = attempt * 300;
+                    const delay = attempt * 150; // Reduced from 300ms to 150ms for faster feedback
                     console.warn(`FileSystem: Save attempt ${attempt} failed, retrying in ${delay}ms:`, err.message);
                     await new Promise(r => setTimeout(r, delay));
                 } else {

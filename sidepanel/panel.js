@@ -20,9 +20,14 @@ let isVideoPlaying = false; // Track playback status
 let isAutoOpenEnabled = true; // New: Auto-Open toggle state
 let isCaptionEnabled = false; // CC-on-Screenshot toggle: OFF by default (clean screenshots)
 let lastCaptureTime = 0; // Prevent spamming screenshots too fast
+let lastScreenshotHash = null; // Track perceptual hash of last captured image
 let panelHeartbeatTimer = null;
 let disconnectedPollCount = 0;
 let detachedHostMissingCount = 0;
+let autoScreenshotInterval = null; // Auto-screenshot interval timer
+let lastAutoScreenshotTime = 0; // Track last auto-screenshot time to suppress scroll
+let savedScrollPositions = new Map(); // videoId -> scrollTop for scroll persistence across navigation
+const DUPLICATE_HASH_THRESHOLD = 6; // Hamming distance threshold for "too similar"
 const VIDEO_STATE_FILENAME = 'video_notes_state.json';
 const HISTORY_INDEX_FILENAME = 'history_index.json';
 const WATCH_LATER_FILENAME = 'watch_later_list.json';
@@ -153,6 +158,16 @@ window.addEventListener('beforeunload', () => {
         safeSendMessage(launchedForTabId, { action: 'TAB_PANEL_CLOSED' });
     }
     stopPanelHeartbeat();
+    
+    // Revoke all blob URLs to prevent memory leaks
+    if (state.blobUrls) {
+        state.blobUrls.forEach(url => {
+            try { URL.revokeObjectURL(url); } catch (e) {
+                console.warn('[Panel] Failed to revoke blob URL:', url, e);
+            }
+        });
+        state.blobUrls.clear();
+    }
 });
 
 // --- UI Utilities ---
@@ -200,6 +215,80 @@ function safeSetInnerHTML(idOrEl, html) {
     }
 }
 
+// --- Image Similarity (dHash) ---
+/**
+ * Calculates a 64-bit Difference Hash (dHash) for an image.
+ * Resizes to 9x8, grayscales, and compares adjacent pixels.
+ */
+async function calculateDHash(dataUrl) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            const width = 9;
+            const height = 8;
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            
+            // Draw resized
+            ctx.drawImage(img, 0, 0, width, height);
+            
+            // Get grayscale data
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const pixels = imageData.data;
+            const gray = [];
+            for (let i = 0; i < pixels.length; i += 4) {
+                // Standard luminance weights
+                const g = 0.299 * pixels[i] + 0.587 * pixels[i+1] + 0.114 * pixels[i+2];
+                gray.push(g);
+            }
+            
+            // Compute differences
+            let hash = "";
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width - 1; x++) {
+                    const left = gray[y * width + x];
+                    const right = gray[y * width + (x + 1)];
+                    hash += (left > right ? "1" : "0");
+                }
+            }
+            
+            // Convert to hex for compact storage
+            let hexHash = "";
+            for (let i = 0; i < hash.length; i += 4) {
+                hexHash += parseInt(hash.substr(i, 4), 2).toString(16);
+            }
+            resolve(hexHash);
+        };
+        img.onerror = () => resolve(null);
+        img.src = dataUrl;
+    });
+}
+
+function getHammingDistance(h1, h2) {
+    if (!h1 || !h2 || h1.length !== h2.length) return 999;
+    let distance = 0;
+    for (let i = 0; i < h1.length; i++) {
+        const v1 = parseInt(h1[i], 16);
+        const v2 = parseInt(h2[i], 16);
+        let xor = v1 ^ v2;
+        // Count bits
+        while (xor > 0) {
+            distance += (xor & 1);
+            xor >>= 1;
+        }
+    }
+    return distance;
+}
+
+function isDuplicate(newHash) {
+    if (!lastScreenshotHash) return false;
+    const distance = getHammingDistance(newHash, lastScreenshotHash);
+    console.log(`[dHash] Distance: ${distance} (Target: >${DUPLICATE_HASH_THRESHOLD})`);
+    return distance <= DUPLICATE_HASH_THRESHOLD;
+}
+
 function isMissingFileSystemEntryError(err) {
     if (!err) return false;
     const name = String(err.name || '');
@@ -235,8 +324,8 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 10, delayMs = 5
             // Suppress error
         }
 
-        // Wait before retrying
-        await new Promise(r => setTimeout(r, delayMs));
+        // Wait before retrying (shorter delay for faster failure)
+        await new Promise(r => setTimeout(r, i === 0 ? 100 : delayMs));
     }
 
     // Final failure
@@ -286,7 +375,10 @@ async function getValidatedWatchTab(tabId) {
         if (tab && isYouTubeWatchUrl(tab.url)) {
             return tab;
         }
-    } catch (_) { }
+    } catch (e) {
+        // Tab may have been closed or doesn't exist - silent expected failure
+        console.debug('[Panel] Tab not found or inaccessible:', tabId, e);
+    }
     return null;
 }
 
@@ -477,6 +569,7 @@ function handleMetadataResponse(response) {
 
         isDataLoadedForId = response.videoId;
         titleUsedForLoad = response.title;
+        lastScreenshotHash = null; // Reset duplicate detection for new video
         loadVideoState(response.videoId, response.title);
     } else if (isDataLoadedForId === response.videoId && !isGeneric && titleUsedForLoad && titleUsedForLoad !== response.title) {
         // Title changed after initial load (e.g., stale SPA title -> real title)
@@ -485,6 +578,7 @@ function handleMetadataResponse(response) {
         currentVideoTitle = response.title;
         state.metadata.videoTitle = response.title;
         titleUsedForLoad = response.title;
+        lastScreenshotHash = null; // Reset duplicate detection
         clearVideoStateUI();
         isDataLoadedForId = response.videoId; // Keep it set
         loadVideoState(response.videoId, response.title);
@@ -696,7 +790,9 @@ async function resolveActiveYouTubeTabId() {
                 currentTabId = tabInHostWindow.id;
                 return currentTabId;
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[Panel] Failed to query active tab in host window:', e);
+        }
 
         try {
             const hostTabs = await chrome.tabs.query({
@@ -708,7 +804,9 @@ async function resolveActiveYouTubeTabId() {
                 currentTabId = fallback.id;
                 return currentTabId;
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[Panel] Failed to query host tabs:', e);
+        }
 
         return null;
     }
@@ -719,7 +817,9 @@ async function resolveActiveYouTubeTabId() {
             currentTabId = tab.id;
             return currentTabId;
         }
-    } catch (_) { }
+    } catch (e) {
+        console.debug('[Panel] Failed to query active tab in last focused window:', e);
+    }
 
     if (Date.now() - window.lastGlobalTabQueryFallback > 2000 || !window.lastGlobalTabQueryFallback) {
         window.lastGlobalTabQueryFallback = Date.now();
@@ -732,7 +832,9 @@ async function resolveActiveYouTubeTabId() {
                 currentTabId = best.id;
                 return currentTabId;
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[Panel] Failed to query all watch tabs:', e);
+        }
     }
 
     return null;
@@ -744,14 +846,16 @@ async function closeDetachedPanelIfHostMissing() {
         await chrome.windows.get(launchedForHostWindowId);
         detachedHostMissingCount = 0;
         return false;
-    } catch (_) {
+    } catch (e) {
         detachedHostMissingCount += 1;
         if (detachedHostMissingCount < 2) {
             return false;
         }
         try {
             window.close();
-        } catch (_) { }
+        } catch (closeErr) {
+            console.error('[Panel] Failed to close panel window:', closeErr);
+        }
         return true;
     }
 }
@@ -876,6 +980,9 @@ async function handleFolderPermissionRegrantClick(event = null) {
     if (currentVideoId && currentVideoTitle) {
         await loadVideoState(currentVideoId, currentVideoTitle);
     }
+    // FIX: Reload global lists after permission regrant
+    await loadWatchLaterList();
+    await loadCountdowns();
 }
 
 function showFolderPermissionBanner() {
@@ -990,6 +1097,7 @@ function initButtons() {
     const btnClosePanel = document.getElementById('btn-close-panel');
     const btnCopyTranscript = document.getElementById('btn-copy-transcript');
     const btnDeleteAllScreenshots = document.getElementById('btn-delete-all-screenshots');
+    const btnExportWatchLater = document.getElementById('btn-export-watch-later');
 
     // Secondary Actions
     const btnCaptureArea = document.getElementById('btn-capture-area');
@@ -1006,6 +1114,7 @@ function initButtons() {
     if (btnAddCountdown) btnAddCountdown.addEventListener('click', handleAddCountdownPrompt);
 
     if (btnExportPDF) btnExportPDF.addEventListener('click', handleExportPDF);
+    if (btnExportWatchLater) btnExportWatchLater.addEventListener('click', handleExportWatchLaterPDF);
     if (btnPreviewPDF) btnPreviewPDF.addEventListener('click', handlePreviewPDF);
     if (btnClosePreview) btnClosePreview.addEventListener('click', closePdfPreviewModal);
 
@@ -1187,7 +1296,7 @@ async function handleAreaCapture() {
                 if (subFolder) {
                     const saved = await FileSystemModule.saveFile(filename, blob, subFolder);
                     if (saved && targetVideoId === currentVideoId) {
-                        addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename);
+                        addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, false);
                         await saveVideoState(targetVideoId, targetVideoTitle);
                     } else if (!saved) {
                         showFolderPermissionBannerIfNeeded();
@@ -1210,10 +1319,12 @@ async function initAutoShotToggle() {
     if (!btn) return;
 
     try {
-        const result = await chrome.storage.local.get('autoScreenshotIntervalSecs');
+        const result = await chrome.storage.local.get(['autoScreenshotIntervalSecs', 'autoScreenshotMode']);
         const seconds = parseInt(result.autoScreenshotIntervalSecs) || 0;
-        if (seconds >= 1) {
-            startAutoScreenshot(seconds, btn);
+        const mode = result.autoScreenshotMode || 'timer';
+        
+        if (seconds >= 1 || mode === 'frame') {
+            startAutoScreenshot(seconds, mode, btn);
         }
     } catch (err) {
         console.warn("Failed to load Auto-Shot state:", err);
@@ -1222,18 +1333,36 @@ async function initAutoShotToggle() {
     btn.addEventListener('click', handleAutoScreenshotToggle);
 }
 
-function startAutoScreenshot(seconds, btn) {
+function startAutoScreenshot(seconds, mode, btn) {
     if (autoScreenshotInterval) clearInterval(autoScreenshotInterval);
-    const ms = seconds * 1000;
+    
+    let ms;
+    if (mode === 'frame') {
+        ms = 1500; // Poll every 1.5s for frame changes
+    } else {
+        ms = (seconds || 10) * 1000;
+    }
+
     autoScreenshotInterval = setInterval(() => {
         if (isVideoPlaying && document.visibilityState === 'visible') {
-            console.log("Auto-capturing because video is playing...");
-            handleCapture();
+            handleCapture(true); // Pass true to indicate auto-shot
         }
     }, ms);
+
+    // Record start time for auto-screenshot session
+    lastAutoScreenshotTime = Date.now();
+
     btn.classList.add('primary');
-    btn.title = `Auto Screenshot ON (Every ${seconds}s) - Click to Stop`;
-    chrome.storage.local.set({ autoScreenshotIntervalSecs: seconds });
+    if (mode === 'frame') {
+        btn.title = `Auto Screenshot ON (Frame Change) - Click to Stop`;
+    } else {
+        btn.title = `Auto Screenshot ON (Every ${seconds}s) - Click to Stop`;
+    }
+    
+    chrome.storage.local.set({ 
+        autoScreenshotIntervalSecs: seconds,
+        autoScreenshotMode: mode 
+    });
 }
 
 function handleAutoScreenshotToggle(e) {
@@ -1241,32 +1370,42 @@ function handleAutoScreenshotToggle(e) {
     if (autoScreenshotInterval) {
         clearInterval(autoScreenshotInterval);
         autoScreenshotInterval = null;
+        lastAutoScreenshotTime = 0; // Reset auto-screenshot timer
         btn.classList.remove('primary');
         btn.title = "Toggle Auto Screenshot";
-        chrome.storage.local.remove('autoScreenshotIntervalSecs');
+        chrome.storage.local.remove(['autoScreenshotIntervalSecs', 'autoScreenshotMode']);
         console.log("Auto Screenshot STOPPED.");
     } else {
         (async () => {
-            const input = await showPrompt("Enter Auto-Screenshot interval (e.g., '10s' or '1m'). Min 1s:", "10s");
-            if (!input) return;
+            const mode = await showPrompt("Choose Auto-Screenshot Mode:", "timer", [
+                { label: "Fixed Interval", value: "timer", icon: "\u23F3", description: "Capture every X seconds (skips duplicates)" },
+                { label: "Frame Change Detection", value: "frame", icon: "\uD83C\uDF9E", description: "Capture automatically on visual movement" }
+            ]);
+            if (!mode) return;
 
             let seconds = 0;
-            const match = input.toLowerCase().match(/^(\d+)([sm]?)$/);
-            if (match) {
-                const val = parseInt(match[1]);
-                const unit = match[2] || 's';
-                if (unit === 'm') seconds = val * 60;
-                else seconds = val;
-            } else if (!isNaN(input)) {
-                seconds = parseInt(input);
+            if (mode === 'timer') {
+                const input = await showPrompt("Enter Auto-Screenshot interval (e.g., '10s' or '1m'). Min 1s:", "10s");
+                if (!input) return;
+
+                const match = input.toLowerCase().match(/^(\d+)([sm]?)$/);
+                if (match) {
+                    const val = parseInt(match[1]);
+                    const unit = match[2] || 's';
+                    if (unit === 'm') seconds = val * 60;
+                    else seconds = val;
+                } else if (!isNaN(input)) {
+                    seconds = parseInt(input);
+                }
+
+                if (seconds < 1) {
+                    showToast("Invalid interval. Minimum 1s required.", "error");
+                    return;
+                }
             }
 
-            if (seconds >= 1) {
-                startAutoScreenshot(seconds, btn);
-                console.log(`Auto Screenshot ENABLED every ${seconds} seconds.`);
-            } else {
-                showToast("Invalid interval. Minimum 1s required.", "error");
-            }
+            startAutoScreenshot(seconds, mode, btn);
+            console.log(`Auto Screenshot ENABLED mode: ${mode} interval: ${seconds}s.`);
         })();
     }
 }
@@ -1336,11 +1475,16 @@ async function pollCurrentVideo() {
                 if (urlVideoId && currentVideoId !== urlVideoId) {
                     console.log("Sidepanel: Instant URL-based navigation detected:", urlVideoId);
                     currentVideoId = urlVideoId;
-                    currentVideoTitle = null; 
-                    isDataLoadedForId = null; 
+                    currentVideoTitle = null;
+                    isDataLoadedForId = null;
                     clearVideoStateUI();
                 }
-            } catch (urlErr) { console.warn("Invalid URL in poll check:", tab.url); }
+            } catch (urlErr) {
+                // Only log if it's a truly invalid URL, not just one with timestamp params (&t=)
+                if (!tab.url || !tab.url.includes('youtube.com/watch')) {
+                    console.warn("Invalid URL in poll check:", tab.url);
+                }
+            }
 
             // Fetch metadata with retry (only if title is missing)
             if (!currentVideoTitle) {
@@ -1453,7 +1597,7 @@ function updateTimeline(vidState) {
 // ==========================================
 // Action: Screenshot Capture
 // ==========================================
-async function handleCapture() {
+async function handleCapture(isAuto = false) {
     if (isCapturing) return; // Guard at top
     const tabId = await resolveActiveYouTubeTabId();
     if (!Number.isInteger(tabId)) return;
@@ -1518,8 +1662,10 @@ async function handleCapture() {
             activeCaptionState = !!ccOpt.isCaptionEnabled;
         } catch (e) { activeCaptionState = isCaptionEnabled; }
 
+        // Try content script capture ONLY if CCs are disabled (faster path)
         if (!activeCaptionState) {
-            response = await sendMessageWithRetry(tabId, { action: 'captureScreenshot', includeCaptions: false }, 5, 500);
+            // Reduced retries for faster fallback (2 retries × 300ms = 600ms max wait)
+            response = await sendMessageWithRetry(tabId, { action: 'captureScreenshot', includeCaptions: false }, 2, 300);
         }
 
         try {
@@ -1538,13 +1684,17 @@ async function handleCapture() {
                     // CRITICAL: When detached, we must capture the HOST window, not the panel window
                     const captureWinId = (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) ? launchedForHostWindowId : null;
 
-                    // If caps disabled: hide them before capture, restore after
+                    // Hide captions before capture (non-blocking, best effort)
                     if (!activeCaptionState) {
-                        await sendMessageWithRetry(tabId, { action: 'hideCaptions' }, 1, 50);
+                        // Fire-and-forget: Don't wait for response, capture immediately
+                        chrome.tabs.sendMessage(tabId, { action: 'hideCaptions' }, () => {});
                     }
+                    
                     finalImageData = await chrome.tabs.captureVisibleTab(captureWinId, { format: 'png', quality: 100 });
+                    
+                    // Restore captions after capture (non-blocking)
                     if (!activeCaptionState) {
-                        sendMessageWithRetry(tabId, { action: 'showCaptions' }, 1, 50); // fire-and-forget restore
+                        chrome.tabs.sendMessage(tabId, { action: 'showCaptions' }, () => {});
                     }
                     console.log("Sidepanel: Capture successful via fallback (captureVisibleTab) for win:", captureWinId);
 
@@ -1565,6 +1715,17 @@ async function handleCapture() {
             }
 
             if (!finalImageData) {
+                return; // Exit inner try, finally will run
+            }
+
+            // --- PERCEPTUAL DUPLICATE DETECTION (dHash) ---
+            const newHash = await calculateDHash(finalImageData);
+            if (newHash && isDuplicate(newHash)) {
+                if (isAuto) {
+                    console.log("[AutoShot] Skipping duplicate frame.");
+                } else {
+                    showToast("Skipping duplicate screenshot.", "info");
+                }
                 return; // Exit inner try, finally will run
             }
 
@@ -1589,7 +1750,12 @@ async function handleCapture() {
             if (saved) {
                 console.log("Saved directly to Windows sub-folder:", filename);
                 // Only add to UI if we successfully saved to Disk (source of truth)
-                addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename);
+                // Track auto-screenshot time for scroll suppression
+                if (isAuto) {
+                    lastAutoScreenshotTime = Date.now();
+                }
+                addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, isAuto);
+                lastScreenshotHash = newHash; // Update tracker for next comparison
             } else {
                 // If save failed but didn't throw (retries exhausted or permission lost)
                 if (FileSystemModule.permissionNeedsUserGesture) {
@@ -1687,12 +1853,14 @@ async function handleAddLocalImage(e) {
             try {
                 const stateResp = await sendMessageWithRetry(currentTabId, { action: 'getState' }, 3, 200);
                 if (stateResp && stateResp.currentTimeMs) currentTimeMs = stateResp.currentTimeMs;
-            } catch (tErr) { }
+            } catch (tErr) {
+                console.warn('[Panel] Failed to get video time for external image:', tErr);
+            }
 
             const timeF = formatTime(currentTimeMs);
 
             // 5. Add to UI
-            addScreenshotToUI(dataUrl, timeF, currentTimeMs, filename, "<i>External image.</i>");
+            addScreenshotToUI(dataUrl, timeF, currentTimeMs, filename, "<i>External image.</i>", false, null, null, false);
 
             // Switch to gallery tab
             const tabBtn = document.querySelector('[data-tab="tab-screenshots"]');
@@ -1723,51 +1891,56 @@ async function dataURLtoBlobAsync(dataurl) {
 }
 
 // ==========================================
-// Gallery Rendering (Interleaved)
+// Gallery Rendering (Virtualized for Performance)
 // ==========================================
-function renderMainGallery() {
+const GALLERY_VIRTUALIZATION_THRESHOLD = 30; // Use virtualization for 30+ items
+const GALLERY_ITEMS_PER_PAGE = 20; // Render 20 items at a time
+
+function renderMainGallery(onComplete = null) {
     const list = document.getElementById('screenshots-list');
     if (!list) return;
 
-    list.innerHTML = '';
+    // SCROLL LOCK: Capture current position before wiping the DOM
+    const currentScroll = list.scrollTop;
 
-    // Combine screenshots (ORIGINAL references) with TOC entries
-    // We sort combined items by timestampMs for a logical interleaved timeline,
-    // BUT the user asked for new screenshots to appear at the bottom "after 7 screenshot".
-    // To satisfy both:
-    // 1. Screenshots themselves should likely be sorted by capture order (createdAt) if that's what user prefers.
-    // 2. Or we keep timestampMs but the user's specific complaint is about them adding "at top".
-    // If they add at top, it means current sort is ascending and new one is earlier?
-    // Actually, if I take a shot at 10:00 and then 05:00, 05:00 goes to top. User wants it at bottom.
-    // So we sort screenshots by createdAt.
+    list.innerHTML = '';
 
     const sortedShots = [...state.screenshots].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
     const sortedToc = sortTOCByCreated(state.toc);
 
     const items = [
         ...sortedShots.map(s => ({ ref: s, type: 'screenshot', sortVal: s.createdAt || 0 })),
-        // IMPORTANT: Use createdAt here (same unit as screenshots) to prevent TOC jumping to top.
         ...sortedToc.map(t => ({ ref: t, type: 'toc', sortVal: t.createdAt || 0 }))
     ];
 
-    // If we interleave them, we need a common sort value. 
-    // If we want "Order Taken", we use createdAt for shots. 
-    // But TOC doesn't have createdAt usually. 
-    // Let's stick to simple: Screenshots by capture order, TOC interleaved.
-    // Actually, user just said "newly taking that screenshot that are adding at top and not after 7 screenshot".
-    // This strongly implies capture order.
-
-    // Sort all by capture order if possible, fallback to timestampMs
     items.sort((a, b) => a.sortVal - b.sortVal);
 
     if (items.length === 0) {
         const svgIcon = `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>`;
         list.innerHTML = `<div class="empty-state">${svgIcon}<p>No screenshots or markers yet.</p></div>`;
+        if (onComplete) onComplete();
         return;
     }
 
+    const finalizeRendering = () => {
+        // SCROLL LOCK: Restore position before user notices the jump
+        list.scrollTop = currentScroll;
+        if (onComplete) onComplete();
+    };
+
+    // For large galleries, use progressive rendering to prevent UI hang
+    if (items.length > GALLERY_VIRTUALIZATION_THRESHOLD) {
+        renderGalleryProgressively(list, items, finalizeRendering);
+    } else {
+        renderGalleryImmediate(list, items);
+        finalizeRendering();
+    }
+}
+
+function renderGalleryImmediate(list, items) {
     const fragment = document.createDocumentFragment();
     let shotCounter = 1;
+    
     items.forEach(item => {
         if (item.type === 'screenshot') {
             const card = createScreenshotCard(item.ref, shotCounter++);
@@ -1777,7 +1950,55 @@ function renderMainGallery() {
             fragment.appendChild(tocElement);
         }
     });
+    
     list.appendChild(fragment);
+}
+
+function renderGalleryProgressively(list, items, onComplete = null) {
+    // Show loading indicator
+    list.innerHTML = `<div class="empty-state"><p>Loading ${items.length} items...</p></div>`;
+
+    let currentIndex = 0;
+    let shotCounter = 1;
+
+    function renderNextBatch() {
+        const batch = items.slice(currentIndex, currentIndex + GALLERY_ITEMS_PER_PAGE);
+        if (batch.length === 0) {
+            if (onComplete) onComplete();
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+
+        batch.forEach(item => {
+            if (item.type === 'screenshot') {
+                const card = createScreenshotCard(item.ref, shotCounter++);
+                fragment.appendChild(card);
+            } else {
+                const tocElement = createTOCGalleryElement(item.ref);
+                fragment.appendChild(tocElement);
+            }
+        });
+
+        // Remove loading indicator on first batch
+        if (currentIndex === 0) {
+            list.innerHTML = '';
+        }
+
+        list.appendChild(fragment);
+        currentIndex += GALLERY_ITEMS_PER_PAGE;
+
+        // Schedule next batch if more items
+        if (currentIndex < items.length) {
+            requestAnimationFrame(renderNextBatch);
+        } else {
+            // Finished rendering all batches
+            if (onComplete) onComplete();
+        }
+    }
+
+    // Start rendering
+    requestAnimationFrame(renderNextBatch);
 }
 
 function createTOCGalleryElement(entry) {
@@ -1887,7 +2108,7 @@ function createTOCGalleryElement(entry) {
         entry.title = nextTitle;
         applyLevelVisual(levelSelect.value);
         setEditMode(false);
-        renderMainGallery();
+        // renderMainGallery() is redundant/harmful here as it resets scroll; the DOM is already updated.
         renderTOCList();
         saveVideoState(currentVideoId);
     };
@@ -1940,8 +2161,23 @@ function createTOCGalleryElement(entry) {
         e.stopPropagation();
         if (await showConfirm("Delete this marker?")) {
             state.toc = state.toc.filter(t => t.id !== entry.id);
-            renderMainGallery();
-            renderTOCList();
+            
+            // SURGICAL DELETION: Remove from DOM directly
+            const itemEl = document.getElementById(entry.id);
+            if (itemEl) {
+                itemEl.remove();
+                
+                // If no items left (including screenshots), show empty state
+                const list = document.getElementById('screenshots-list');
+                if (list && list.children.length === 0) {
+                    const svgIcon = `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>`;
+                    list.innerHTML = `<div class="empty-state">${svgIcon}<p>No screenshots or markers yet.</p></div>`;
+                }
+            } else {
+                renderMainGallery();
+            }
+
+            renderTOCList(); // Still needed to update TOC side-panel list
             saveVideoState(currentVideoId);
         }
     });
@@ -1980,12 +2216,18 @@ function applyNoteToolbarCommand(editorEl, cmd, value) {
     // Prefer `hiliteColor` then normalize selected highlight nodes.
     if (cmd === 'backColor') {
         const highlightColor = value || '#FFF36A';
-        try { document.execCommand('styleWithCSS', false, true); } catch (_) { }
+        try { document.execCommand('styleWithCSS', false, true); } catch (e) {
+            console.debug('[Panel] styleWithCSS command failed:', e);
+        }
 
         let applied = false;
-        try { applied = document.execCommand('hiliteColor', false, highlightColor); } catch (_) { }
+        try { applied = document.execCommand('hiliteColor', false, highlightColor); } catch (e) {
+            console.debug('[Panel] hiliteColor command failed:', e);
+        }
         if (!applied) {
-            try { document.execCommand('backColor', false, highlightColor); } catch (_) { }
+            try { document.execCommand('backColor', false, highlightColor); } catch (e) {
+                console.debug('[Panel] backColor command failed:', e);
+            }
         }
 
         syncNoteHighlightNodes(editorEl);
@@ -2172,7 +2414,7 @@ function createScreenshotCard(shot, index) {
 
         } catch (err) {
             console.error("Failed to add transcript:", err);
-            showToast("Failed to get transcript.", "error");
+            showToast("Failed to get transcript. Try turning CC on for a moment.", "error");
         } finally {
             btn.innerHTML = originalText;
             btn.disabled = false;
@@ -2523,19 +2765,16 @@ function normalizeScreenshotRecord(shot, index = 0) {
 }
 
 // Add screenshot to the UI list and local state
-async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml = "", isRestoring = false, existingId = null, existingCreatedAt = null) {
+async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml = "", isRestoring = false, existingId = null, existingCreatedAt = null, skipScroll = false) {
     const shotId = existingId || `shot-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     let finalDataUrl = dataUrl;
-    // If we just captured a massive base64 image, convert it to a Blob URL for memory efficiency 
-    // so the side panel doesn't balloon in RAM over time.
     if (dataUrl && dataUrl.startsWith('data:')) {
         try {
             const blob = await dataURLtoBlobAsync(dataUrl);
             finalDataUrl = URL.createObjectURL(blob);
-            // Fix #11: Track for revocation
             state.blobUrls.add(finalDataUrl);
-        } catch (e) { console.warn("Blob URL memory optimization failed", e); }
+        } catch (e) { console.warn("Blob URL optimization failed", e); }
     }
 
     const item = {
@@ -2549,18 +2788,90 @@ async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNote
     };
     state.screenshots.push(item);
 
-    // Sort by creation time (Capture Order) to satisfy "after 7 screenshot" requirement
+    // Sort by creation time (Capture Order)
     state.screenshots.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
 
-    renderMainGallery();
-
     if (!isRestoring) {
-        setTimeout(() => {
-            const card = document.getElementById(shotId);
-            if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }, TIMEOUT_CONFIG.METADATA_CHECK_DELAY);
+        const list = document.getElementById('screenshots-list');
+        if (list && list.querySelector('.empty-state')) {
+            list.innerHTML = '';
+        }
+
+        if (list) {
+            const scrollContainer = list.closest('.scrollable') || list;
+
+            // FIX #1: Calculate scroll position BEFORE appending
+            const scrollHeightBefore = scrollContainer.scrollHeight;
+            const scrollTopBefore = scrollContainer.scrollTop;
+            const clientHeight = scrollContainer.clientHeight;
+            const wasNearBottom = (scrollHeightBefore - scrollTopBefore - clientHeight) < 100;
+            
+            // FIX #2: Detect auto-screenshots to suppress scroll thrashing
+            const isAutoScreenshot = filename.startsWith('AutoShot_') ||
+                                     filename.startsWith('AreaShot_') ||
+                                     (lastAutoScreenshotTime > 0 && (Date.now() - lastAutoScreenshotTime) < 5000);
+            
+            // Auto-screenshots NEVER auto-scroll to avoid disrupting user's review workflow
+            const shouldAutoScroll = !skipScroll && 
+                                     !isAutoScreenshot &&
+                                     (state.screenshots.length <= 1 || wasNearBottom);
+
+            // FIX #3: Append card
+            const index = state.screenshots.length;
+            const card = createScreenshotCard(item, index);
+            list.appendChild(card);
+
+            // FIX #4: Wait for image to fully load BEFORE scrolling
+            const img = card.querySelector('.card-img');
+
+            const performScroll = () => {
+                if (!shouldAutoScroll) return;
+
+                // Use requestAnimationFrame for smooth scroll after layout is stable
+                requestAnimationFrame(() => {
+                    const finalScrollTop = scrollContainer.scrollHeight;
+                    scrollContainer.scrollTo({
+                        top: finalScrollTop,
+                        behavior: 'smooth'
+                    });
+                });
+            };
+
+            if (img && !img.complete) {
+                // Image not loaded — wait for it
+                img.onload = performScroll;
+                img.onerror = performScroll; // Still scroll even if image fails
+                // Fallback timeout in case onload doesn't fire
+                setTimeout(performScroll, 800);
+            } else {
+                // Image already cached — scroll immediately
+                performScroll();
+            }
+        }
         saveVideoState(currentVideoId);
+    } else {
+        renderMainGallery();
     }
+}
+
+/**
+ * Robust vertical scroll that handles dynamic layouts and potential UI lag.
+ * Refined for ultra-smooth movement.
+ */
+function safeScrollToElement(el, behavior = 'smooth') {
+    if (!el || !el.isConnected) return;
+    
+    // Ensure we are scrolling the correct container
+    const container = el.closest('.scrollable') || el.parentElement;
+    if (!container) return;
+
+    requestAnimationFrame(() => {
+        el.scrollIntoView({ 
+            behavior: behavior, 
+            block: 'nearest',
+            inline: 'nearest' 
+        });
+    });
 }
 
 function normalizeTOCRecord(entry, index = 0) {
@@ -2671,7 +2982,9 @@ function revokeScreenshotBlobUrlIfNeeded(shot) {
     if (!shot.dataUrl.startsWith('blob:')) return;
     try {
         URL.revokeObjectURL(shot.dataUrl);
-    } catch (_) { }
+    } catch (e) {
+        console.debug('[Panel] Failed to revoke screenshot blob URL:', shot.dataUrl, e);
+    }
     state.blobUrls.delete(shot.dataUrl);
 }
 
@@ -2817,7 +3130,30 @@ async function deleteScreenshot(shotId) {
 
     state.screenshots = state.screenshots.filter(s => s.id !== shotId);
     revokeScreenshotBlobUrlIfNeeded(shot);
-    renderMainGallery();
+
+    // SURGICAL DELETION: Remove from DOM directly to avoid scroll jump
+    const cardEl = document.getElementById(shotId);
+    if (cardEl) {
+        cardEl.remove();
+        
+        // Update indices of remaining cards to keep them sequential
+        const screenshotCards = document.querySelectorAll('.screenshot-card');
+        screenshotCards.forEach((card, idx) => {
+            const indexEl = card.querySelector('.card-index');
+            if (indexEl) indexEl.textContent = `#${idx + 1}`;
+        });
+
+        // If no items left (including TOC), show empty state
+        const list = document.getElementById('screenshots-list');
+        if (list && list.children.length === 0) {
+            const svgIcon = `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>`;
+            list.innerHTML = `<div class="empty-state">${svgIcon}<p>No screenshots or markers yet.</p></div>`;
+        }
+    } else {
+        // Fallback if DOM is out of sync
+        renderMainGallery();
+    }
+
     await saveVideoState(currentVideoId, currentVideoTitle);
 }
 
@@ -3242,7 +3578,21 @@ function addTOCToUI(title, timeStr, timeMs, existingCreatedAt = null, level = 'H
     state.toc = sortTOCByCreated(state.toc);
 
     renderTOCList();
-    renderMainGallery();
+    
+    const list = document.getElementById('screenshots-list');
+    if (list && list.querySelector('.empty-state')) {
+        list.innerHTML = '';
+    }
+
+    const totalItems = state.screenshots.length + state.toc.length;
+
+    if (list) {
+        // DELTA RENDERING: Always append markers if they are the latest item
+        const tocElement = createTOCGalleryElement(entry);
+        list.appendChild(tocElement);
+        safeScrollToElement(tocElement);
+    }
+
     saveVideoState(currentVideoId);
 }
 
@@ -3314,7 +3664,9 @@ function renderTOCList() {
 function clearVideoStateUI() {
     // Fix #11: Revoke all Blob URLs to free memory
     state.blobUrls.forEach(url => {
-        try { URL.revokeObjectURL(url); } catch (_) { }
+        try { URL.revokeObjectURL(url); } catch (e) {
+            console.debug('[Panel] Failed to revoke blob URL during clear:', url, e);
+        }
     });
     state.blobUrls.clear();
 
@@ -4246,7 +4598,6 @@ async function generatePDFDoc(progressCallback = null) {
 
     const sanitizeForPdfSafe = (str) => {
         if (!str) return "";
-        // Replace non-ASCII and common encoding artifacts with a space or empty
         return str.replace(/[^\x00-\x7F]/g, " ").replace(/\s+/g, " ").trim();
     };
 
@@ -4366,11 +4717,11 @@ async function generatePDFDoc(progressCallback = null) {
         if (sortedTocEntries.length === 0) return 0;
         let count = 1;
         const bottomLimit = pageHeight - margin - 15;
-        let y = margin + 24; // drawTOCHeading(margin+12) + 12mm
+        let y = margin + 24;
         for (const entry of sortedTocEntries) {
             const level = normalizeTOCLevel(entry.level);
             const lineHeight = level === 'H1' ? 5.2 : (level === 'H2' ? 4.8 : 4.6);
-            const label = (entry.numPrefix || "") + entry.title; // Includes numbering
+            const label = (entry.numPrefix || "") + entry.title;
             const lines = doc.splitTextToSize(label, contentWidth - (level === 'H1' ? 0 : (level === 'H2' ? 6 : 12)));
             const required = (lines.length * lineHeight) + 1.4;
             if (y + required > bottomLimit) {
@@ -4385,7 +4736,7 @@ async function generatePDFDoc(progressCallback = null) {
 
     const frontPagesCount = 1 + (sortedTocEntries.length > 0 ? tocPages : 0);
 
-    // 2. Pre-calculate destinations for ALL items (Shots and TOC Markers)
+    // 2. Pre-calculate destinations for ALL items
     const unifiedItemsForSizing = [
         ...sortedShots.map((s, idx) => ({ type: 'shot', data: s, index: idx + 1, time: s.timestampMs || 0 })),
         ...sortedTocEntries.map(e => ({ type: 'toc', data: e, time: e.timestampMs || 0 }))
@@ -4930,6 +5281,12 @@ async function generatePDFDoc(progressCallback = null) {
 
         for (let i = 0; i < allItems.length; i++) {
             const item = allItems[i];
+            
+            // NON-BLOCKING: Yield to UI thread every 5 items to prevent freeze
+            if (i > 0 && i % 5 === 0) {
+                report(`Rendering pages... ${Math.round((i / allItems.length) * 100)}%`);
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
 
             if (item.type === 'toc') {
                 // Absolute Sync: use 22mm threshold matching sizing pass
@@ -5038,18 +5395,20 @@ async function generatePDFDoc(progressCallback = null) {
 }
 
 async function handleExportPDF() {
-    showExportProgressDialog("Preparing export...");
+    showExportProgressDialog("Starting PDF export...");
 
     try {
+        // Use the existing generatePDFDoc function (already tested and working)
         const doc = await generatePDFDoc((message) => {
             updateExportProgressDialog(message || "Exporting PDF...");
         });
+        
         if (!doc) {
             hideExportProgressDialog();
             return;
         }
 
-        updateExportProgressDialog("Opening Save As dialog...");
+        updateExportProgressDialog("Saving PDF...");
 
         const title = document.getElementById('video-title').textContent || "YouTube Notes";
         const pdfBlob = doc.output('blob');
@@ -5059,13 +5418,179 @@ async function handleExportPDF() {
         const saved = await FileSystemModule.saveFileAs(filename, pdfBlob);
         if (saved) {
             console.log("PDF saved via Save As dialog.");
+            showToast("PDF saved successfully!", "success");
+        } else {
+            showToast("PDF export cancelled", "info");
         }
     } catch (err) {
         console.error("PDF export failed:", err);
-        await showAlert("PDF export failed. Please try again.");
+        await showAlert("PDF export failed: " + err.message);
     } finally {
         hideExportProgressDialog();
     }
+}
+
+async function imageUrlToBase64(url) {
+    try {
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        const blob = await response.blob();
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (e) {
+        console.error("Failed to convert image to base64:", e);
+        return null;
+    }
+}
+
+async function handleExportWatchLaterPDF() {
+    if (state.watchLaterList.length === 0) {
+        await showAlert("Watch Later list is empty!");
+        return;
+    }
+
+    showExportProgressDialog("Starting Watch Later PDF export...");
+
+    try {
+        const doc = await generateWatchLaterPDFDoc((message) => {
+            updateExportProgressDialog(message || "Exporting Watch Later List...");
+        });
+        
+        if (!doc) {
+            hideExportProgressDialog();
+            return;
+        }
+
+        updateExportProgressDialog("Saving PDF...");
+
+        const pdfBlob = doc.output('blob');
+        const filename = `YouTube_Watch_Later_${Date.now().toString().slice(-4)}.pdf`;
+
+        const saved = await FileSystemModule.saveFileAs(filename, pdfBlob);
+        if (saved) {
+            showToast("Watch Later PDF saved successfully!", "success");
+        } else {
+            showToast("Export cancelled", "info");
+        }
+    } catch (err) {
+        console.error("Watch Later PDF export failed:", err);
+        await showAlert("Export failed: " + err.message);
+    } finally {
+        hideExportProgressDialog();
+    }
+}
+
+async function generateWatchLaterPDFDoc(progressCallback = null) {
+    if (!window.jspdf && !window.jsPDF) {
+        await showAlert("PDF Library not loaded properly.");
+        return null;
+    }
+
+    const jsPDFBuilder = window.jspdf ? window.jspdf.jsPDF : window.jsPDF;
+    if (!jsPDFBuilder) {
+        await showAlert("Could not initialize JS PDF builder.");
+        return null;
+    }
+
+    const doc = new jsPDFBuilder();
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 20;
+
+    // Title
+    doc.setFontSize(22);
+    doc.setTextColor(40, 40, 40);
+    doc.text("YouTube Watch Later List", margin, 30);
+
+    // Metadata
+    doc.setFontSize(10);
+    doc.setTextColor(100, 100, 100);
+    doc.text(`Generated on: ${new Date().toLocaleString()}`, margin, 40);
+    doc.text(`Total Videos: ${state.watchLaterList.length}`, margin, 45);
+
+    doc.setDrawColor(200, 200, 200);
+    doc.line(margin, 50, pageWidth - margin, 50);
+
+    let y = 65;
+    const sorted = [...state.watchLaterList].sort((a, b) => a.priority - b.priority || b.addedAt - a.addedAt);
+
+    for (let i = 0; i < sorted.length; i++) {
+        const item = sorted[i];
+
+        // Page break check
+        if (y > pageHeight - 50) {
+            doc.addPage();
+            y = 30;
+        }
+
+        // Fetch Thumbnail
+        if (item.thumbnail) {
+            const base64 = await imageUrlToBase64(item.thumbnail);
+            if (base64) {
+                try {
+                    doc.addImage(base64, 'JPEG', margin, y - 5, 32, 18);
+                } catch (e) {
+                    console.error("Failed to add thumbnail to PDF:", e);
+                }
+            }
+        }
+
+        const contentX = margin + 38;
+
+        // Priority Icon/Color
+        let priorityColor = [100, 100, 100];
+        if (item.priority === 1) priorityColor = [231, 76, 60]; // Red
+        else if (item.priority === 2) priorityColor = [241, 196, 15]; // Yellow
+        else if (item.priority === 3) priorityColor = [52, 152, 219]; // Blue
+
+        // Priority Badge
+        doc.setFillColor(...priorityColor);
+        doc.roundedRect(contentX, y - 5, 12, 8, 1.5, 1.5, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(7);
+        doc.text(`P${item.priority}`, contentX + 6, y + 0.5, { align: 'center' });
+
+        // Title
+        doc.setTextColor(30, 30, 30);
+        doc.setFontSize(11);
+        const splitTitle = doc.splitTextToSize(item.title, pageWidth - contentX - 25);
+        doc.text(splitTitle, contentX + 15, y);
+        
+        y += (splitTitle.length * 5.5);
+
+        // Subtext (Date Added)
+        doc.setFontSize(8);
+        doc.setTextColor(120, 120, 120);
+        const dateStr = new Date(item.addedAt).toLocaleDateString();
+        doc.text(`Added: ${dateStr} • Progress: ${item.progressPercentage}%`, contentX + 15, y);
+        
+        y += 5;
+
+        // Link (Clickable)
+        const url = `https://www.youtube.com/watch?v=${item.videoId}`;
+        doc.setTextColor(52, 152, 219);
+        doc.setFontSize(8);
+        doc.textWithLink(url, contentX + 15, y, { url });
+        
+        y += 20; // Gap between items
+        
+        if (progressCallback) progressCallback(`Processing video ${i+1}/${sorted.length}`);
+    }
+
+    // Page Numbers
+    const totalPages = doc.internal.getNumberOfPages();
+    for (let j = 1; j <= totalPages; j++) {
+        doc.setPage(j);
+        doc.setFontSize(8);
+        doc.setTextColor(150, 150, 150);
+        doc.text(`Page ${j} of ${totalPages}`, pageWidth / 2, pageHeight - 10, { align: 'center' });
+    }
+
+    return doc;
 }
 
 let previewObserver = null;
@@ -5479,15 +6004,43 @@ function buildStateSnapshot(forVideoId, forTitle = null, lastTimeMs = 0) {
     };
 }
 
-// Fix #8: Debounced save state to prevent race conditions & disk thrashing
+// Fix #8: Mutex lock to prevent race conditions during concurrent state saves
+let saveVideoStateLock = false;
+let pendingSaveRequested = false;
 let saveVideoStateTimer = null;
+
 async function saveVideoState(forVideoId = null, forTitle = null) {
+    // If a save is in progress, mark that we need another save after it completes
+    if (saveVideoStateLock) {
+        pendingSaveRequested = true;
+        return; // Don't start concurrent save
+    }
+
+    // Use a short debounce to batch rapid changes, but respect the lock
     if (saveVideoStateTimer) clearTimeout(saveVideoStateTimer);
+    
     saveVideoStateTimer = setTimeout(async () => {
+        // Double-check lock after timeout
+        if (saveVideoStateLock) {
+            pendingSaveRequested = true;
+            return;
+        }
+        
+        saveVideoStateLock = true;
+
         try {
             await saveVideoStateExecution(forVideoId, forTitle);
         } catch (err) {
-            console.error("Delayed saveVideoState failed:", err);
+            console.error("saveVideoState failed:", err);
+        } finally {
+            saveVideoStateLock = false;
+
+            // If another save was requested while this one was running, trigger it
+            if (pendingSaveRequested) {
+                pendingSaveRequested = false;
+                // Use setTimeout to avoid immediate recursion
+                setTimeout(() => saveVideoState(forVideoId, forTitle), 50);
+            }
         }
     }, 500);
 }
@@ -5515,7 +6068,9 @@ async function saveVideoStateExecution(forVideoId = null, forTitle = null) {
         try {
             const resp = await sendMessageWithRetry(currentTabId, { action: 'getState' }, 1, 0);
             if (resp) lastTimeMs = resp.currentTimeMs;
-        } catch (e) { }
+        } catch (e) {
+            console.debug('[Panel] Failed to get video state for save:', e);
+        }
 
         const snapshot = buildStateSnapshot(targetVideoId, videoTitle, lastTimeMs);
         state.metadata = { ...snapshot.metadata };
@@ -5550,6 +6105,12 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
     // console.log("[STABILITY_V3] loadVideoState starting for:", forVideoId, "isPreview:", isPreview);
     try {
         if (!FileSystemModule.dirHandle || !forVideoId || !forTitle) return;
+
+        // Save current scroll position BEFORE clearing UI (for returning to this video later)
+        const scrollContainer = document.querySelector('.scrollable');
+        if (scrollContainer && currentVideoId && !isPreview) {
+            savedScrollPositions.set(currentVideoId, scrollContainer.scrollTop);
+        }
 
         // Ensure we are still on the same video that we started loading for
         if (forVideoId !== currentVideoId) return;
@@ -5616,55 +6177,57 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
             const permissionDeniedDuringRehydration = [];
             const otherRehydrationFailures = [];
 
-            // PARALLEL REHYDRATION (Fix #15): Better error handling and concurrency control
-            const rehydratePromises = state.screenshots.map(async (shot) => {
-                if (!shot.dataUrl && shot.filename) {
-                    try {
-                        const imgHandle = await subFolder.getFileHandle(shot.filename);
-                        const imgFile = await imgHandle.getFile();
-                        const blobUrl = URL.createObjectURL(imgFile);
-                        shot.dataUrl = blobUrl;
-                        delete shot.missingOnDisk;
-                        state.blobUrls.add(blobUrl);
+            // PARALLEL REHYDRATION with concurrency limit to prevent UI hang
+            // Process images in batches of 10 to avoid overwhelming file system
+            const CONCURRENCY_LIMIT = 10;
+            
+            async function processRehydrationBatch(batch) {
+                await Promise.all(batch.map(async (shot) => {
+                    if (!shot.dataUrl && shot.filename) {
+                        try {
+                            const imgHandle = await subFolder.getFileHandle(shot.filename);
+                            const imgFile = await imgHandle.getFile();
+                            const blobUrl = URL.createObjectURL(imgFile);
+                            shot.dataUrl = blobUrl;
+                            delete shot.missingOnDisk;
+                            state.blobUrls.add(blobUrl);
 
-                        if (isPreview) {
-                            const shotIdAttr = shot.id || shot.filename;
-                            const previewImgs = document.querySelectorAll(`[data-shot-id="${shotIdAttr}"] .preview-shot-image`);
-                            previewImgs.forEach(img => {
-                                img.src = blobUrl;
-                                img.classList.remove('loading');
-                            });
-                        }
-                    } catch (e) {
-                        if (isMissingFileSystemEntryError(e)) {
-                            removedMissingShotIds.push(shot.id);
-                            missingFilesDuringRehydration.push(shot.filename);
-                            return;
-                        }
-                        if (isPermissionDeniedFileSystemError(e)) {
-                            permissionDeniedDuringRehydration.push(shot.filename);
-                            return;
-                        }
+                            if (isPreview) {
+                                const shotIdAttr = shot.id || shot.filename;
+                                const previewImgs = document.querySelectorAll(`[data-shot-id="${shotIdAttr}"] .preview-shot-image`);
+                                previewImgs.forEach(img => {
+                                    img.src = blobUrl;
+                                    img.classList.remove('loading');
+                                });
+                            }
+                        } catch (e) {
+                            if (isMissingFileSystemEntryError(e)) {
+                                removedMissingShotIds.push(shot.id);
+                                missingFilesDuringRehydration.push(shot.filename);
+                                return;
+                            }
+                            if (isPermissionDeniedFileSystemError(e)) {
+                                permissionDeniedDuringRehydration.push(shot.filename);
+                                return;
+                            }
 
-                        const errName = String(e?.name || "UnknownError");
-                        const errMsg = String(e?.message || e || "Unknown rehydration failure");
-                        otherRehydrationFailures.push(`${shot.filename}: ${errName} - ${errMsg}`);
+                            const errName = String(e?.name || "UnknownError");
+                            const errMsg = String(e?.message || e || "Unknown rehydration failure");
+                            otherRehydrationFailures.push(`${shot.filename}: ${errName} - ${errMsg}`);
+                        }
                     }
-                }
-            });
-
-            // If it's a preview, we want the structure to show INSTANTLY.
-            // Don't await the rehydration; let it happen in background.
-            if (isPreview) {
-                // Kick off but return early
-                Promise.all(rehydratePromises).then(() => {
-                    console.log("PDF Preview: Background image rehydration complete.");
-                }).catch(err => {
-                    console.warn("PDF Preview: Background image rehydration failed:", err);
-                });
-            } else {
-                // If main app opening, wait for it so the UI doesn't pop in too much
-                await Promise.all(rehydratePromises);
+                }));
+            }
+            
+            // Split into batches
+            const batches = [];
+            for (let i = 0; i < state.screenshots.length; i += CONCURRENCY_LIMIT) {
+                batches.push(state.screenshots.slice(i, i + CONCURRENCY_LIMIT));
+            }
+            
+            // Process batches sequentially
+            for (const batch of batches) {
+                await processRehydrationBatch(batch);
             }
 
             if (removedMissingShotIds.length > 0) {
@@ -5688,7 +6251,8 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
                 }
                 if (!isPreview) {
                     // Persist cleanup immediately so stale entries do not reappear on next open.
-                    await saveVideoStateExecution(forVideoId, forTitle);
+                    // Use saveVideoState to respect mutex lock and prevent race conditions
+                    saveVideoState(forVideoId, forTitle);
                 }
             }
 
@@ -5744,6 +6308,17 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
             try {
                 renderTOCList();
             } catch (e) { console.error("Sidepanel: renderTOCList failed", e); }
+
+            // Restore scroll position after rendering (instant, no animation)
+            requestAnimationFrame(() => {
+                const savedScroll = savedScrollPositions.get(forVideoId);
+                if (savedScroll !== undefined && scrollContainer) {
+                    scrollContainer.scrollTo({
+                        top: savedScroll,
+                        behavior: 'auto'
+                    });
+                }
+            });
         }
 
     } catch (err) {
@@ -5893,6 +6468,7 @@ async function getCachedTranscript(force = false) {
     const tabId = await resolveActiveYouTubeTabId();
     if (!Number.isInteger(tabId)) return null;
 
+    // Prove-in parameters from Copy (8): 2 retries, 250ms delay
     const response = await sendMessageWithRetry(tabId, { action: 'getTranscript' }, 2, 250);
     if (response?.success && response.segments) {
         cachedTranscriptSegments = normalizeTranscriptSegmentsForDisplay(response.segments);
@@ -5915,9 +6491,8 @@ async function refreshTranscript() {
     const errors = [];
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
+        // Robust parameters: 2 retries, 250ms delay
         const response = await sendMessageWithRetry(tabId, { action: 'getTranscript' }, 2, 250);
-        // Fix #17: Redundant normalization removed - it's already done in getCachedTranscript 
-        // which refreshTranscript should use or mirror.
         if (response?.success && response.segments) {
             const segments = normalizeTranscriptSegmentsForDisplay(response.segments);
             cachedTranscriptSegments = segments; // Synchronize cache
@@ -6516,19 +7091,18 @@ function initWatchLaterTab() {
 }
 
 async function loadWatchLaterList() {
-    if (!FileSystemModule.dirHandle) return;
     try {
-        const fileHandle = await FileSystemModule.dirHandle.getFileHandle(WATCH_LATER_FILENAME, { create: false });
-        const file = await fileHandle.getFile();
-        const text = await file.text();
+        const text = await FileSystemModule.getFileText(WATCH_LATER_FILENAME);
+        if (!text) return;
+
         const data = JSON.parse(text);
         if (Array.isArray(data)) {
             state.watchLaterList = data;
             renderWatchLaterList();
         }
     } catch (err) {
-        if (err.name !== 'NotFoundError') {
-            console.error("Failed to load Watch Later list:", err);
+        if (err.name !== 'NotFoundError' && err.name !== 'SyntaxError') {
+            console.error("Panel: Failed to load Watch Later list:", err.name, err.message);
         }
     }
 }
@@ -6717,19 +7291,18 @@ function renderWatchLaterList() {
 // ==========================================
 
 async function loadCountdowns() {
-    if (!FileSystemModule.dirHandle) return;
     try {
-        const fileHandle = await FileSystemModule.dirHandle.getFileHandle(COUNTDOWN_FILENAME, { create: false });
-        const file = await fileHandle.getFile();
-        const text = await file.text();
+        const text = await FileSystemModule.getFileText(COUNTDOWN_FILENAME);
+        if (!text) return;
+
         const data = JSON.parse(text);
         if (Array.isArray(data)) {
             state.countdowns = data;
             renderCountdowns();
         }
     } catch (err) {
-        if (err.name !== 'NotFoundError') {
-            console.error("Failed to load Countdowns list:", err);
+        if (err.name !== 'NotFoundError' && err.name !== 'SyntaxError') {
+            console.error("Panel: Failed to load Countdowns list:", err.name, err.message);
         }
     }
 }
@@ -7048,3 +7621,63 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
         }
     }
 });
+
+// ==========================================
+// Image Hash Utilities (dHash)
+// ==========================================
+/**
+ * Calculates a 64-bit Perceptual Difference Hash (dHash) for a given image DataURL.
+ * Uses a hidden 9x8 canvas to detect horizontal gradients.
+ */
+async function calculateDHash(dataUrl) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            const width = 9;
+            const height = 8;
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            
+            // Draw resized grayscale version
+            ctx.filter = 'grayscale(100%)';
+            ctx.drawImage(img, 0, 0, width, height);
+            
+            const imageData = ctx.getImageData(0, 0, width, height).data;
+            let hash = "";
+            
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width - 1; x++) {
+                    const leftIdx = (y * width + x) * 4;
+                    const rightIdx = (y * width + (x + 1)) * 4;
+                    
+                    // Since it's grayscale, R=G=B. Use R value.
+                    const leftVal = imageData[leftIdx];
+                    const rightVal = imageData[rightIdx];
+                    
+                    hash += leftVal < rightVal ? "1" : "0";
+                }
+            }
+            
+            // Cleanup and resolve
+            canvas.width = 0; canvas.height = 0;
+            resolve(hash);
+        };
+        img.onerror = () => resolve(null);
+        img.src = dataUrl;
+    });
+}
+
+/**
+ * Calculates the Hamming distance between two binary hash strings.
+ * Lower distance = more visually similar.
+ */
+function compareHashes(hash1, hash2) {
+    if (!hash1 || !hash2 || hash1.length !== hash2.length) return 999;
+    let distance = 0;
+    for (let i = 0; i < hash1.length; i++) {
+        if (hash1[i] !== hash2[i]) distance++;
+    }
+    return distance;
+}

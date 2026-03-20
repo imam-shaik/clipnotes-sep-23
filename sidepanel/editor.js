@@ -15,10 +15,10 @@ let currentViewportScale = 1;
 let statusPrefix = "";
 let resizeRaf = null;
 
-// History System for Annotations
+// History System for Annotations - COMMAND-BASED (No Images)
 let historyStack = [];
 let redoStack = [];
-const MAX_HISTORY = 40;
+const MAX_HISTORY = 50; // Can be higher now since we store commands, not images
 
 document.addEventListener('DOMContentLoaded', async () => {
     const params = new URLSearchParams(window.location.search);
@@ -178,32 +178,57 @@ function setupInteractions() {
         isDrawing = false;
         drawCanvas.releasePointerCapture(e.pointerId);
 
-        if (currentTool !== 'pen' && currentTool !== 'eraser') {
-            // Commit shape from preview to drawing layer
-            const pos = getPos(e);
-            previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-            drawShape(drawCtx, startPos, pos, currentTool, currentColor, currentSize * getViewportScaleFactor());
+        const endPos = getPos(e);
+        
+        // --- COMMAND-BASED HISTORY (No Images) ---
+        let action;
+        if (currentTool === 'pen' || currentTool === 'eraser') {
+            // For pens/erasers, store the points drawn
+            action = { 
+                tool: currentTool, 
+                color: currentColor, 
+                size: currentSize, 
+                points: [...points, endPos],
+                compositeOp: currentTool === 'eraser' ? 'destination-out' : 'source-over'
+            };
         } else {
-            // Draw the final segment
-            if (points.length >= 2) {
-                const last = points[points.length - 1];
-                const prev = points[points.length - 2];
-                drawCtx.beginPath();
-                drawCtx.lineWidth = Math.max(1, currentSize * getViewportScaleFactor());
-                if (currentTool === 'eraser') {
-                    drawCtx.globalCompositeOperation = 'destination-out';
-                } else {
-                    drawCtx.globalCompositeOperation = 'source-over';
-                    drawCtx.strokeStyle = currentColor;
-                }
-                drawCtx.moveTo(prev.x, prev.y);
-                drawCtx.lineTo(last.x, last.y);
-                drawCtx.stroke();
-            }
+            // For shapes, store start and end coordinates
+            action = { 
+                tool: currentTool, 
+                color: currentColor, 
+                size: currentSize, 
+                start: startPos, 
+                end: endPos 
+            };
         }
 
+        // Commit shape from preview to drawing layer if needed
+        if (currentTool !== 'pen' && currentTool !== 'eraser') {
+            previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+            drawShape(drawCtx, startPos, endPos, currentTool, currentColor, currentSize * getViewportScaleFactor());
+        } else if (points.length >= 2) {
+            // Draw final segment for pen/eraser
+            const last = points[points.length - 1];
+            const prev = points[points.length - 2];
+            drawCtx.beginPath();
+            drawCtx.lineWidth = Math.max(1, currentSize * getViewportScaleFactor());
+            drawCtx.globalCompositeOperation = action.compositeOp;
+            drawCtx.strokeStyle = currentColor;
+            drawCtx.moveTo(prev.x, prev.y);
+            drawCtx.lineTo(last.x, last.y);
+            drawCtx.stroke();
+        }
+
+        // Add the action to history (not an image!)
+        historyStack.push(action);
+        if (historyStack.length > MAX_HISTORY) historyStack.shift();
+        redoStack = [];
+        
+        // No need to call saveToHistory() - we already drew it
+        updateHistoryButtons();
+        // --- END OF FIX ---
+
         points = [];
-        saveToHistory();
     };
 
     window.addEventListener('pointermove', onPointerMove);
@@ -365,46 +390,61 @@ function drawArrow(ctx, fromX, fromY, toX, toY, headlen) {
     ctx.stroke();
 }
 
-// ── History Engine ───────────────────────────────────────────
-function saveToHistory() {
-    // Only save the drawing layer
-    historyStack.push(drawCanvas.toDataURL());
-    if (historyStack.length > MAX_HISTORY) historyStack.shift();
+// ── Command-Based History Engine (No Images) ───────────────────────────────────────────
+
+// Redraw entire canvas from command history
+function redrawAll() {
+    // Clear the drawing layer (keep background intact)
+    drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    
+    // Replay every command in history
+    historyStack.forEach(action => {
+        drawCtx.globalCompositeOperation = action.compositeOp || 'source-over';
+        drawCtx.strokeStyle = action.color;
+        drawCtx.lineWidth = action.size * getViewportScaleFactor();
+        
+        if (action.tool === 'pen' || action.tool === 'eraser') {
+            // Replay the line drawing
+            if (action.points && action.points.length > 1) {
+                drawCtx.beginPath();
+                drawCtx.moveTo(action.points[0].x, action.points[0].y);
+                
+                // Use the same curve logic as during drawing for smooth lines
+                for (let i = 1; i < action.points.length; i++) {
+                    const prev = action.points[i - 1];
+                    const curr = action.points[i];
+                    drawCtx.lineTo(curr.x, curr.y);
+                }
+                drawCtx.stroke();
+            }
+        } else if (action.tool) {
+            // Replay the shape drawing
+            drawShape(drawCtx, action.start, action.end, action.tool, action.color, action.size * getViewportScaleFactor());
+        }
+    });
+    
     updateHistoryButtons();
 }
 
 function undo() {
-    if (historyStack.length <= 1) return;
+    if (historyStack.length === 0) return;
     redoStack.push(historyStack.pop());
-    restoreFromData(historyStack[historyStack.length - 1]);
+    redrawAll(); // Redraw without the last action
+    updateHistoryButtons();
 }
 
 function redo() {
     if (redoStack.length === 0) return;
-    const next = redoStack.pop();
-    historyStack.push(next);
-    restoreFromData(next);
+    historyStack.push(redoStack.pop());
+    redrawAll(); // Redraw with the redone action
+    updateHistoryButtons();
 }
 
-function restoreFromData(dataUrl) {
-    if (!dataUrl) return;
-    const img = new Image();
-    img.onload = () => {
-        drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
-        drawCtx.globalCompositeOperation = 'source-over';
-        drawCtx.drawImage(img, 0, 0);
-
-        // Clean up to prevent memory leak
-        img.onload = null;
-        img.src = "";
-
-        updateHistoryButtons();
-    };
-    img.onerror = () => {
-        img.onload = null;
-        img.src = "";
-    };
-    img.src = dataUrl;
+// Initial blank state (no commands yet)
+function saveToHistory() {
+    // For command-based, we don't need to save initial state
+    // The empty historyStack represents the blank canvas
+    updateHistoryButtons();
 }
 
 function updateHistoryButtons() {

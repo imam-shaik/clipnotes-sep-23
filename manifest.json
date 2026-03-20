@@ -10,10 +10,14 @@
     "sidePanel",
     "downloads",
     "contextMenus",
-    "windows"
+    "windows",
+    "tabs"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "*://youtube.com/*",
+    "*://www.youtube.com/*",
+    "*://*.youtube.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js"

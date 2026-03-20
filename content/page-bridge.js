@@ -75,7 +75,9 @@
                 }
                 if (oldestKey) timedtextUrlMap.delete(oldestKey);
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[PageBridge] Failed to manage timedtext URL cache:', e);
+        }
     }
 
     function seedTimedtextUrlsFromPerformance() {
@@ -84,7 +86,9 @@
             for (const entry of entries) {
                 if (entry?.name) rememberTimedtextUrl(entry.name);
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[PageBridge] Failed to seed timedtext URLs from performance:', e);
+        }
     }
 
     function getObservedTimedtextUrlsForCurrentVideo() {
@@ -122,7 +126,9 @@
                         recentNoVideoUrls.push(entry);
                     }
                 }
-            } catch (_) { }
+            } catch (e) {
+                console.debug('[PageBridge] Failed to process timedtext URL entry:', e);
+            }
         }
 
         // Prefer strict current-video URLs; fallback to very recent no-`v` URLs only.
@@ -136,25 +142,33 @@
         try {
             const fromYtPlayer = parseMaybeJson(window.ytplayer?.config?.args?.player_response);
             if (fromYtPlayer) candidates.push(fromYtPlayer);
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[PageBridge] Failed to parse ytplayer config:', e);
+        }
 
         try {
             if (typeof window.ytcfg?.get === 'function') {
                 const fromCfg = parseMaybeJson(window.ytcfg.get('PLAYER_RESPONSE'));
                 if (fromCfg) candidates.push(fromCfg);
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[PageBridge] Failed to get ytcfg PLAYER_RESPONSE:', e);
+        }
 
         try {
             const fromCfgData = parseMaybeJson(window.ytcfg?.data_?.PLAYER_RESPONSE);
             if (fromCfgData) candidates.push(fromCfgData);
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[PageBridge] Failed to parse ytcfg data PLAYER_RESPONSE:', e);
+        }
 
         try {
             if (window.ytInitialPlayerResponse) {
                 candidates.push(window.ytInitialPlayerResponse);
             }
-        } catch (_) { }
+        } catch (e) {
+            console.debug('[PageBridge] Failed to access ytInitialPlayerResponse:', e);
+        }
 
         return candidates.filter(Boolean);
     }
@@ -229,16 +243,23 @@
                                             meta.ts = Date.now() + 2e12; // Massive boost for cached response
                                         }
                                     }
-                                }).catch(() => { });
+                                }).catch((err) => {
+                                    console.debug('[PageBridge] Failed to read response text:', err);
+                                });
                             } catch (cloneErr) {
                                 // Clone can fail if response is already used or stream is closed
+                                console.debug('[PageBridge] Response clone failed:', cloneErr);
                             }
                         }
-                    }).catch(() => { });
+                    }).catch((err) => {
+                        console.debug('[PageBridge] Fetch interceptor error:', err);
+                    });
                     return result;
                 };
             }
-        } catch (_) { }
+        } catch (e) {
+            console.warn('[PageBridge] Failed to setup fetch interceptor:', e);
+        }
 
         try {
             const nativeOpen = XMLHttpRequest.prototype.open;
@@ -276,7 +297,9 @@
                 }, { once: true });
                 return nativeSend.apply(this, args);
             };
-        } catch (_) { }
+        } catch (e) {
+            console.warn('[PageBridge] Failed to setup XHR interceptor:', e);
+        }
 
         try {
             if (typeof PerformanceObserver === 'function') {
@@ -296,10 +319,14 @@
 
                 // Disconnect after 30 seconds to prevent background overhead
                 setTimeout(() => {
-                    try { observer.disconnect(); } catch (_) { }
+                    try { observer.disconnect(); } catch (disconnectErr) {
+                        console.debug('[PageBridge] Failed to disconnect PerformanceObserver:', disconnectErr);
+                    }
                 }, 30000);
             }
-        } catch (_) { }
+        } catch (e) {
+            console.warn('[PageBridge] Failed to setup PerformanceObserver:', e);
+        }
     }
 
     hookFetchAndXhr();

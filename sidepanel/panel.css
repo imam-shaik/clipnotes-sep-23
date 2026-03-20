@@ -262,6 +262,35 @@ body {
     background-color: rgba(231, 76, 60, 0.14);
 }
 
+.action-btn-extra-small {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    padding: 3px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    color: var(--text-main);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+}
+
+.action-btn-extra-small:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+    background-color: var(--bg-card-hover);
+}
+
+.action-btn-extra-small svg {
+    width: 10px;
+    height: 10px;
+}
+
 /* -- Status Banner -- */
 .status-banner {
     display: none;
@@ -882,7 +911,29 @@ input:checked~.switch-text {
     width: 100%;
     max-width: 100%;
     max-height: 480px;
-    /* Limit vertical expansion */
+    animation: screenshotCardEnter 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes screenshotCardEnter {
+    from {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes cardAppear {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 
 .screenshot-card:hover {
@@ -896,10 +947,13 @@ input:checked~.switch-text {
     background: #000;
     overflow: hidden;
     max-height: 280px;
-    /* Limit image height */
     display: flex;
     align-items: center;
     justify-content: center;
+    /* Reserve space for 16:9 thumbnails to prevent layout jump when image loads */
+    aspect-ratio: 16 / 9;
+    background-color: var(--bg-header);
+    contain: layout;
 }
 
 .card-img {

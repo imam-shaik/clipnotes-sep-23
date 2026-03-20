@@ -13,14 +13,74 @@ const DETACHED_JOIN_OVERLAP = 9;
 const TIMEOUT_CONFIG = {
   WINDOW_STATE_MAX_WAIT: 1500, // Max wait for maximize/restore transitions
   WINDOW_STATE_NORMAL_WAIT: 1000,
-  DETACHED_SYNC_LOCK: 450,
-  BOUNDS_CHANGE_DEBOUNCE: 100,
+  DETACHED_SYNC_LOCK: 600, // Increased from 450ms to 600ms to prevent feedback loops
+  BOUNDS_CHANGE_DEBOUNCE: 150, // Increased from 100ms to 150ms for stability
   POLL_INTERVAL_FAST: 50,
   POLL_INTERVAL_NORMAL: 200
 };
 
 // Keep track of original maximize states during tiling
 const tilingRestoreStates = new Map();
+
+// Fix #1: Persist detached panel state to survive service worker restarts
+const STORAGE_KEY_DETACHED_PANELS = 'detachedPanelState_v1';
+
+// Load persisted state on service worker startup
+async function loadDetachedPanelState() {
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEY_DETACHED_PANELS);
+    const state = result[STORAGE_KEY_DETACHED_PANELS];
+    if (state && typeof state === 'object') {
+      // Restore detachedPanelWindowByTab
+      if (state.panels) {
+        for (const [tabIdStr, panelData] of Object.entries(state.panels)) {
+          const tabId = parseInt(tabIdStr, 10);
+          if (Number.isInteger(tabId)) {
+            detachedPanelWindowByTab.set(tabId, panelData);
+          }
+        }
+      }
+      // Restore relatedWindowsByTab
+      if (state.relatedWindows) {
+        for (const [tabIdStr, windowIds] of Object.entries(state.relatedWindows)) {
+          const tabId = parseInt(tabIdStr, 10);
+          if (Number.isInteger(tabId) && Array.isArray(windowIds)) {
+            relatedWindowsByTab.set(tabId, new Set(windowIds));
+          }
+        }
+      }
+      console.log(`[SW] Restored ${detachedPanelWindowByTab.size} detached panel(s) from storage`);
+    }
+  } catch (err) {
+    console.error('[SW] Failed to load detached panel state:', err);
+  }
+}
+
+// Save detached panel state to storage
+async function saveDetachedPanelState() {
+  try {
+    const state = {
+      panels: {},
+      relatedWindows: {}
+    };
+    
+    // Convert Maps to plain objects for storage
+    for (const [tabId, entry] of detachedPanelWindowByTab.entries()) {
+      state.panels[tabId] = entry;
+    }
+    
+    for (const [tabId, windowSet] of relatedWindowsByTab.entries()) {
+      state.relatedWindows[tabId] = Array.from(windowSet);
+    }
+    
+    await chrome.storage.local.set({ [STORAGE_KEY_DETACHED_PANELS]: state });
+  } catch (err) {
+    console.error('[SW] Failed to save detached panel state:', err);
+  }
+}
+
+// Initialize: Load persisted state
+loadDetachedPanelState();
 
 // Helper to wait for a window to reach a certain state (Fix #3)
 async function waitForWindowState(windowId, targetState, maxWaitMs = 2000) {
@@ -88,6 +148,8 @@ function handleOpenBigEditor(message, sender, sendResponse) {
         if (tabId) {
           if (!relatedWindowsByTab.has(tabId)) relatedWindowsByTab.set(tabId, new Set());
           relatedWindowsByTab.get(tabId).add(created.id);
+          // Persist state change
+          saveDetachedPanelState();
         }
       }
     });
@@ -157,7 +219,9 @@ function handleContentScriptReady(message, sender, sendResponse) {
         if (chrome.runtime.lastError) { /* ignore */ }
       }
     );
-  } catch (e) { }
+  } catch (e) {
+    console.warn('[SW] Failed to send message to panel:', e);
+  }
   sendResponse({ success: true });
 }
 function isPanelOpenForTab(tabId) {
@@ -182,7 +246,9 @@ async function resolveHostWindowForTab(tabId, hostWindowIdHint) {
     if (Number.isInteger(tab?.windowId)) {
       return await chrome.windows.get(tab.windowId);
     }
-  } catch (_) { }
+  } catch (e) {
+    console.debug('[SW] Failed to resolve host window for tab:', tabId, e);
+  }
 
   return null;
 }
@@ -247,12 +313,14 @@ async function syncDetachedPairFromHost(tabId) {
     const nextTop = Math.round(hostWindow.top);
     const nextHeight = Math.max(DETACHED_PANEL_MIN_HEIGHT, hostWindow.height);
 
-    // DELTA CHECK: Skip if already aligned within 1.5 pixels to prevent recursive update loops
+    // ENHANCED DELTA CHECK: Skip if already aligned within 3 pixels (increased from 2px for OS tolerance)
     const deltaL = Math.abs(Number(panelWindow.left) - nextLeft);
     const deltaT = Math.abs(Number(panelWindow.top) - nextTop);
     const deltaW = Math.abs(Number(panelWindow.width) - panelWidth);
     const deltaH = Math.abs(Number(panelWindow.height) - nextHeight);
-    if (deltaL < 2 && deltaT < 2 && deltaW < 2 && deltaH < 2) {
+    
+    // Increased tolerance to 3px to account for OS rounding and DPI scaling
+    if (deltaL < 3 && deltaT < 3 && deltaW < 3 && deltaH < 3) {
       return true;
     }
 
@@ -308,14 +376,15 @@ async function syncDetachedPairFromPanel(tabId) {
     const panelTop = Math.round(hostWindow.top);
     const panelHeight = Math.max(DETACHED_PANEL_MIN_HEIGHT, hostWindow.height);
 
-    // DELTA CHECK: If both windows are already aligned, skip to prevent infinite feedback
+    // ENHANCED DELTA CHECK: Increased tolerance to 3px to prevent feedback loops
     const hDeltaW = Math.abs(Number(hostWindow.width) - hostWidth);
     const pDeltaL = Math.abs(Number(panelWindow.left) - panelLeft);
     const pDeltaT = Math.abs(Number(panelWindow.top) - panelTop);
     const pDeltaW = Math.abs(Number(panelWindow.width) - panelWidth);
     const pDeltaH = Math.abs(Number(panelWindow.height) - panelHeight);
 
-    if (hDeltaW < 2 && pDeltaL < 2 && pDeltaT < 2 && pDeltaW < 2 && pDeltaH < 2) {
+    // Increased tolerance to 3px to account for OS rounding and DPI scaling
+    if (hDeltaW < 3 && pDeltaL < 3 && pDeltaT < 3 && pDeltaW < 3 && pDeltaH < 3) {
       return true;
     }
 
@@ -394,7 +463,9 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
     await chrome.windows.update(hostWindow.id, { state: "normal" });
     // Use config for robust wait
     await waitForWindowState(hostWindow.id, "normal", TIMEOUT_CONFIG.WINDOW_STATE_NORMAL_WAIT);
-  } catch (_) { }
+  } catch (e) {
+    console.warn('[SW] Failed to set host window to normal state:', e);
+  }
 
   // Retrieve last saved panel width (ignore host width to ensure full-screen fill)
   let storedPanelWidth = null;
@@ -403,7 +474,9 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
     if (data.lastPreferredPanelWidth) {
       storedPanelWidth = clampDetachedPanelWidth(data.lastPreferredPanelWidth);
     }
-  } catch (_) { }
+  } catch (e) {
+    console.debug('[SW] Failed to retrieve stored panel width:', e);
+  }
 
   const baseLeft = Number(screenBounds.left);
   const baseTop = Number(screenBounds.top);
@@ -481,6 +554,9 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
       if (!relatedWindowsByTab.has(tabId)) relatedWindowsByTab.set(tabId, new Set());
       relatedWindowsByTab.get(tabId).add(created.id);
 
+      // Persist state to survive service worker restarts
+      saveDetachedPanelState();
+
       // Initial tiling is already perfected by the created/update calls with shared bounds.
       // Re-triggering sync immediately would just risk race conditions with partially applied OS bounds.
     }
@@ -499,7 +575,9 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
             state: hostResizeRestore.restoreState
           });
         }
-      } catch (_) { }
+      } catch (e) {
+        console.warn('[SW] Failed to restore host window bounds:', e);
+      }
     }
     return false;
   }
@@ -546,8 +624,9 @@ async function closeNotesPanelForTab(tabId) {
     try {
       await chrome.windows.remove(detachedWindowId);
       closedAnything = true;
-    } catch (_) {
-      // Window already closed.
+    } catch (e) {
+      // Window already closed or inaccessible.
+      console.debug('[SW] Window already closed or inaccessible:', winId, e);
     }
   }
 
@@ -555,7 +634,9 @@ async function closeNotesPanelForTab(tabId) {
   const related = relatedWindowsByTab.get(tabId);
   if (related) {
     related.forEach(winId => {
-      chrome.windows.remove(winId).catch(() => { });
+      chrome.windows.remove(winId).catch((err) => {
+        console.debug('[SW] Failed to close related window:', winId, err);
+      });
     });
     relatedWindowsByTab.delete(tabId);
   }
@@ -643,13 +724,17 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "open-notes-panel") {
-    openNotesPanelForTab(tab?.id, tab?.windowId).catch(() => { });
+    openNotesPanelForTab(tab?.id, tab?.windowId).catch((err) => {
+      console.error('[SW] Failed to open notes panel from context menu:', err);
+    });
   }
 });
 
 // Automatically trigger side panel globally or on icon click
 chrome.action.onClicked.addListener((tab) => {
-  openNotesPanelForTab(tab?.id, tab?.windowId).catch(() => { });
+  openNotesPanelForTab(tab?.id, tab?.windowId).catch((err) => {
+    console.error('[SW] Failed to open notes panel from action click:', err);
+  });
 });
 
 
@@ -660,17 +745,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   const hostResizeRestore = entry?.hostResizeRestore;
   detachedPanelWindowByTab.delete(tabId);
   if (Number.isInteger(panelWindowId)) {
-    chrome.windows.remove(panelWindowId).catch(() => { });
+    chrome.windows.remove(panelWindowId).catch((err) => {
+      console.debug('[SW] Failed to remove panel window on tab close:', err);
+    });
+  }
+
+  // Clear auto-open timer for this tab
+  if (autoOpenTimers.has(tabId)) {
+    clearTimeout(autoOpenTimers.get(tabId));
+    autoOpenTimers.delete(tabId);
   }
 
   // Close all other related windows (e.g. Big Editor)
   const related = relatedWindowsByTab.get(tabId);
   if (related) {
     related.forEach(winId => {
-      chrome.windows.remove(winId).catch(() => { });
+      chrome.windows.remove(winId).catch((err) => {
+        console.debug('[SW] Failed to close related window on tab close:', winId, err);
+      });
     });
     relatedWindowsByTab.delete(tabId);
   }
+
+  // Persist state change
+  saveDetachedPanelState();
 
   if (hostResizeRestore && Number.isInteger(hostResizeRestore.hostWindowId)) {
     chrome.windows.update(hostResizeRestore.hostWindowId, {
@@ -682,7 +780,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       if (hostResizeRestore.restoreState && hostResizeRestore.restoreState !== "normal") {
         return chrome.windows.update(hostResizeRestore.hostWindowId, { state: hostResizeRestore.restoreState });
       }
-    }).catch(() => { });
+    }).catch((err) => {
+      console.warn('[SW] Failed to restore host window bounds on panel close:', err);
+    });
   }
 });
 
@@ -705,8 +805,12 @@ chrome.windows.onRemoved.addListener((windowId) => {
           if (hostResizeRestore.restoreState && hostResizeRestore.restoreState !== "normal") {
             return chrome.windows.update(hostResizeRestore.hostWindowId, { state: hostResizeRestore.restoreState });
           }
-        }).catch(() => { });
+        }).catch((err) => {
+          console.warn('[SW] Failed to restore host window bounds on window remove:', err);
+        });
       }
+      // Persist state change
+      saveDetachedPanelState();
       break;
     }
 
@@ -716,18 +820,24 @@ chrome.windows.onRemoved.addListener((windowId) => {
       panelHeartbeatByTab.delete(tabId);
 
       if (Number.isInteger(panelWindowId) && panelWindowId !== windowId) {
-        chrome.windows.remove(panelWindowId).catch(() => { });
+        chrome.windows.remove(panelWindowId).catch((err) => {
+          console.debug('[SW] Failed to remove panel window on host close:', err);
+        });
       }
 
       const related = relatedWindowsByTab.get(tabId);
       if (related) {
         related.forEach((winId) => {
           if (winId !== windowId && winId !== panelWindowId) {
-            chrome.windows.remove(winId).catch(() => { });
+            chrome.windows.remove(winId).catch((err) => {
+              console.debug('[SW] Failed to close related window on host close:', winId, err);
+            });
           }
         });
         relatedWindowsByTab.delete(tabId);
       }
+      // Persist state change
+      saveDetachedPanelState();
       break;
     }
   }
@@ -745,9 +855,34 @@ chrome.windows.onRemoved.addListener((windowId) => {
     clearTimeout(boundsChangeDebounceTimers.get(windowId));
     boundsChangeDebounceTimers.delete(windowId);
   }
+  
+  // Persist state change
+  saveDetachedPanelState();
 });
 
 const boundsChangeDebounceTimers = new Map();
+
+// Helper function to execute bounds change sync logic
+function onBoundsChangedExecution(windowId) {
+  const match = findDetachedEntryByWindowId(windowId);
+  if (!match) return;
+  
+  const { tabId, entry, role } = match;
+  if (isDetachedSyncLocked(entry)) return;
+  
+  // --- CRITICAL FIX: Leader/Follower Architecture ---
+  // ONLY sync when the HOST (leader) window moves.
+  // Ignore all movements from the panel (follower) itself.
+  // This breaks the feedback loop that causes high-CPU thrashing.
+  if (role === "host") {
+    syncDetachedPairFromHost(tabId).catch((err) => {
+      console.warn("Host-led sync failed:", err);
+    });
+  }
+  // By removing the 'else' block, the panel can no longer
+  // trigger a resize on the host, preventing the loop.
+  // --- END OF FIX ---
+}
 
 chrome.windows.onBoundsChanged.addListener((window) => {
   const windowId = Number(window?.id);
