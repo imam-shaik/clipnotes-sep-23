@@ -23,7 +23,10 @@
         // Try to get data from chrome storage if opener isn't available
         chrome.storage.local.get(['bigEditorBuffer'], (result) => {
             if (result.bigEditorBuffer && result.bigEditorBuffer.shotId === shotId) {
-                editor.innerHTML = result.bigEditorBuffer.html;
+                // Sanitize HTML to prevent XSS - use opener's sanitizeNoteHtml if available
+                editor.innerHTML = (typeof sanitizeNoteHtml === 'function') 
+                    ? sanitizeNoteHtml(result.bigEditorBuffer.html) 
+                    : result.bigEditorBuffer.html;
             }
         });
     }

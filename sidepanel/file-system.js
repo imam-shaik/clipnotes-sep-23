@@ -338,6 +338,12 @@ const FileSystemModule = {
     },
 
     async saveFileAs(suggestedName, blobData) {
+        const fileHandle = await this.pickPdfSaveFileHandle(suggestedName);
+        if (!fileHandle) return false;
+        return await this.writeFileHandle(fileHandle, blobData);
+    },
+
+    async pickPdfSaveFileHandle(suggestedName) {
         try {
             const options = {
                 suggestedName: suggestedName,
@@ -353,9 +359,10 @@ const FileSystemModule = {
             } else {
                 options.startIn = 'documents';
             }
+
             if (typeof window.showSaveFilePicker !== 'function') {
                 this.showAlert("Your browser does not support the File System Access API. Please use a supported browser like Chrome or Edge.");
-                return false;
+                return null;
             }
 
             let fileHandle;
@@ -372,18 +379,26 @@ const FileSystemModule = {
                 }
             }
 
+            // Remember this location for next time
+            await this.savePdfHandle(fileHandle);
+            return fileHandle;
+        } catch (err) {
+            if (err?.name === 'AbortError') return null;
+            console.error("Save As picker error:", err);
+            return null;
+        }
+    },
+
+    async writeFileHandle(fileHandle, blobData) {
+        if (!fileHandle) return false;
+        try {
             const writable = await fileHandle.createWritable();
             await writable.write(blobData);
             await writable.close();
-
-            // Try to remember this directory for next time
-            // Note: browser might not give us the parent handle directly, but it lets us store the file's startIn context
-            await this.savePdfHandle(fileHandle);
-
             return true;
         } catch (err) {
-            if (err.name === 'AbortError') return false;
-            console.error("Save As error:", err);
+            if (err?.name === 'AbortError') return false;
+            console.error("Write file error:", err);
             return false;
         }
     },

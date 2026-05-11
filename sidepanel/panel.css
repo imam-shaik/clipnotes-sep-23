@@ -887,6 +887,27 @@ input:checked~.switch-text {
     padding: 40px 20px;
 }
 
+.empty-state svg {
+    margin-bottom: 8px;
+}
+
+.empty-state .text-sm {
+    font-size: 11px;
+    margin-top: 4px;
+}
+
+.empty-state kbd {
+    display: inline-block;
+    padding: 2px 6px;
+    font-size: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+    background-color: var(--bg-card-hover);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    margin: 0 2px;
+}
+
 /* Screenshots Gallery */
 .gallery-list {
     display: flex;
@@ -917,22 +938,18 @@ input:checked~.switch-text {
 @keyframes screenshotCardEnter {
     from {
         opacity: 0;
-        transform: translateY(12px);
     }
     to {
         opacity: 1;
-        transform: translateY(0);
     }
 }
 
 @keyframes cardAppear {
     from {
         opacity: 0;
-        transform: translateY(8px);
     }
     to {
         opacity: 1;
-        transform: translateY(0);
     }
 }
 
@@ -1878,6 +1895,136 @@ input:checked~.switch-text {
 
 .modal-overlay.hidden .modal-content {
     transform: translateY(20px);
+}
+
+/* Copy Status Message */
+.copy-status {
+    color: var(--status-success);
+    font-size: 12px;
+    font-weight: 600;
+    margin-left: 4px;
+    animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* Transcript Actions */
+.transcript-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.transcript-actions .small-select {
+    max-width: 120px;
+}
+
+.transcript-actions .range-input {
+    width: 60px;
+    padding: 4px 6px;
+    font-size: 12px;
+}
+
+.transcript-actions .range-sep {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+#transcript-range-inputs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+#copy-btn-text.hidden {
+    display: none;
+}
+    width: 90%;
+    max-width: 350px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.toc-list-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+}
+
+.toc-modal-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    cursor: pointer;
+    transition: background-color 0.15s;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.toc-modal-item:hover {
+    background-color: var(--bg-card-hover);
+}
+
+.toc-marker-color {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.toc-marker-number {
+    font-weight: 600;
+    color: var(--text-main);
+    min-width: 24px;
+}
+
+.toc-marker-time {
+    color: var(--text-muted);
+    font-size: 13px;
+    font-family: monospace;
+}
+
+.toc-marker-title {
+    flex: 1;
+    color: var(--text-main);
+    font-size: 14px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.toc-heading-label {
+    display: inline-block;
+    min-width: 32px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    margin-right: 8px;
+    background: var(--primary-color);
+    color: white;
+}
+
+.toc-level-h1 {
+    font-weight: 700;
+    font-size: 15px;
+}
+
+.toc-level-h2 {
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.toc-level-h3 {
+    font-weight: 500;
+    font-size: 13px;
 }
 
 .modal-message {
@@ -3450,6 +3597,16 @@ input:checked~.switch-text {
 .small-select:focus {
     outline: none;
     border-color: var(--primary-color);
+}
+
+#transcript-interval-select {
+    background: var(--bg-card);
+    color: var(--text-main);
+}
+
+#transcript-copy-mode {
+    background: var(--bg-card);
+    color: var(--text-main);
 }
 
 /* ==========================================

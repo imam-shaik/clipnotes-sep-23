@@ -4,7 +4,7 @@ const TIMEOUT_CONFIG = {
     ANIMATION_FEEDBACK: 150,
     PLAYER_POLL_RATE: 500,
     NAV_FALLBACK_POLL: 5000,
-    RETRY_DELAY_BASE: 200,
+    RETRY_DELAY_BASE: 300,
     ENABLE_DEBUG: false
 };
 
@@ -96,6 +96,16 @@ class YouTubeNotesContent {
                 console.debug('[ContentScript] MiniViewDragCleanup failed:', e);
             }
             this._miniViewDragCleanup = null;
+        }
+
+        // Clean up playback event listeners
+        if (this._playbackRateListener && this.video) {
+            this.video.removeEventListener('ratechange', this._playbackRateListener);
+            this._playbackRateListener = null;
+        }
+        if (this._seekListener && this.video) {
+            this.video.removeEventListener('seeked', this._seekListener);
+            this._seekListener = null;
         }
 
         this.removeMiniView();
@@ -391,6 +401,47 @@ class YouTubeNotesContent {
                 if (chrome.runtime.lastError) { /* normal */ }
             });
         } catch (e) { /* Extension context invalidated */ }
+        
+        // Set up event listeners for playback rate changes and seeks
+        this.setupPlaybackEventListeners();
+    }
+
+    setupPlaybackEventListeners() {
+        if (!this.video) return;
+        
+        // Clean up any existing listeners
+        if (this._playbackRateListener) {
+            this.video.removeEventListener('ratechange', this._playbackRateListener);
+        }
+        if (this._seekListener) {
+            this.video.removeEventListener('seeked', this._seekListener);
+        }
+        
+        // Listen for playback rate changes
+        this._playbackRateListener = () => {
+            if (!chrome.runtime?.id || !this.video) return;
+            chrome.runtime.sendMessage({
+                type: 'PLAYBACK_RATE_CHANGED',
+                playbackRate: this.video.playbackRate
+            }, () => {
+                if (chrome.runtime.lastError) { /* ignore */ }
+            });
+        };
+        
+        // Listen for seek operations
+        this._seekListener = () => {
+            if (!chrome.runtime?.id || !this.video) return;
+            chrome.runtime.sendMessage({
+                type: 'VIDEO_SEEKED',
+                currentTime: this.video.currentTime,
+                currentTimeMs: this.video.currentTime * 1000
+            }, () => {
+                if (chrome.runtime.lastError) { /* ignore */ }
+            });
+        };
+        
+        this.video.addEventListener('ratechange', this._playbackRateListener);
+        this.video.addEventListener('seeked', this._seekListener);
     }
 
     seekToMs(ms) {
@@ -749,6 +800,7 @@ class YouTubeNotesContent {
         document.body.appendChild(overlay);
 
         let startX, startY, isDragging = false;
+        let aborted = false;
 
         const onMouseDown = (e) => {
             isDragging = true;
@@ -781,8 +833,10 @@ class YouTubeNotesContent {
             if (!isDragging) return;
             isDragging = false;
 
+            if (aborted) return;
+
             const rect = selectionBox.getBoundingClientRect();
-            document.body.removeChild(overlay);
+            if (overlay.parentNode === document.body) overlay.remove();
             document.removeEventListener('keydown', onEsc);
             window.removeEventListener('mousemove', onMouseMove);
 
@@ -797,7 +851,8 @@ class YouTubeNotesContent {
 
         const onEsc = (e) => {
             if (e.key === 'Escape') {
-                document.body.removeChild(overlay);
+                aborted = true;
+                if (overlay.parentNode === document.body) overlay.remove();
                 document.removeEventListener('keydown', onEsc);
                 window.removeEventListener('mousemove', onMouseMove);
                 sendResponse({ success: false, error: "Cancelled" });
@@ -971,6 +1026,53 @@ class YouTubeNotesContent {
         const el = document.createElement('textarea');
         el.innerHTML = text;
         return el.value;
+    }
+
+    parseYoutubeiTranscript(data) {
+        if (!data) return [];
+        try {
+            // InnerTube transcript response structure
+            const action = (data.actions || []).find(a => a?.updateTranscriptAction);
+            if (!action) return [];
+
+            const renderer = action.updateTranscriptAction?.transcript?.transcriptRenderer;
+            if (!renderer) return [];
+
+            const bodyRenderer = renderer.body?.transcriptBodyRenderer;
+            const cueGroups = bodyRenderer?.cueGroups;
+            if (!Array.isArray(cueGroups)) return [];
+
+            const segments = [];
+            for (const group of cueGroups) {
+                const cueGroup = group?.transcriptCueGroupRenderer;
+                if (!cueGroup) continue;
+
+                const cue = cueGroup.cues?.[0]?.transcriptCueRenderer;
+                if (!cue) continue;
+
+                const startMs = Number(cue.startMessageMs);
+                if (!Number.isFinite(startMs)) continue;
+
+                let text = "";
+                if (cue.cue?.simpleText) {
+                    text = cue.cue.simpleText;
+                } else if (Array.isArray(cue.cue?.runs)) {
+                    text = cue.cue.runs.map(r => r.text || "").join("");
+                }
+
+                if (text) {
+                    segments.push({
+                        time: formatTimeHelper(startMs),
+                        text: this.normalizeTranscriptText(text),
+                        timestampMs: startMs
+                    });
+                }
+            }
+            return segments;
+        } catch (e) {
+            console.error("[ContentScript] Error parsing Youtubei transcript:", e);
+            return [];
+        }
     }
 
     parseJson3Transcript(rawText) {
@@ -1313,7 +1415,11 @@ class YouTubeNotesContent {
                 const fetchOptions = {
                     method: item.method || 'GET',
                     credentials: 'include',
-                    headers: { 'Accept': '*/*', 'User-Agent': navigator.userAgent }
+                    headers: { 
+                        'Accept': '*/*',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache'
+                    }
                 };
 
                 if (item.method === 'POST') {
@@ -1690,19 +1796,20 @@ class YouTubeNotesContent {
     }
 }
 
-// Helper for transcript timing
-function formatTimeHelper(ms) {
-    if (!ms || ms < 0) return "00:00";
-    let seconds = Math.floor(ms / 1000);
-    let minutes = Math.floor(seconds / 60);
-    seconds = seconds % 60;
-    let hours = Math.floor(minutes / 60);
-    minutes = minutes % 60;
-    if (hours > 0) {
-        return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-    }
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-}
+// Helper for transcript timing - uses shared TimeUtils.formatTime() for consistency
+// Note: TimeUtils is loaded from utils/time.js via manifest.json content_scripts
+const formatTimeHelper = (typeof TimeUtils !== 'undefined' && TimeUtils.formatTime) 
+    ? TimeUtils.formatTime 
+    : function(ms) {
+        const totalSeconds = Math.floor(ms / 1000);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        if (hours > 0) {
+            return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    };
 
 (function bootstrapYouTubeController() {
     const key = '__ytNotesController__';
@@ -1715,4 +1822,6 @@ function formatTimeHelper(ms) {
         }
     }
     window[key] = new YouTubeNotesContent();
+})();
+
 })();

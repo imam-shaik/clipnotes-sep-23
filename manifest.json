@@ -3,6 +3,10 @@
   "name": "Clip Notes",
   "version": "1.0.0",
   "description": "Take screenshots, vector notes, and create TOC for YouTube videos with local saving",
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://img.youtube.com https://i.ytimg.com; connect-src 'self' data: blob: https://img.youtube.com https://i.ytimg.com;",
+    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval';"
+  },
   "permissions": [
     "storage",
     "activeTab",
@@ -11,7 +15,8 @@
     "downloads",
     "contextMenus",
     "windows",
-    "tabs"
+    "tabs",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -29,6 +34,7 @@
         "https://youtube.com/*"
       ],
       "js": [
+        "utils/time.js",
         "content/page-bridge.js"
       ],
       "run_at": "document_start",
@@ -40,6 +46,7 @@
         "https://youtube.com/*"
       ],
       "js": [
+        "utils/time.js",
         "content/content-script.js"
       ],
       "css": [
@@ -68,7 +75,8 @@
     {
       "resources": [
         "assets/*",
-        "lib/*"
+        "lib/*",
+        "utils/*"
       ],
       "matches": [
         "https://www.youtube.com/*"

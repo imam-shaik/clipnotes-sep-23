@@ -27,13 +27,65 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (!shotId) return window.close();
 
-    chrome.storage.local.get([`edit_state_${shotId}`], (result) => {
-        const data = result[`edit_state_${shotId}`];
-        if (!data || !data.dataUrl) return window.close();
-        statusPrefix = `Editing capture from ${data.timeFormatted || 'unknown time'}`;
-        updateStatusText();
-        initEditor(data.dataUrl);
+    const key = `edit_state_${shotId}`;
+    const tryGet = (area) => new Promise((resolve) => {
+        area.get([key], (result) => {
+            const err = chrome.runtime.lastError;
+            if (err) {
+                resolve(null);
+                return;
+            }
+            resolve(result?.[key] || null);
+        });
     });
+
+    let data = null;
+    if (chrome.storage?.session) {
+        data = await tryGet(chrome.storage.session);
+    }
+    if (!data && chrome.storage?.local) {
+        data = await tryGet(chrome.storage.local);
+    }
+
+    // NEW: If not found in storage, try message-based fetch with retries
+    if (!data || !data.dataUrl) {
+        console.debug('[Editor] State not in storage, attempting message-based fetch...');
+        
+        async function attemptFetch(retryCount) {
+            return new Promise((resolve) => {
+                chrome.runtime.sendMessage({ action: 'requestEditState', shotId }, (resp) => {
+                    const err = chrome.runtime.lastError;
+                    if (err || !resp || !resp.success || !resp.dataUrl) {
+                        if (retryCount > 0) {
+                            console.debug(`[Editor] Fetch failed, retrying (${retryCount} left)...`);
+                            setTimeout(() => resolve(attemptFetch(retryCount - 1)), 200);
+                        } else {
+                            resolve(null);
+                        }
+                    } else {
+                        resolve(resp);
+                    }
+                });
+            });
+        }
+
+        const resp = await attemptFetch(3); // 3 retries, total ~800ms wait
+        if (!resp) {
+            console.error('[Editor] Failed to retrieve screenshot data after retries.');
+            alert("Failed to load screenshot data. Please try opening the editor again.");
+            window.close();
+            return;
+        }
+        
+        statusPrefix = `Editing capture from ${resp.timeFormatted || 'unknown time'}`;
+        updateStatusText();
+        initEditor(resp.dataUrl);
+        return;
+    }
+
+    statusPrefix = `Editing capture from ${data.timeFormatted || 'unknown time'}`;
+    updateStatusText();
+    initEditor(data.dataUrl);
 });
 
 function initEditor(dataUrl) {
@@ -78,17 +130,13 @@ function initEditor(dataUrl) {
     baseImage.src = dataUrl;
 }
 
+function getViewportScaleFactor() {
+    if (currentViewportScale > 0) return 1 / currentViewportScale;
+    return 1;
+}
+
 function setupInteractions() {
     let points = [];
-
-    const getViewportScaleFactor = () => {
-        const rect = drawCanvas.getBoundingClientRect();
-        const safeWidth = Math.max(1, rect.width);
-        const safeHeight = Math.max(1, rect.height);
-        const scaleX = drawCanvas.width / safeWidth;
-        const scaleY = drawCanvas.height / safeHeight;
-        return (scaleX + scaleY) / 2;
-    };
 
     const getPos = (e) => {
         const rect = drawCanvas.getBoundingClientRect();
@@ -126,34 +174,24 @@ function setupInteractions() {
         if (currentTool === 'pen' || currentTool === 'eraser') {
             points.push(pos);
 
+            const scale = getViewportScaleFactor();
+            const pressure = pos.pressure || 1;
+            drawCtx.lineWidth = Math.max(1, currentSize * pressure * 1.2 * scale);
+            
+            if (currentTool === 'eraser') {
+                drawCtx.globalCompositeOperation = 'destination-out';
+            } else {
+                drawCtx.globalCompositeOperation = 'source-over';
+                drawCtx.strokeStyle = currentColor;
+            }
+
             if (points.length < 3) {
-                // Not enough points for a curve yet, draw a simple line
+                const prev = points[points.length - 2] || pos;
                 drawCtx.beginPath();
-                drawCtx.lineWidth = Math.max(1, currentSize * (pos.pressure * 1.5 || 1) * getViewportScaleFactor());
-                if (currentTool === 'eraser') {
-                    drawCtx.globalCompositeOperation = 'destination-out';
-                } else {
-                    drawCtx.globalCompositeOperation = 'source-over';
-                    drawCtx.strokeStyle = currentColor;
-                }
-                const prev = points[points.length - 2];
                 drawCtx.moveTo(prev.x, prev.y);
                 drawCtx.lineTo(pos.x, pos.y);
                 drawCtx.stroke();
             } else {
-                drawCtx.beginPath();
-
-                // Pressure smoothing (average last few points)
-                const avgPressure = points.slice(-3).reduce((acc, p) => acc + p.pressure, 0) / 3;
-                drawCtx.lineWidth = Math.max(1, currentSize * (avgPressure * 1.5 || 1) * getViewportScaleFactor());
-
-                if (currentTool === 'eraser') {
-                    drawCtx.globalCompositeOperation = 'destination-out';
-                } else {
-                    drawCtx.globalCompositeOperation = 'source-over';
-                    drawCtx.strokeStyle = currentColor;
-                }
-
                 // Bezier Smoothing: Midpoint logic
                 const p1 = points[points.length - 3];
                 const p2 = points[points.length - 2];
@@ -162,6 +200,7 @@ function setupInteractions() {
                 const mid1 = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
                 const mid2 = { x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2 };
 
+                drawCtx.beginPath();
                 drawCtx.moveTo(mid1.x, mid1.y);
                 drawCtx.quadraticCurveTo(p2.x, p2.y, mid2.x, mid2.y);
                 drawCtx.stroke();
@@ -247,11 +286,33 @@ function setupInteractions() {
         });
     });
 
+    // --- PERSISTENCE: LOAD LAST USED SETTINGS ---
+    chrome.storage.local.get(['editor_color', 'editor_size'], (res) => {
+        if (res.editor_color) {
+            currentColor = res.editor_color;
+            const swatch = document.querySelector(`.swatch[data-color="${currentColor}"]`);
+            if (swatch) {
+                document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
+                swatch.classList.add('active');
+            }
+        }
+        if (res.editor_size) {
+            currentSize = parseInt(res.editor_size, 10) || 5;
+            const slider = document.getElementById('brush-size');
+            const val = document.getElementById('brush-size-val');
+            if (slider) slider.value = currentSize;
+            if (val) val.textContent = currentSize;
+        }
+    });
+    // --------------------------------------------
+
     document.querySelectorAll('.swatch').forEach(sw => {
         sw.addEventListener('click', () => {
             document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
             sw.classList.add('active');
             currentColor = sw.dataset.color;
+            chrome.storage.local.set({ editor_color: currentColor });
+
             // Auto switch to pen if color selected but currently on eraser
             if (currentTool === 'eraser') {
                 document.querySelector('[data-tool="pen"]').click();
@@ -264,6 +325,7 @@ function setupInteractions() {
     sizeSlider.addEventListener('input', () => {
         currentSize = sizeSlider.value;
         sizeVal.textContent = currentSize;
+        chrome.storage.local.set({ editor_size: currentSize });
     });
 
     // History Actions
@@ -448,7 +510,7 @@ function saveToHistory() {
 }
 
 function updateHistoryButtons() {
-    document.getElementById('undo-btn').disabled = historyStack.length <= 1;
+    document.getElementById('undo-btn').disabled = historyStack.length === 0;
     document.getElementById('redo-btn').disabled = redoStack.length === 0;
 }
 
@@ -458,6 +520,13 @@ const onKeyDown = (e) => {
     const withModifier = e.ctrlKey || e.metaKey;
 
     if (withModifier && key === 's') {
+        e.preventDefault();
+        const saveBtn = document.getElementById('save-edit');
+        if (saveBtn) saveBtn.click();
+        return;
+    }
+
+    if (key === 'enter') {
         e.preventDefault();
         const saveBtn = document.getElementById('save-edit');
         if (saveBtn) saveBtn.click();

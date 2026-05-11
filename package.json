@@ -1,0 +1,26 @@
+{
+  "name": "clipnotes-extension",
+  "version": "1.0.0",
+  "description": "YouTube video note-taking extension with screenshot capture and PDF export",
+  "private": true,
+  "scripts": {
+    "test": "jest --config jest.config.js --coverage",
+    "test:watch": "jest --config jest.config.js --watch",
+    "test:coverage": "jest --config jest.config.js --coverage --coverageReporters=html",
+    "test:unit": "jest --config jest.config.js --testPathPattern=tests/unit",
+    "test:integration": "jest --config jest.config.js --testPathPattern=tests/integration",
+    "test:critical": "jest --config jest.config.js --testPathPattern=tests/critical",
+    "lint": "eslint . --ext .js"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^9.3.4",
+    "@testing-library/jest-dom": "^6.4.0",
+    "eslint": "^8.56.0",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "jsdom": "^24.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

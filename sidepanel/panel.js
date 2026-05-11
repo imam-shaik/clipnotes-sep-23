@@ -21,13 +21,24 @@ let isAutoOpenEnabled = true; // New: Auto-Open toggle state
 let isCaptionEnabled = false; // CC-on-Screenshot toggle: OFF by default (clean screenshots)
 let lastCaptureTime = 0; // Prevent spamming screenshots too fast
 let lastScreenshotHash = null; // Track perceptual hash of last captured image
+let lastScreenshotTime = 0; // Track time of last screenshot for time-based duplicate exemption
 let panelHeartbeatTimer = null;
 let disconnectedPollCount = 0;
 let detachedHostMissingCount = 0;
-let autoScreenshotInterval = null; // Auto-screenshot interval timer
+let autoScreenshotInterval = null; // Auto-screenshot loop timer
+let autoScreenshotMode = 'timer';
+let autoScreenshotIntervalMs = 0;
+let autoScreenshotActive = false;
 let lastAutoScreenshotTime = 0; // Track last auto-screenshot time to suppress scroll
+let lastAutoFrameHash = null; // Frame-mode: last sampled hash for change detection
+let cachedPlaybackRate = 1.0; // Cache playback rate for dynamic interval adjustment
+let lastPlaybackRateFetch = 0; // Timestamp of last playback rate fetch
+const PLAYBACK_RATE_CACHE_MS = 5000; // Refresh playback rate every 5 seconds
+const BASE_FRAME_INTERVAL_MS = 1500; // Base sampling interval for frame mode (at 1.0x speed)
 let savedScrollPositions = new Map(); // videoId -> scrollTop for scroll persistence across navigation
 const DUPLICATE_HASH_THRESHOLD = 6; // Hamming distance threshold for "too similar"
+const FRAME_CHANGE_HASH_THRESHOLD = 12; // More tolerant for frame-change mode (ignore tiny changes/noise)
+const DUPLICATE_TIME_WINDOW_MS = 3000; // 3 seconds - allow duplicates after this time
 const VIDEO_STATE_FILENAME = 'video_notes_state.json';
 const HISTORY_INDEX_FILENAME = 'history_index.json';
 const WATCH_LATER_FILENAME = 'watch_later_list.json';
@@ -170,6 +181,77 @@ window.addEventListener('beforeunload', () => {
     }
 });
 
+// ==========================================
+// Memory Leak Prevention: Aggressive Blob Cleanup
+// ==========================================
+
+// FIX #1: Periodic cleanup of orphaned blob URLs (runs every 60 seconds)
+setInterval(() => {
+    const allBlobUrls = new Set();
+
+    // Collect all blob URLs currently in use by screenshots
+    state.screenshots.forEach(shot => {
+        if (shot.dataUrl && shot.dataUrl.startsWith('blob:')) {
+            allBlobUrls.add(shot.dataUrl);
+        }
+    });
+
+    // Revoke any tracked blobs not in current state (orphans)
+    state.blobUrls.forEach(trackedBlob => {
+        if (!allBlobUrls.has(trackedBlob)) {
+            try {
+                URL.revokeObjectURL(trackedBlob);
+                state.blobUrls.delete(trackedBlob);
+                console.debug('[Panel] Revoked orphan blob URL:', trackedBlob);
+            } catch (e) {
+                console.debug('[Panel] Failed to revoke orphan blob:', trackedBlob, e);
+            }
+        }
+    });
+}, 60000);
+
+// FIX #2: Visibility change cleanup - clean up when tab is backgrounded
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        // Aggressively clean up blob URLs when tab is backgrounded to free memory
+        const revokedCount = state.blobUrls.size;
+        state.blobUrls.forEach(url => {
+            try { URL.revokeObjectURL(url); } catch (e) {
+                console.debug('[Panel] Failed to revoke blob on visibility change:', url, e);
+            }
+        });
+        state.blobUrls.clear();
+
+        // Clear references in state so they are recognized as needing re-hydration
+        state.screenshots.forEach(shot => {
+            if (shot.dataUrl && shot.dataUrl.startsWith('blob:')) {
+                shot.dataUrl = null;
+            }
+        });
+
+        if (revokedCount > 0) {
+            console.debug('[Panel] Revoked', revokedCount, 'blob URLs and cleared references on tab background');
+        }
+    } else if (document.visibilityState === 'visible') {
+        // Re-hydrate when returning to the tab
+        // GHOST BUG FIX: Only re-hydrate/re-render if we AREN'T actively typing in a note
+        const activeNode = document.activeElement;
+        const isEditingNote = activeNode && (activeNode.classList.contains('note-editor') || activeNode.isContentEditable);
+
+        if (currentVideoId && currentVideoTitle && state.screenshots.length > 0) {
+            if (isEditingNote) {
+                console.debug('[Panel] Visibility restored, but user is typing. Skipping full re-render to prevent focus loss.');
+                // We still want to re-hydrate the images eventually, but let's not wipe the DOM yet.
+                // Re-hydration of blobs happens in loadVideoState
+                loadVideoState(currentVideoId, currentVideoTitle, { lazy: true, skipRender: true });
+            } else {
+                console.debug('[Panel] Visibility restored, triggering lazy re-hydration');
+                loadVideoState(currentVideoId, currentVideoTitle, { lazy: true });
+            }
+        }
+    }
+});
+
 // --- UI Utilities ---
 function showToast(message, type = 'info') {
     let container = document.getElementById('toast-container');
@@ -282,10 +364,18 @@ function getHammingDistance(h1, h2) {
     return distance;
 }
 
-function isDuplicate(newHash) {
+function isDuplicate(newHash, options = {}) {
     if (!lastScreenshotHash) return false;
+
+    const ignoreTimeWindow = options.ignoreTimeWindow === true;
+    // EXEMPTION: Always allow if enough time has passed (user intentionally took another shot)
+    const timeSinceLast = Date.now() - lastScreenshotTime;
+    if (!ignoreTimeWindow && timeSinceLast > DUPLICATE_TIME_WINDOW_MS) {
+        return false;
+    }
+
     const distance = getHammingDistance(newHash, lastScreenshotHash);
-    console.log(`[dHash] Distance: ${distance} (Target: >${DUPLICATE_HASH_THRESHOLD})`);
+    console.log(`[dHash] Distance: ${distance}, Time: ${timeSinceLast}ms (Threshold: >${DUPLICATE_HASH_THRESHOLD})`);
     return distance <= DUPLICATE_HASH_THRESHOLD;
 }
 
@@ -472,10 +562,40 @@ function initMessageListeners() {
             // Update the data in state array too
             const shot = state.screenshots.find(s => s.id === shotId);
             if (shot) shot.noteHtml = html;
+        } else if (message.type === 'PLAYBACK_RATE_CHANGED' && autoScreenshotActive && autoScreenshotMode === 'frame') {
+            // Reset frame hash when playback speed changes to avoid false captures
+            console.log(`[AutoShot] Playback rate changed to ${message.playbackRate}x, resetting frame hash`);
+            lastAutoFrameHash = null;
+            cachedPlaybackRate = message.playbackRate; // Update cache immediately
+            lastPlaybackRateFetch = Date.now();
+        } else if (message.type === 'VIDEO_SEEKED' && autoScreenshotActive && autoScreenshotMode === 'frame') {
+            // Reset frame hash when user seeks to avoid comparing frames from different video positions
+            console.log(`[AutoShot] Video seeked to ${formatTime(message.currentTimeMs)}, resetting frame hash`);
+            lastAutoFrameHash = null;
         } else if (message.action === 'screenshotEdited') {
             console.log("Sidepanel: Screenshot edited result received for", message.shotId);
             handleScreenshotEditedResult(message.shotId, message.dataUrl);
             if (sendResponse) sendResponse({ success: true });
+        } else if (message.action === 'requestEditState') {
+            (async () => {
+                const shot = state.screenshots.find(s => s.id === message.shotId);
+                if (!shot || !shot.dataUrl) {
+                    if (sendResponse) sendResponse({ success: false });
+                    return;
+                }
+                let dataUrl = shot.dataUrl;
+                if (typeof dataUrl === 'string' && dataUrl.startsWith('blob:')) {
+                    dataUrl = await ensureDataUrlFromBlob(dataUrl, message.shotId);
+                }
+                if (sendResponse) {
+                    sendResponse({
+                        success: !!dataUrl,
+                        dataUrl: dataUrl || null,
+                        timeFormatted: shot.timeFormatted || null
+                    });
+                }
+            })();
+            return true;
         }
     });
 }
@@ -1126,10 +1246,44 @@ function initButtons() {
             }
         });
     }
+
     if (btnCopyTranscript) btnCopyTranscript.addEventListener('click', copyTranscriptToClipboard);
 
-    if (btnCaptureArea) btnCaptureArea.addEventListener('click', handleAreaCapture);
-    if (btnDurationCalc) btnDurationCalc.addEventListener('click', handleDurationCalculator);
+    // Transcript Copy Mode Handlers
+    const copyModeSelect = document.getElementById('transcript-copy-mode');
+    const intervalSelect = document.getElementById('transcript-interval-select');
+    const rangeInputs = document.getElementById('transcript-range-inputs');
+    const copyBtnText = document.getElementById('copy-btn-text');
+    const copyStatus = document.getElementById('copy-status');
+
+    // Restore saved preferences
+    chrome.storage.local.get(['transcriptCopyMode', 'transcriptIntervalValue'], (data) => {
+        if (copyModeSelect && data.transcriptCopyMode) {
+            copyModeSelect.value = data.transcriptCopyMode;
+            // Trigger change to update UI
+            copyModeSelect.dispatchEvent(new Event('change'));
+        }
+        // intervalSelect value will be restored after markers are populated (handled in updateIntervalSelect)
+    });
+
+    if (copyModeSelect) {
+        copyModeSelect.addEventListener('change', () => {
+            const mode = copyModeSelect.value;
+            if (intervalSelect) intervalSelect.classList.toggle('hidden', mode !== 'interval');
+            if (rangeInputs) rangeInputs.classList.toggle('hidden', mode !== 'range');
+            if (copyBtnText) copyBtnText.textContent = mode === 'all' ? 'Copy All' : 'Copy';
+            // Save preference
+            chrome.storage.local.set({ transcriptCopyMode: mode });
+        });
+    }
+
+    // Save interval selection when changed
+    if (intervalSelect) {
+        intervalSelect.addEventListener('change', () => {
+            chrome.storage.local.set({ transcriptIntervalValue: intervalSelect.value });
+        });
+    }
+
     if (btnCreateBoard) btnCreateBoard.addEventListener('click', handleCreateBoard);
     if (btnDeleteAllScreenshots) btnDeleteAllScreenshots.addEventListener('click', handleDeleteAllScreenshotsForCurrentVideo);
     const btnCaptureAuto = document.getElementById('btn-capture-auto');
@@ -1140,6 +1294,25 @@ function initButtons() {
     if (document.getElementById('btn-set-interval')) {
         document.getElementById('btn-set-interval').addEventListener('click', handleSetInterval);
     }
+
+    // TOC Modal Setup
+    const tocModal = document.getElementById('toc-modal-overlay');
+    const tocModalClose = document.getElementById('toc-modal-close');
+    const tocModalCloseBottom = document.getElementById('toc-modal-close-bottom');
+    const tocModalList = document.getElementById('toc-modal-list');
+
+    if (document.getElementById('btn-toc')) {
+        document.getElementById('btn-toc').addEventListener('click', () => {
+            renderTOCModal();
+            if (tocModal) tocModal.classList.remove('hidden');
+        });
+    }
+
+    if (tocModalClose) tocModalClose.addEventListener('click', () => tocModal.classList.add('hidden'));
+    if (tocModalCloseBottom) tocModalCloseBottom.addEventListener('click', () => tocModal.classList.add('hidden'));
+    if (tocModal) tocModal.addEventListener('click', (e) => {
+        if (e.target === tocModal) tocModal.classList.add('hidden');
+    });
 
     if (btnAddImg) btnAddImg.addEventListener('click', () => document.getElementById('input-add-image').click());
 
@@ -1168,6 +1341,55 @@ function initButtons() {
             editLastScreenshot();
         } else if (key === '+') {
             handleAddWatchLaterRequest();
+        }
+    });
+}
+
+// Populate interval select when markers change
+function updateIntervalSelect() {
+    const intervalSelect = document.getElementById('transcript-interval-select');
+    console.log("[DEBUG] updateIntervalSelect called, element:", intervalSelect);
+    if (!intervalSelect) return;
+    const markers = state.intervalMarkers || [];
+    console.log("[DEBUG] markers count:", markers.length);
+    intervalSelect.innerHTML = '<option value="">Select Marker Range</option>';
+    if (markers.length === 0) return;
+
+    const durationMs = state.metadata.durationMs || 0;
+    // Add option for start to first marker
+    const firstMarkerTime = (markers[0].percentage / 100) * durationMs;
+    const firstOpt = document.createElement('option');
+    firstOpt.value = `0-${firstMarkerTime}`;
+    firstOpt.textContent = `Start to Marker ${markers[0].number}`;
+    intervalSelect.appendChild(firstOpt);
+
+    // Add options for each interval range (marker N to marker N+1)
+    markers.forEach((marker, idx) => {
+        const startTime = (marker.percentage / 100) * durationMs;
+        const endTime = idx < markers.length - 1
+            ? (markers[idx + 1].percentage / 100) * durationMs
+            : durationMs;
+        const opt = document.createElement('option');
+        opt.value = `${startTime}-${endTime}`;
+        opt.textContent = `Marker ${marker.number} to ${idx < markers.length - 1 ? 'Marker ' + markers[idx + 1].number : 'End'}`;
+        intervalSelect.appendChild(opt);
+    });
+    // Add option for all markers range
+    if (markers.length > 0) {
+        const allOpt = document.createElement('option');
+        allOpt.value = `${((markers[0].percentage / 100) * durationMs)}-${durationMs}`;
+        allOpt.textContent = 'All Markers to End';
+        intervalSelect.appendChild(allOpt);
+    }
+    
+    // Restore saved interval selection if available
+    chrome.storage.local.get('transcriptIntervalValue', (data) => {
+        if (data.transcriptIntervalValue) {
+            // Check if the saved value exists in the options
+            const options = Array.from(intervalSelect.options).map(opt => opt.value);
+            if (options.includes(data.transcriptIntervalValue)) {
+                intervalSelect.value = data.transcriptIntervalValue;
+            }
         }
     });
 }
@@ -1333,44 +1555,106 @@ async function initAutoShotToggle() {
     btn.addEventListener('click', handleAutoScreenshotToggle);
 }
 
-function startAutoScreenshot(seconds, mode, btn) {
-    if (autoScreenshotInterval) clearInterval(autoScreenshotInterval);
-    
-    let ms;
-    if (mode === 'frame') {
-        ms = 1500; // Poll every 1.5s for frame changes
-    } else {
-        ms = (seconds || 10) * 1000;
+/**
+ * Get cached playback rate for dynamic interval adjustment.
+ * Refreshes every PLAYBACK_RATE_CACHE_MS (5 seconds) to balance accuracy and performance.
+ * @returns {Promise<number>} Current playback rate (defaults to 1.0 on error)
+ */
+async function getCachedPlaybackRate() {
+    if (!autoScreenshotActive || autoScreenshotMode !== 'frame') {
+        return 1.0;
     }
-
-    autoScreenshotInterval = setInterval(() => {
-        if (isVideoPlaying && document.visibilityState === 'visible') {
-            handleCapture(true); // Pass true to indicate auto-shot
+    
+    // Return cached value if still fresh
+    if (Date.now() - lastPlaybackRateFetch < PLAYBACK_RATE_CACHE_MS) {
+        return cachedPlaybackRate;
+    }
+    
+    // Fetch fresh playback rate from video
+    try {
+        const tab = await resolveTrackedYouTubeTab();
+        if (tab) {
+            const stateResponse = await sendMessageWithRetry(tab.id, { action: 'getState' }, 1, 0);
+            if (stateResponse?.playbackRate) {
+                cachedPlaybackRate = stateResponse.playbackRate;
+                lastPlaybackRateFetch = Date.now();
+                console.log(`[AutoShot] Playback rate: ${cachedPlaybackRate}x`);
+            }
         }
-    }, ms);
+    } catch (e) {
+        console.debug('[AutoShot] Failed to fetch playback rate:', e);
+    }
+    
+    return cachedPlaybackRate;
+}
+
+function startAutoScreenshot(seconds, mode, btn) {
+    if (autoScreenshotInterval) clearTimeout(autoScreenshotInterval);
+
+    autoScreenshotMode = mode || 'timer';
+    const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 10;
+    autoScreenshotIntervalMs = autoScreenshotMode === 'frame' ? BASE_FRAME_INTERVAL_MS : (safeSeconds * 1000);
+    autoScreenshotActive = true;
+    lastAutoFrameHash = null;
+    cachedPlaybackRate = 1.0; // Reset playback rate cache
+    lastPlaybackRateFetch = 0;
+
+    const scheduleNext = async (delayMs) => {
+        if (!autoScreenshotActive) return;
+        
+        // Dynamic interval adjustment for frame mode based on playback speed
+        let nextIntervalMs = autoScreenshotIntervalMs;
+        if (autoScreenshotMode === 'frame') {
+            const playbackRate = await getCachedPlaybackRate();
+            nextIntervalMs = BASE_FRAME_INTERVAL_MS / playbackRate;
+        }
+        
+        autoScreenshotInterval = setTimeout(async () => {
+            if (!autoScreenshotActive) return;
+            const tickStart = Date.now();
+            try {
+                if (isVideoPlaying && document.visibilityState === 'visible') {
+                    await handleCapture(true); // Auto-shot
+                }
+            } catch (err) {
+                console.warn("[AutoShot] Capture loop error:", err);
+            }
+            const elapsed = Date.now() - tickStart;
+            const nextDelay = Math.max(0, nextIntervalMs - elapsed);
+            scheduleNext(nextDelay);
+        }, delayMs);
+    };
+
+    // Start loop after the configured interval
+    const initialDelay = autoScreenshotMode === 'frame' ? BASE_FRAME_INTERVAL_MS : autoScreenshotIntervalMs;
+    scheduleNext(initialDelay);
 
     // Record start time for auto-screenshot session
     lastAutoScreenshotTime = Date.now();
 
     btn.classList.add('primary');
-    if (mode === 'frame') {
+    if (autoScreenshotMode === 'frame') {
         btn.title = `Auto Screenshot ON (Frame Change) - Click to Stop`;
     } else {
-        btn.title = `Auto Screenshot ON (Every ${seconds}s) - Click to Stop`;
+        btn.title = `Auto Screenshot ON (Every ${safeSeconds}s) - Click to Stop`;
     }
-    
-    chrome.storage.local.set({ 
-        autoScreenshotIntervalSecs: seconds,
-        autoScreenshotMode: mode 
+
+    chrome.storage.local.set({
+        autoScreenshotIntervalSecs: safeSeconds,
+        autoScreenshotMode: autoScreenshotMode
     });
 }
 
 function handleAutoScreenshotToggle(e) {
     const btn = e.currentTarget;
     if (autoScreenshotInterval) {
-        clearInterval(autoScreenshotInterval);
+        clearTimeout(autoScreenshotInterval);
         autoScreenshotInterval = null;
+        autoScreenshotActive = false;
         lastAutoScreenshotTime = 0; // Reset auto-screenshot timer
+        lastAutoFrameHash = null;
+        cachedPlaybackRate = 1.0; // Reset playback rate cache
+        lastPlaybackRateFetch = 0;
         btn.classList.remove('primary');
         btn.title = "Toggle Auto Screenshot";
         chrome.storage.local.remove(['autoScreenshotIntervalSecs', 'autoScreenshotMode']);
@@ -1720,13 +2004,44 @@ async function handleCapture(isAuto = false) {
 
             // --- PERCEPTUAL DUPLICATE DETECTION (dHash) ---
             const newHash = await calculateDHash(finalImageData);
-            if (newHash && isDuplicate(newHash)) {
-                if (isAuto) {
-                    console.log("[AutoShot] Skipping duplicate frame.");
-                } else {
-                    showToast("Skipping duplicate screenshot.", "info");
+            const isAutoFrameMode = isAuto && autoScreenshotMode === 'frame';
+
+            // Frame-mode: compare against last sampled frame to detect visual changes
+            if (isAutoFrameMode) {
+                if (!newHash) {
+                    console.warn("[AutoShot] Failed to calculate frame hash.");
+                    return;
                 }
-                return; // Exit inner try, finally will run
+
+                if (lastAutoFrameHash) {
+                    const sampleDistance = getHammingDistance(newHash, lastAutoFrameHash);
+                    if (sampleDistance <= FRAME_CHANGE_HASH_THRESHOLD) {
+                        // Frame unchanged - skip capture BUT update reference for next comparison
+                        // This ensures gradual changes (fades, pans, zooms) are tracked properly
+                        console.log(`[AutoShot] Frame unchanged (distance=${sampleDistance}); skipping.`);
+                        lastAutoFrameHash = newHash; // CRITICAL FIX: Update reference even on skip
+                        return; // Exit inner try, finally will run
+                    }
+                    // Frame changed significantly - update reference and allow save
+                    console.log(`[AutoShot] Frame changed (distance=${sampleDistance}); capturing.`);
+                    lastAutoFrameHash = newHash;
+                } else {
+                    // First frame in frame-change mode - set as reference and capture
+                    console.log("[AutoShot] First frame - setting reference.");
+                    lastAutoFrameHash = newHash;
+                }
+                // In frame mode, skip the standard isDuplicate() check entirely
+                // to avoid conflicts between lastAutoFrameHash and lastScreenshotHash
+            } else {
+                // Timer mode or manual capture - use standard duplicate detection
+                if (newHash && isDuplicate(newHash)) {
+                    if (isAuto) {
+                        console.log("[AutoShot] Skipping duplicate frame.");
+                    } else {
+                        showToast("Skipping duplicate screenshot.", "info");
+                    }
+                    return; // Exit inner try, finally will run
+                }
             }
 
             const blob = await dataURLtoBlobAsync(finalImageData);
@@ -1754,7 +2069,10 @@ async function handleCapture(isAuto = false) {
                 if (isAuto) {
                     lastAutoScreenshotTime = Date.now();
                 }
-                addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, isAuto);
+                // Track screenshot time for duplicate detection exemption
+                lastScreenshotTime = Date.now();
+                // Let addScreenshotToUI decide auto-scroll behavior (it already detects auto shots).
+                addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, false);
                 lastScreenshotHash = newHash; // Update tracker for next comparison
             } else {
                 // If save failed but didn't throw (retries exhausted or permission lost)
@@ -1882,26 +2200,56 @@ async function handleAddLocalImage(e) {
 
 
 /**
- * Modern, non-blocking Data URL to Blob conversion using browser native fetch.
- * This is 10x faster than legacy atob loops and doesn't "hang" the UI thread.
+ * Data URL to Blob conversion - CSP compliant version.
+ * Uses atob decoding instead of fetch() to avoid CSP violations with data: URLs.
  */
 async function dataURLtoBlobAsync(dataurl) {
-    const res = await fetch(dataurl);
-    return await res.blob();
+    return new Promise((resolve, reject) => {
+        try {
+            // Parse data URL
+            const arr = dataurl.split(',');
+            if (arr.length < 2) {
+                throw new Error('Invalid data URL');
+            }
+            
+            const mimeMatch = arr[0].match(/:(.*?);/);
+            if (!mimeMatch) {
+                throw new Error('Invalid MIME type in data URL');
+            }
+            
+            const mime = mimeMatch[1];
+            const bstr = atob(arr[1]);
+            let n = bstr.length;
+            const u8arr = new Uint8Array(n);
+            
+            while (n--) {
+                u8arr[n] = bstr.charCodeAt(n);
+            }
+            
+            resolve(new Blob([u8arr], { type: mime }));
+        } catch (err) {
+            console.error('[dataURLtoBlobAsync] Conversion failed:', err);
+            reject(err);
+        }
+    });
 }
 
 // ==========================================
 // Gallery Rendering (Virtualized for Performance)
 // ==========================================
-const GALLERY_VIRTUALIZATION_THRESHOLD = 30; // Use virtualization for 30+ items
-const GALLERY_ITEMS_PER_PAGE = 20; // Render 20 items at a time
+const GALLERY_VIRTUALIZATION_THRESHOLD = 50; // Use virtualization for 50+ items
+const GALLERY_ITEMS_PER_PAGE = 30; // Batch size for progressive rendering
 
 function renderMainGallery(onComplete = null) {
     const list = document.getElementById('screenshots-list');
     if (!list) return;
 
     // SCROLL LOCK: Capture current position before wiping the DOM
-    const currentScroll = list.scrollTop;
+    const scrollContainer = list.closest('#tab-screenshots') ||
+                            list.closest('.tab-pane.scrollable') ||
+                            list.closest('.scrollable') ||
+                            list.parentElement;
+    const currentScroll = scrollContainer ? scrollContainer.scrollTop : 0;
 
     list.innerHTML = '';
 
@@ -1924,8 +2272,17 @@ function renderMainGallery(onComplete = null) {
 
     const finalizeRendering = () => {
         // SCROLL LOCK: Restore position before user notices the jump
-        list.scrollTop = currentScroll;
-        if (onComplete) onComplete();
+        // Only restore if we had a non-zero scroll previously to avoid fighting auto-scroll-on-load
+        if (scrollContainer && currentScroll > 0) {
+            scrollContainer.scrollTop = currentScroll;
+        }
+        
+        // Use a frame delay for onComplete to ensure browser has processed the DOM additions
+        if (onComplete) {
+            requestAnimationFrame(() => {
+                onComplete();
+            });
+        }
     };
 
     // For large galleries, use progressive rendering to prevent UI hang
@@ -2006,6 +2363,7 @@ function createTOCGalleryElement(entry) {
     entry.level = level;
     const item = document.createElement('div');
     item.className = `toc-gallery-item toc-gallery-${level.toLowerCase()}`;
+    item.dataset.createdAt = entry.createdAt;
     item.id = entry.id;
     item.innerHTML = `
         <div class="toc-indicator"></div>
@@ -2252,6 +2610,7 @@ function createScreenshotCard(shot, index) {
     const hasNote = noteHtml && noteHtml.trim().replace(/<[^>]*>/g, '').trim().length > 0;
     const card = document.createElement('div');
     card.className = 'screenshot-card';
+    card.dataset.createdAt = shot.createdAt;
     card.id = shot.id;
     card.innerHTML = `
         <div class="card-img-container">
@@ -2363,6 +2722,17 @@ function createScreenshotCard(shot, index) {
         btn.disabled = true;
 
         try {
+            // Feature: Use current playback time instead of shot time if available
+            let targetTimeMs = shot.timestampMs;
+            try {
+                const response = await sendMessageWithRetry(currentTabId, { action: 'getState' }, 5, 200);
+                if (response && typeof response.currentTimeMs === 'number') {
+                    targetTimeMs = response.currentTimeMs;
+                }
+            } catch (e) {
+                // Fallback to shot.timestampMs
+            }
+
             let segments = await getCachedTranscript();
             if (!segments || segments.length === 0) {
                 segments = await getCachedTranscript(true); // Force fetch
@@ -2377,8 +2747,8 @@ function createScreenshotCard(shot, index) {
             const preSec = parseInt(document.getElementById('transcript-before')?.value || '4');
             const postSec = parseInt(document.getElementById('transcript-after')?.value || '5');
 
-            const startTargetMs = shot.timestampMs - (preSec * 1000);
-            const endTargetMs = shot.timestampMs + (postSec * 1000);
+            const startTargetMs = targetTimeMs - (preSec * 1000);
+            const endTargetMs = targetTimeMs + (postSec * 1000);
 
             // Filter segments within the [startTargetMs, endTargetMs] window
             const rangeSegments = segments.filter(seg => {
@@ -2439,7 +2809,7 @@ function createScreenshotCard(shot, index) {
 
         const targetId = currentVideoId;
         const targetTitle = currentVideoTitle;
-        const details = await collectTOCEntryDetails(`Marker @ ${shot.timeFormatted || '00:00'}`, 'H2');
+        const details = await collectTOCEntryDetails("", 'H2');
         if (!details) return;
         let placement = 'bottom';
         if (state.screenshots.length >= 2) {
@@ -2486,13 +2856,16 @@ function createScreenshotCard(shot, index) {
     editor.addEventListener('input', () => {
         syncNoteHighlightNodes(editor);
 
+        // Sanitize HTML before saving to prevent XSS
+        const sanitizedHtml = sanitizeNoteHtml(editor.innerHTML);
+
         // Update the ORIGINAL state entry directly via the reference
-        shot.noteHtml = editor.innerHTML;
+        shot.noteHtml = sanitizedHtml;
 
         // SAFETY NET: Also update by ID in case the reference got detached
         const stateEntry = state.screenshots.find(s => s.id === shot.id);
         if (stateEntry && stateEntry !== shot) {
-            stateEntry.noteHtml = editor.innerHTML;
+            stateEntry.noteHtml = sanitizedHtml;
         }
 
         // Debounce save: wait for configured delay after last keystroke before saving to disk
@@ -2620,6 +2993,50 @@ async function openScreenshotInSystemViewer(shotId) {
 }
 
 // â”€â”€ Internal Image Editor (Opens in a New Window) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function persistScreenshotEditState(shotId, editState) {
+    const key = `edit_state_${shotId}`;
+    const trySet = (area, areaName) => new Promise((resolve) => {
+        // Clear all other edit states first to keep storage lean
+        area.get(null, (all) => {
+            const keysToRemove = Object.keys(all || {}).filter(k => k.startsWith('edit_state_'));
+            if (keysToRemove.length > 0) {
+                area.remove(keysToRemove, () => {
+                    area.set({ [key]: editState }, () => {
+                        const err = chrome.runtime.lastError;
+                        if (err) {
+                            console.warn(`[Panel] Failed to set ${key} in ${areaName}:`, err);
+                            resolve({ ok: false, error: err, area: areaName });
+                            return;
+                        }
+                        resolve({ ok: true, area: areaName });
+                    });
+                });
+            } else {
+                area.set({ [key]: editState }, () => {
+                    const err = chrome.runtime.lastError;
+                    if (err) {
+                        console.warn(`[Panel] Failed to set ${key} in ${areaName}:`, err);
+                        resolve({ ok: false, error: err, area: areaName });
+                        return;
+                    }
+                    resolve({ ok: true, area: areaName });
+                });
+            }
+        });
+    });
+
+    if (chrome.storage?.session) {
+        const sessionResult = await trySet(chrome.storage.session, 'session');
+        if (sessionResult.ok) return sessionResult;
+    }
+
+    if (chrome.storage?.local) {
+        return await trySet(chrome.storage.local, 'local');
+    }
+
+    return { ok: false, error: new Error('Storage API not available') };
+}
+
 async function openScreenshotEditor(shotId) {
     const shot = state.screenshots.find(s => s.id === shotId);
     if (!shot) return;
@@ -2634,18 +3051,11 @@ async function openScreenshotEditor(shotId) {
     // If it's a blob url (from rehydration), we MUST convert it to base64 dataUrl 
     // before passing to a different window, as Blob URLs don't survive cross-window storage boundary.
     if (finalDataUrl.startsWith('blob:')) {
-        try {
-            const blobResp = await fetch(finalDataUrl);
-            const blob = await blobResp.blob();
-            finalDataUrl = await new Promise((res, rej) => {
-                const reader = new FileReader();
-                reader.onloadend = () => res(reader.result);
-                reader.onerror = rej;
-                reader.readAsDataURL(blob);
-            });
-        } catch (e) {
-            console.error("Failed to convert blob to dataUrl for editor", e);
-            return;
+        finalDataUrl = await ensureDataUrlFromBlob(finalDataUrl, shotId);
+        if (!finalDataUrl || finalDataUrl.startsWith('blob:')) {
+             console.error("Failed to convert blob to dataUrl for editor");
+             showToast("Could not prepare image data. Please try again.", "error");
+             return;
         }
     }
 
@@ -2656,23 +3066,31 @@ async function openScreenshotEditor(shotId) {
         timeFormatted: shot.timeFormatted
     };
 
-    // Store in chrome.storage.local so the new window can pick it up
-    chrome.storage.local.set({ [`edit_state_${shotId}`]: editState }, () => {
-        // Calculate center position
-        const width = Math.min(window.screen.availWidth - 100, 1200);
-        const height = Math.min(window.screen.availHeight - 100, 900);
-        const left = (window.screen.availWidth - width) / 2;
-        const top = (window.screen.availHeight - height) / 2;
+    const saveResult = await persistScreenshotEditState(shotId, editState);
+    if (!saveResult.ok) {
+        console.warn("Failed to store edit state for screenshot editor, falling back to live fetch:", saveResult.error);
+    }
 
-        chrome.windows.create({
-            url: chrome.runtime.getURL(`sidepanel/editor.html?shotId=${shotId}&videoId=${currentVideoId}`),
-            type: 'popup',
-            width: width,
-            height: height,
-            left: Math.round(left),
-            top: Math.round(top),
-            focused: true
-        });
+    // Calculate center position
+    const width = Math.min(window.screen.availWidth - 100, 1200);
+    const height = Math.min(window.screen.availHeight - 100, 900);
+    const left = (window.screen.availWidth - width) / 2;
+    const top = (window.screen.availHeight - height) / 2;
+
+    chrome.windows.create({
+        url: chrome.runtime.getURL(`sidepanel/editor.html?shotId=${shotId}&videoId=${currentVideoId}`),
+        type: 'popup',
+        width: width,
+        height: height,
+        left: Math.round(left),
+        top: Math.round(top),
+        focused: true
+    }, () => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+            console.error("Failed to open screenshot editor window:", err);
+            showToast("Could not open editor window. Please try again.", "error");
+        }
     });
 }
 
@@ -2798,54 +3216,39 @@ async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNote
         }
 
         if (list) {
-            const scrollContainer = list.closest('.scrollable') || list;
+            // The real scroll container is the tab-pane (.scrollable), NOT the gallery-list
+            const scrollContainer = document.getElementById('tab-screenshots') ||
+                                    list.closest('.tab-pane.scrollable') ||
+                                    list.closest('.scrollable') ||
+                                    list.parentElement;
 
-            // FIX #1: Calculate scroll position BEFORE appending
-            const scrollHeightBefore = scrollContainer.scrollHeight;
+            // Capture scroll metrics BEFORE appending the new card
             const scrollTopBefore = scrollContainer.scrollTop;
             const clientHeight = scrollContainer.clientHeight;
-            const wasNearBottom = (scrollHeightBefore - scrollTopBefore - clientHeight) < 100;
-            
-            // FIX #2: Detect auto-screenshots to suppress scroll thrashing
+            const scrollHeightBefore = scrollContainer.scrollHeight;
+            const wasNearBottom = (scrollHeightBefore - scrollTopBefore - clientHeight) < 150;
+
+            // Detect auto-screenshots to suppress scroll thrashing during review
             const isAutoScreenshot = filename.startsWith('AutoShot_') ||
                                      filename.startsWith('AreaShot_') ||
                                      (lastAutoScreenshotTime > 0 && (Date.now() - lastAutoScreenshotTime) < 5000);
-            
-            // Auto-screenshots NEVER auto-scroll to avoid disrupting user's review workflow
-            const shouldAutoScroll = !skipScroll && 
-                                     !isAutoScreenshot &&
-                                     (state.screenshots.length <= 1 || wasNearBottom);
 
-            // FIX #3: Append card
+            // Manual shots ALWAYS scroll into view. Auto-shots only scroll if near bottom.
+            const shouldAutoScroll = !skipScroll && (isAutoScreenshot ? wasNearBottom : true);
+
+            // Insert the new card in sorted order
             const index = state.screenshots.length;
             const card = createScreenshotCard(item, index);
-            list.appendChild(card);
+            insertElementSorted(list, card);
 
-            // FIX #4: Wait for image to fully load BEFORE scrolling
-            const img = card.querySelector('.card-img');
-
-            const performScroll = () => {
-                if (!shouldAutoScroll) return;
-
-                // Use requestAnimationFrame for smooth scroll after layout is stable
+            // Scroll to show the new card using direct scrollTop on the real container
+            if (shouldAutoScroll) {
                 requestAnimationFrame(() => {
-                    const finalScrollTop = scrollContainer.scrollHeight;
                     scrollContainer.scrollTo({
-                        top: finalScrollTop,
+                        top: scrollContainer.scrollHeight,
                         behavior: 'smooth'
                     });
                 });
-            };
-
-            if (img && !img.complete) {
-                // Image not loaded — wait for it
-                img.onload = performScroll;
-                img.onerror = performScroll; // Still scroll even if image fails
-                // Fallback timeout in case onload doesn't fire
-                setTimeout(performScroll, 800);
-            } else {
-                // Image already cached — scroll immediately
-                performScroll();
             }
         }
         saveVideoState(currentVideoId);
@@ -2860,17 +3263,35 @@ async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNote
  */
 function safeScrollToElement(el, behavior = 'smooth') {
     if (!el || !el.isConnected) return;
-    
-    // Ensure we are scrolling the correct container
-    const container = el.closest('.scrollable') || el.parentElement;
+
+    // Resolve the true scrolling container: prefer the tab-pane, fall back to nearest scrollable
+    const container = el.closest('#tab-screenshots') ||
+                      el.closest('.tab-pane.scrollable') ||
+                      el.closest('.scrollable') ||
+                      el.parentElement;
     if (!container) return;
 
     requestAnimationFrame(() => {
-        el.scrollIntoView({ 
-            behavior: behavior, 
-            block: 'nearest',
-            inline: 'nearest' 
-        });
+        // Calculate where the element is relative to the container
+        const elTop = el.offsetTop;
+        const elBottom = elTop + el.offsetHeight;
+        const containerTop = container.scrollTop;
+        const containerBottom = containerTop + container.clientHeight;
+
+        if (elBottom > containerBottom) {
+            // Element is below the visible area — scroll it into view at the bottom
+            container.scrollTo({
+                top: elBottom - container.clientHeight + 16,
+                behavior: behavior
+            });
+        } else if (elTop < containerTop) {
+            // Element is above the visible area — scroll it into view at the top
+            container.scrollTo({
+                top: elTop - 16,
+                behavior: behavior
+            });
+        }
+        // else: already fully visible — no scroll needed
     });
 }
 
@@ -3114,6 +3535,9 @@ async function deleteScreenshot(shotId) {
     const shot = state.screenshots.find(s => s.id === shotId);
     if (!shot) return;
 
+    // FIX: Revoke blob URL BEFORE removing from state to ensure proper cleanup
+    revokeScreenshotBlobUrlIfNeeded(shot);
+
     const diskResult = await deleteScreenshotFilesFromCurrentVideo([shot]);
     if (diskResult.blocked) {
         if (diskResult.reason === 'permission' || diskResult.reason === 'no_root_handle') {
@@ -3129,7 +3553,6 @@ async function deleteScreenshot(shotId) {
     }
 
     state.screenshots = state.screenshots.filter(s => s.id !== shotId);
-    revokeScreenshotBlobUrlIfNeeded(shot);
 
     // SURGICAL DELETION: Remove from DOM directly to avoid scroll jump
     const cardEl = document.getElementById(shotId);
@@ -3341,17 +3764,38 @@ async function removeHistoryIndexEntry(folderName, videoId = null) {
 async function scanFoldersForHistoryEntries() {
     const folders = await FileSystemModule.listSubFolders();
     const entries = [];
-    for (const folder of folders) {
-        try {
-            const stateFile = await folder.getFileHandle(VIDEO_STATE_FILENAME);
-            const file = await stateFile.getFile();
-            const text = await file.text();
-            const vState = JSON.parse(text);
-            entries.push(buildHistoryEntryFromState(vState, folder.name));
-        } catch (_) {
-            // Ignore folders without a valid state file.
-        }
+
+    // Performance: Process folders in parallel with concurrency limit to prevent I/O bottleneck
+    const CONCURRENCY_LIMIT = 5; // Process 5 folders at a time
+
+    for (let i = 0; i < folders.length; i += CONCURRENCY_LIMIT) {
+        const batch = folders.slice(i, i + CONCURRENCY_LIMIT);
+        
+        // Process batch in parallel
+        const batchResults = await Promise.allSettled(
+            batch.map(async (folder) => {
+                try {
+                    const stateFile = await folder.getFileHandle(VIDEO_STATE_FILENAME);
+                    const file = await stateFile.getFile();
+                    const text = await file.text();
+                    const vState = JSON.parse(text);
+                    return buildHistoryEntryFromState(vState, folder.name);
+                } catch (e) {
+                    // Ignore folders without a valid state file or read errors
+                    console.debug('[History] Failed to read folder:', folder.name, e);
+                    return null;
+                }
+            })
+        );
+
+        // Collect successful results
+        batchResults.forEach(result => {
+            if (result.status === 'fulfilled' && result.value) {
+                entries.push(result.value);
+            }
+        });
     }
+
     return sortHistoryEntries(entries);
 }
 
@@ -3460,9 +3904,13 @@ async function refreshHistory() {
         const list = document.getElementById('history-list');
         if (list) {
             list.innerHTML = '';
+            
+            // Performance: Use DocumentFragment to batch DOM insertions
+            const fragment = document.createDocumentFragment();
             for (const entry of entries) {
-                renderHistoryEntry(list, entry);
+                renderHistoryEntry(fragment, entry);
             }
+            list.appendChild(fragment);
 
             if (!list.querySelector('.history-item')) {
                 list.innerHTML = '<div class="empty-state"><p>No valid history files found.</p></div>';
@@ -3477,7 +3925,7 @@ async function refreshHistory() {
 // ==========================================
 // Action: Table of Contents
 // ==========================================
-async function collectTOCEntryDetails(defaultTitle = "Key Moment", defaultLevel = "H2") {
+async function collectTOCEntryDetails(defaultTitle = "", defaultLevel = "H2") {
     const titleInput = await showPrompt("Enter marker name:", defaultTitle);
     const cleanedTitle = String(titleInput || "").trim();
     if (!cleanedTitle) return null;
@@ -3491,16 +3939,16 @@ async function collectTOCEntryDetails(defaultTitle = "Key Moment", defaultLevel 
 async function collectTOCPlacementForScreenshot(defaultPlacement = 'bottom') {
     const choices = [
         {
-            value: 'bottom',
-            label: 'Below Screenshot',
-            icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14"></path><polyline points="6 13 12 19 18 13"></polyline></svg>',
-            description: 'Add this marker after the screenshot in the gallery flow.'
-        },
-        {
             value: 'top',
             label: 'Above Screenshot',
             icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14"></path><polyline points="6 11 12 5 18 11"></polyline></svg>',
             description: 'Insert this marker before the screenshot in the gallery flow.'
+        },
+        {
+            value: 'bottom',
+            label: 'Below Screenshot',
+            icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14"></path><polyline points="6 13 12 19 18 13"></polyline></svg>',
+            description: 'Add this marker after the screenshot in the gallery flow.'
         }
     ];
 
@@ -3534,7 +3982,7 @@ async function handleAddTOC() {
 
     const timeMs = response.currentTimeMs;
     const timeStr = formatTime(timeMs);
-    const details = await collectTOCEntryDetails("Key Moment", "H2");
+    const details = await collectTOCEntryDetails("", "H2");
 
     if (details) {
         console.log("Sidepanel: Adding TOC Entry:", details.title, timeStr, details.level);
@@ -3563,6 +4011,23 @@ async function handleAddTOC() {
     }
 }
 
+function insertElementSorted(container, newElement) {
+    if (!container || !newElement) return;
+    const newCreated = Number(newElement.dataset.createdAt) || 0;
+    const children = Array.from(container.children);
+    
+    // Skip empty states or non-card elements if any
+    const existingItems = children.filter(child => child.dataset.createdAt !== undefined);
+    
+    const nextElement = existingItems.find(child => (Number(child.dataset.createdAt) || 0) > newCreated);
+    
+    if (nextElement) {
+        container.insertBefore(newElement, nextElement);
+    } else {
+        container.appendChild(newElement);
+    }
+}
+
 function addTOCToUI(title, timeStr, timeMs, existingCreatedAt = null, level = 'H2') {
     const entry = normalizeTOCRecord({
         id: `toc-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -3587,78 +4052,93 @@ function addTOCToUI(title, timeStr, timeMs, existingCreatedAt = null, level = 'H
     const totalItems = state.screenshots.length + state.toc.length;
 
     if (list) {
-        // DELTA RENDERING: Always append markers if they are the latest item
+        // DELTA RENDERING: Insert marker in sorted position
         const tocElement = createTOCGalleryElement(entry);
-        list.appendChild(tocElement);
+        insertElementSorted(list, tocElement);
         safeScrollToElement(tocElement);
     }
 
     saveVideoState(currentVideoId);
 }
 
+// Fix #16: Batch DOM creation in renderTOCList using DocumentFragment
 function renderTOCList() {
-    console.log("[STABILITY_V3] renderTOCList entry");
-    if (!safeSetInnerHTML('toc-list', '')) return;
+    const list = document.getElementById('toc-list');
+    if (!list) return;
 
-    if (!Array.isArray(state.toc) || state.toc.length === 0) {
-        safeSetInnerHTML('toc-list', `<div class="empty-state"><p>No timeline markers added.</p></div>`);
+    list.innerHTML = "";
+    if (!state.toc || state.toc.length === 0) {
+        list.innerHTML = '<div class="empty-state">No markers yet. Use the timeline or click a screenshot button to add.</div>';
         return;
     }
 
-    // NOTEUP behavior: the TOC LIST panel shows entries ordered by video time.
-    // We use a LOCAL sorted copy to avoid mutating state.toc (which must keep
-    // its insertion/createdAt order so renderMainGallery positions markers correctly).
-    const timelineOrdered = sortTOCByTimeline(state.toc).map((entry, idx) => normalizeTOCRecord(entry, idx));
-
+    const fragment = document.createDocumentFragment();
     state.toc.forEach(entry => {
-        const level = normalizeTOCLevel(entry.level);
+        const item = createTOCGalleryElement(entry);
+        fragment.appendChild(item);
+    });
+    list.appendChild(fragment);
+}
+
+function renderTOCModal() {
+    const tocModalList = document.getElementById('toc-modal-list');
+    if (!tocModalList) return;
+
+    tocModalList.innerHTML = '';
+
+    // Only show TOC entries with hierarchy (h1, h2, h3)
+    const tocEntries = (state.toc || [])
+        .filter(entry => entry.level)
+        .sort((a, b) => a.timestampMs - b.timestampMs);
+
+    if (tocEntries.length === 0) {
+        tocModalList.innerHTML = '<div class="empty-state"><p>No TOC entries with headings (H1, H2, H3) added for this video.</p></div>';
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+
+    tocEntries.forEach(entry => {
+        const levelClass = `toc-level-${entry.level.toLowerCase()}`;
+        const indentSize = entry.level === 'H1' ? 0 : entry.level === 'H2' ? 16 : 32;
+
         const item = document.createElement('div');
-        item.className = `toc-item toc-item-${level.toLowerCase()}`;
+        item.className = `toc-modal-item ${levelClass}`;
+        item.style.paddingLeft = `${16 + indentSize}px`;
+        item.dataset.entryId = entry.id;
         item.innerHTML = `
-            <div class="toc-time">${entry.timeFormatted}</div>
-            <select class="toc-level" title="TOC Level">
-                <option value="H1" ${level === 'H1' ? 'selected' : ''}>H1</option>
-                <option value="H2" ${level === 'H2' ? 'selected' : ''}>H2</option>
-                <option value="H3" ${level === 'H3' ? 'selected' : ''}>H3</option>
-            </select>
-            <div class="toc-text" contenteditable="true">${entry.title}</div>
-            <button class="toc-delete" title="Delete Entry">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-            </button>
+            <span class="toc-heading-label">${entry.level}</span>
+            <span class="toc-marker-title">${entry.title}</span>
+            <span class="toc-marker-time">${entry.timeFormatted || formatTime(entry.timestampMs)}</span>
         `;
 
-        // Click on time to seek
-        item.querySelector('.toc-time').addEventListener('click', () => {
-            seekActiveYouTubeTab(entry.timestampMs);
+        item.addEventListener('click', async () => {
+            const tabId = await resolveActiveYouTubeTabId();
+            if (Number.isInteger(tabId)) {
+                chrome.tabs.sendMessage(tabId, { action: 'seekTo', timeMs: entry.timestampMs });
+            }
+
+            // Switch to Screenshots tab and scroll to the entry
+            const tabBtn = document.querySelector('.tab-btn[data-tab="tab-screenshots"]');
+            if (tabBtn && !tabBtn.classList.contains('active')) {
+                tabBtn.click();
+            }
+
+            // Navigate to the entry in the side panel
+            requestAnimationFrame(() => {
+                const panelEntry = document.getElementById(entry.id);
+                if (panelEntry) {
+                    panelEntry.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            });
+
+            document.getElementById('toc-modal-overlay')?.classList.add('hidden');
         });
 
-        const levelSelect = item.querySelector('.toc-level');
-        levelSelect.addEventListener('change', () => {
-            entry.level = normalizeTOCLevel(levelSelect.value);
-            item.className = `toc-item toc-item-${entry.level.toLowerCase()}`;
-            saveVideoState();
-            renderMainGallery();
-        });
-
-        // Edit title inline
-        const textEdit = item.querySelector('.toc-text');
-        textEdit.addEventListener('input', () => {
-            entry.title = textEdit.innerText;
-            saveVideoState();
-            renderMainGallery();
-        });
-
-        // Delete
-        item.querySelector('.toc-delete').addEventListener('click', (e) => {
-            e.stopPropagation();
-            state.toc = state.toc.filter(t => t.id !== entry.id);
-            renderTOCList();
-            renderMainGallery();
-            saveVideoState();
-        });
-
-        list.appendChild(item);
+        fragment.appendChild(item);
     });
+
+    tocModalList.appendChild(fragment);
 }
 
 function clearVideoStateUI() {
@@ -3678,8 +4158,12 @@ function clearVideoStateUI() {
 
     // Fix #10: Clear auto-screenshot interval on video change
     if (autoScreenshotInterval) {
-        clearInterval(autoScreenshotInterval);
+        clearTimeout(autoScreenshotInterval);
         autoScreenshotInterval = null;
+        autoScreenshotActive = false;
+        lastAutoFrameHash = null;
+        cachedPlaybackRate = 1.0; // Reset playback rate cache
+        lastPlaybackRateFetch = 0;
         const toggle = document.getElementById('toggle-auto-screenshot');
         if (toggle) toggle.checked = false;
         const text = document.getElementById('auto-screenshot-text');
@@ -3935,7 +4419,8 @@ function getScreenshotNoteHtml(shot) {
     const htmlCandidates = [shot.noteHtml, shot.note_html];
     for (const candidate of htmlCandidates) {
         if (typeof candidate === 'string' && candidate.trim()) {
-            return candidate;
+            // Sanitize HTML to prevent XSS attacks
+            return sanitizeNoteHtml(candidate);
         }
     }
 
@@ -3947,6 +4432,160 @@ function getScreenshotNoteHtml(shot) {
     }
 
     return "";
+}
+
+// Security: Sanitize note HTML to prevent XSS attacks
+// Removes dangerous tags and attributes while preserving formatting
+function sanitizeNoteHtml(html) {
+    if (!html || typeof html !== 'string') return "";
+
+    // Create a temporary DOM element for parsing
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = html;
+
+    // Allowed tags (whitelist approach)
+    const allowedTags = new Set([
+        'b', 'i', 'em', 'strong', 'u', 'span', 'div', 'p', 'br', 'hr',
+        'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'mark', 'code', 'pre', 'blockquote', 'a'
+    ]);
+
+    // Allowed attributes per tag
+    const allowedAttrs = {
+        '*': ['style', 'class'],
+        'a': ['href', 'title', 'target'],
+        'span': ['style', 'class'],
+        'div': ['style', 'class'],
+        'p': ['style', 'class'],
+        'h1': ['style', 'class'],
+        'h2': ['style', 'class'],
+        'h3': ['style', 'class'],
+        'h4': ['style', 'class'],
+        'h5': ['style', 'class'],
+        'h6': ['style', 'class'],
+        'mark': ['style', 'class'],
+        'code': ['style', 'class'],
+        'pre': ['style', 'class'],
+        'blockquote': ['style', 'class']
+    };
+
+    // Allowed CSS properties in style attributes
+    const allowedStyles = new Set([
+        'color', 'background-color', 'background',
+        'font-weight', 'font-style', 'font-family', 'font-size',
+        'text-decoration', 'text-align',
+        'margin', 'padding', 'border',
+        'white-space', 'word-wrap', 'line-height'
+    ]);
+
+    // Dangerous tags to completely remove (including contents)
+    const dangerousTags = new Set([
+        'script', 'iframe', 'object', 'embed', 'form', 'input',
+        'button', 'select', 'textarea', 'style', 'link', 'meta',
+        'base', 'applet', 'frame', 'frameset', 'layer', 'ilayer'
+    ]);
+
+    // Recursive function to sanitize nodes
+    function sanitizeNode(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            return node.cloneNode();
+        }
+
+        if (node.nodeType !== Node.ELEMENT_NODE) {
+            return null;
+        }
+
+        const tagName = node.nodeName.toLowerCase();
+
+        // Remove dangerous tags completely
+        if (dangerousTags.has(tagName)) {
+            return null;
+        }
+
+        // Skip unknown tags but process their children
+        if (!allowedTags.has(tagName)) {
+            const fragment = document.createDocumentFragment();
+            Array.from(node.childNodes).forEach(child => {
+                const sanitized = sanitizeNode(child);
+                if (sanitized) fragment.appendChild(sanitized);
+            });
+            return fragment;
+        }
+
+        // Create sanitized element
+        const sanitizedEl = document.createElement(tagName);
+
+        // Copy allowed attributes
+        Array.from(node.attributes).forEach(attr => {
+            const attrName = attr.name.toLowerCase();
+            const allowedForTag = allowedAttrs[tagName] || allowedAttrs['*'] || [];
+
+            if (allowedForTag.includes(attrName)) {
+                if (attrName === 'style') {
+                    // Sanitize style attribute
+                    const sanitizedStyle = sanitizeStyleAttribute(attr.value);
+                    if (sanitizedStyle) {
+                        sanitizedEl.setAttribute(attrName, sanitizedStyle);
+                    }
+                } else if (attrName === 'href') {
+                    // Only allow safe protocols for links
+                    const hrefValue = attr.value.trim();
+                    if (hrefValue.startsWith('#') ||
+                        hrefValue.startsWith('http://') ||
+                        hrefValue.startsWith('https://') ||
+                        hrefValue.startsWith('mailto:')) {
+                        sanitizedEl.setAttribute(attrName, hrefValue);
+                    }
+                } else {
+                    sanitizedEl.setAttribute(attrName, attr.value);
+                }
+            }
+        });
+
+        // Process children
+        Array.from(node.childNodes).forEach(child => {
+            const sanitized = sanitizeNode(child);
+            if (sanitized) sanitizedEl.appendChild(sanitized);
+        });
+
+        return sanitizedEl;
+    }
+
+    // Sanitize style attribute value
+    function sanitizeStyleAttribute(styleValue) {
+        if (!styleValue || typeof styleValue !== 'string') return '';
+
+        const declarations = styleValue.split(';');
+        const sanitized = [];
+
+        declarations.forEach(declaration => {
+            const colonIndex = declaration.indexOf(':');
+            if (colonIndex === -1) return;
+
+            const property = declaration.substring(0, colonIndex).trim().toLowerCase();
+            const value = declaration.substring(colonIndex + 1).trim();
+
+            // Only allow whitelisted CSS properties
+            if (allowedStyles.has(property)) {
+                // Additional safety: remove url() and expression() which can execute code
+                if (!value.includes('url(') &&
+                    !value.includes('expression(') &&
+                    !value.includes('javascript:')) {
+                    sanitized.push(`${property}: ${value}`);
+                }
+            }
+        });
+
+        return sanitized.join('; ');
+    }
+
+    // Process the HTML
+    const sanitized = sanitizeNode(tempDiv);
+    if (!sanitized) return '';
+
+    // Return sanitized HTML
+    const result = sanitized.nodeType === Node.ELEMENT_NODE ? sanitized.outerHTML : sanitized.textContent;
+    return result || '';
 }
 
 function convertMarkdownToHtml(text) {
@@ -4126,10 +4765,13 @@ function handleNoteEditorPaste(event, editor, shot) {
     if (!insertHtml) return;
 
     document.execCommand('insertHTML', false, insertHtml);
-    shot.noteHtml = editor.innerHTML;
+    
+    // Sanitize HTML before saving to prevent XSS
+    const sanitizedHtml = sanitizeNoteHtml(editor.innerHTML);
+    shot.noteHtml = sanitizedHtml;
     const stateEntry = state.screenshots.find(s => s.id === shot.id);
     if (stateEntry && stateEntry !== shot) {
-        stateEntry.noteHtml = editor.innerHTML;
+        stateEntry.noteHtml = sanitizedHtml;
     }
     saveVideoState(currentVideoId);
 }
@@ -4187,6 +4829,42 @@ function loadImageFromDataUrl(dataUrl) {
         img.onerror = reject;
         img.src = dataUrl;
     });
+}
+
+async function ensureDataUrlFromBlob(sourceUrl, optionalShotId = null) {
+    if (!sourceUrl || typeof sourceUrl !== 'string') {
+        // If it was already null/empty, we might need to re-hydrate it if shotId is provided
+        if (!sourceUrl && optionalShotId && currentVideoId && currentVideoTitle) {
+            console.debug('[Panel] ensureDataUrlFromBlob: URL is missing, attempting re-hydration for', optionalShotId);
+            await loadVideoState(currentVideoId, currentVideoTitle, { lazy: true });
+            const shot = state.screenshots.find(s => s.id === optionalShotId);
+            if (shot && shot.dataUrl) return shot.dataUrl;
+        }
+        return sourceUrl;
+    }
+    if (!sourceUrl.startsWith('blob:')) return sourceUrl;
+
+    try {
+        const blobResp = await fetch(sourceUrl);
+        const blob = await blobResp.blob();
+        return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (e) {
+        console.warn("[Panel] Failed to convert blob URL to data URL, attempting re-hydration:", e);
+        if (optionalShotId && currentVideoId && currentVideoTitle) {
+            await loadVideoState(currentVideoId, currentVideoTitle, { lazy: true });
+            const shot = state.screenshots.find(s => s.id === optionalShotId);
+            if (shot && shot.dataUrl) {
+                // If it's a blob again, recurrence is fine as loadVideoState creates a FRESH blob
+                return await ensureDataUrlFromBlob(shot.dataUrl); 
+            }
+        }
+        return sourceUrl;
+    }
 }
 
 async function isDataUrlLikelyBlank(dataUrl) {
@@ -5047,7 +5725,8 @@ async function generatePDFDoc(progressCallback = null) {
 
         if (hasShotImage) {
             try {
-                const shotImageMeta = await loadImageFromDataUrl(shot.dataUrl);
+                const shotImageSrc = await ensureDataUrlFromBlob(shot.dataUrl);
+                const shotImageMeta = await loadImageFromDataUrl(shotImageSrc);
                 if (!shotImageMeta || !shotImageMeta.width || !shotImageMeta.height) {
                     throw new Error("Could not load screenshot image metadata.");
                 }
@@ -5091,7 +5770,7 @@ async function generatePDFDoc(progressCallback = null) {
 
                 if (imageHeight > 8) {
                     const imageX = margin + ((contentWidth - imageWidth) / 2);
-                    doc.addImage(shot.dataUrl, 'PNG', imageX, y, imageWidth, imageHeight, undefined, 'FAST');
+                    doc.addImage(shotImageSrc, 'PNG', imageX, y, imageWidth, imageHeight, undefined, 'FAST');
                     y += imageHeight + 2;
                 }
             } catch (err) {
@@ -5269,6 +5948,10 @@ async function generatePDFDoc(progressCallback = null) {
         ...sortedTocEntries.map(e => ({ type: 'toc', data: e, time: e.timestampMs || 0 }))
     ].sort((a, b) => a.time - b.time);
 
+    // Performance: Chunk rendering with proper async yielding to prevent UI freeze
+    const CHUNK_SIZE = 3; // Yield every 3 items for smoother UI
+    const YIELD_DELAY_MS = 10; // Give UI thread 10ms to breathe
+
     if (allItems.length > 0) {
         doc.addPage();
 
@@ -5281,11 +5964,18 @@ async function generatePDFDoc(progressCallback = null) {
 
         for (let i = 0; i < allItems.length; i++) {
             const item = allItems[i];
-            
-            // NON-BLOCKING: Yield to UI thread every 5 items to prevent freeze
-            if (i > 0 && i % 5 === 0) {
-                report(`Rendering pages... ${Math.round((i / allItems.length) * 100)}%`);
-                await new Promise(resolve => setTimeout(resolve, 0));
+
+            // NON-BLOCKING: Yield to UI thread more frequently to prevent freeze
+            if (i > 0 && i % CHUNK_SIZE === 0) {
+                const progress = Math.round((i / allItems.length) * 100);
+                report(`Rendering pages... ${progress}%`);
+
+                // Use requestIdleCallback if available for optimal scheduling, fallback to setTimeout
+                if (typeof requestIdleCallback === 'function') {
+                    await new Promise(resolve => requestIdleCallback(resolve, { timeout: 50 }));
+                } else {
+                    await new Promise(resolve => setTimeout(resolve, YIELD_DELAY_MS));
+                }
             }
 
             if (item.type === 'toc') {
@@ -5395,9 +6085,21 @@ async function generatePDFDoc(progressCallback = null) {
 }
 
 async function handleExportPDF() {
-    showExportProgressDialog("Starting PDF export...");
+    showExportProgressDialog("Choose save location...");
 
     try {
+        const title = document.getElementById('video-title').textContent || "YouTube Notes";
+        const safeTitle = title.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
+        const filename = `${safeTitle}_${Date.now().toString().slice(-4)}.pdf`;
+
+        const fileHandle = await FileSystemModule.pickPdfSaveFileHandle(filename);
+        if (!fileHandle) {
+            showToast("PDF export cancelled", "info");
+            return;
+        }
+
+        updateExportProgressDialog("Starting PDF export...");
+
         // Use the existing generatePDFDoc function (already tested and working)
         const doc = await generatePDFDoc((message) => {
             updateExportProgressDialog(message || "Exporting PDF...");
@@ -5410,17 +6112,13 @@ async function handleExportPDF() {
 
         updateExportProgressDialog("Saving PDF...");
 
-        const title = document.getElementById('video-title').textContent || "YouTube Notes";
         const pdfBlob = doc.output('blob');
-        const safeTitle = title.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
-        const filename = `${safeTitle}_${Date.now().toString().slice(-4)}.pdf`;
-
-        const saved = await FileSystemModule.saveFileAs(filename, pdfBlob);
+        const saved = await FileSystemModule.writeFileHandle(fileHandle, pdfBlob);
         if (saved) {
             console.log("PDF saved via Save As dialog.");
             showToast("PDF saved successfully!", "success");
         } else {
-            showToast("PDF export cancelled", "info");
+            showToast("PDF export failed", "error");
         }
     } catch (err) {
         console.error("PDF export failed:", err);
@@ -5453,9 +6151,18 @@ async function handleExportWatchLaterPDF() {
         return;
     }
 
-    showExportProgressDialog("Starting Watch Later PDF export...");
+    showExportProgressDialog("Choose save location...");
 
     try {
+        const filename = `YouTube_Watch_Later_${Date.now().toString().slice(-4)}.pdf`;
+        const fileHandle = await FileSystemModule.pickPdfSaveFileHandle(filename);
+        if (!fileHandle) {
+            showToast("Watch Later export cancelled", "info");
+            return;
+        }
+
+        updateExportProgressDialog("Starting Watch Later PDF export...");
+
         const doc = await generateWatchLaterPDFDoc((message) => {
             updateExportProgressDialog(message || "Exporting Watch Later List...");
         });
@@ -5468,13 +6175,11 @@ async function handleExportWatchLaterPDF() {
         updateExportProgressDialog("Saving PDF...");
 
         const pdfBlob = doc.output('blob');
-        const filename = `YouTube_Watch_Later_${Date.now().toString().slice(-4)}.pdf`;
-
-        const saved = await FileSystemModule.saveFileAs(filename, pdfBlob);
+        const saved = await FileSystemModule.writeFileHandle(fileHandle, pdfBlob);
         if (saved) {
             showToast("Watch Later PDF saved successfully!", "success");
         } else {
-            showToast("Export cancelled", "info");
+            showToast("Watch Later export failed", "error");
         }
     } catch (err) {
         console.error("Watch Later PDF export failed:", err);
@@ -6101,15 +6806,19 @@ function getDisplayPath(fullPath) {
     return fullPath.split('\\').pop().split('/').pop();
 }
 
-async function loadVideoState(forVideoId, forTitle, isPreview = false) {
-    // console.log("[STABILITY_V3] loadVideoState starting for:", forVideoId, "isPreview:", isPreview);
+async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) {
+    const isPreview = (typeof isPreviewOrOptions === 'object') ? !!isPreviewOrOptions.isPreview : !!isPreviewOrOptions;
+    const isLazy = (typeof isPreviewOrOptions === 'object') ? !!isPreviewOrOptions.lazy : false;
+    const skipRender = (typeof isPreviewOrOptions === 'object') ? !!isPreviewOrOptions.skipRender : false;
+
+    // console.log("[STABILITY] loadVideoState starting for:", forVideoId, "isPreview:", isPreview, "isLazy:", isLazy);
     try {
         if (!FileSystemModule.dirHandle || !forVideoId || !forTitle) return;
 
         // Save current scroll position BEFORE clearing UI (for returning to this video later)
-        const scrollContainer = document.querySelector('.scrollable');
-        if (scrollContainer && currentVideoId && !isPreview) {
-            savedScrollPositions.set(currentVideoId, scrollContainer.scrollTop);
+        const scrollContainer = document.getElementById('tab-screenshots');
+        if (scrollContainer && forVideoId && !isPreview) {
+            savedScrollPositions.set(forVideoId, scrollContainer.scrollTop);
         }
 
         // Ensure we are still on the same video that we started loading for
@@ -6169,8 +6878,10 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
         }
 
         if (loadedState && loadedState.screenshots && loadedState.screenshots.length > 0) {
-            // Batch load screenshots into state
-            state.screenshots = loadedState.screenshots.map((shot, idx) => normalizeScreenshotRecord(shot, idx));
+            // Batch load screenshots into state (only if NOT lazy re-hydrating existing state)
+            if (!isLazy) {
+                state.screenshots = loadedState.screenshots.map((shot, idx) => normalizeScreenshotRecord(shot, idx));
+            }
 
             const missingFilesDuringRehydration = [];
             const removedMissingShotIds = [];
@@ -6191,6 +6902,15 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
                             shot.dataUrl = blobUrl;
                             delete shot.missingOnDisk;
                             state.blobUrls.add(blobUrl);
+
+                            // Update UI if already rendered
+                            if (!isPreview) {
+                                const cardImg = document.getElementById(shot.id)?.querySelector('.card-img');
+                                if (cardImg) {
+                                    cardImg.src = blobUrl;
+                                    cardImg.classList.remove('loading');
+                                }
+                            }
 
                             if (isPreview) {
                                 const shotIdAttr = shot.id || shot.filename;
@@ -6286,8 +7006,8 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
             state.toc = sortTOCByCreated(state.toc);
         }
 
-        // Resume video position (skip for preview)
-        if (!isPreview && loadedState && loadedState.metadata && loadedState.metadata.lastTimeMs > 0) {
+        // Resume video position (skip for preview and lazy re-hydration)
+        if (!isPreview && !isLazy && loadedState && loadedState.metadata && loadedState.metadata.lastTimeMs > 0) {
             console.log("Sidepanel: Resuming video at", loadedState.metadata.lastTimeMs);
             setTimeout(() => {
                 seekActiveYouTubeTab(loadedState.metadata.lastTimeMs);
@@ -6295,30 +7015,52 @@ async function loadVideoState(forVideoId, forTitle, isPreview = false) {
         }
 
         // Single render call for everything
-        if (!isPreview) {
-            debugLog("Sidepanel: Triggering UI renders...");
-            try {
-                renderMainGallery();
-            } catch (e) { console.error("Sidepanel: renderMainGallery failed", e); }
-
-            try {
-                generateIntervalMarkers();
-            } catch (e) { console.error("Sidepanel: generateIntervalMarkers failed", e); }
-
-            try {
-                renderTOCList();
-            } catch (e) { console.error("Sidepanel: renderTOCList failed", e); }
-
-            // Restore scroll position after rendering (instant, no animation)
-            requestAnimationFrame(() => {
-                const savedScroll = savedScrollPositions.get(forVideoId);
-                if (savedScroll !== undefined && scrollContainer) {
-                    scrollContainer.scrollTo({
-                        top: savedScroll,
-                        behavior: 'auto'
+        if (!isPreview && !skipRender) {
+            // Wait for rehydration to finish then render the UI
+            setTimeout(() => {
+                try {
+                    renderMainGallery(() => {
+                        // Restore scroll position after rendering is complete
+                        const scrollEl = document.getElementById('tab-screenshots');
+                        const listEl = document.getElementById('screenshots-list');
+                        if (!scrollEl || !listEl) return;
+                        
+                        const savedScroll = savedScrollPositions.get(forVideoId);
+                        
+                        // Use a double requestAnimationFrame to ensure the browser has performed layout
+                        requestAnimationFrame(() => {
+                            requestAnimationFrame(() => {
+                                if (savedScroll !== undefined && savedScroll > 0) {
+                                    scrollEl.scrollTo({ top: savedScroll, behavior: 'auto' });
+                                } else if (state.screenshots.length > 0) {
+                                    // Default to showing the most recent screenshot if no saved position
+                                    // Use scrollIntoView on the last child for maximum reliability in large lists
+                                    const lastItem = listEl.lastElementChild;
+                                    if (lastItem) {
+                                        lastItem.scrollIntoView({ behavior: 'auto', block: 'end' });
+                                    } else {
+                                        scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'auto' });
+                                    }
+                                    
+                                    // Final safety adjustment
+                                    setTimeout(() => {
+                                        const finalItem = listEl.lastElementChild;
+                                        if (finalItem) finalItem.scrollIntoView({ behavior: 'auto', block: 'end' });
+                                    }, 150);
+                                }
+                            });
+                        });
                     });
-                }
-            });
+                } catch (e) { console.error("Sidepanel: renderMainGallery failed", e); }
+
+                try {
+                    generateIntervalMarkers();
+                } catch (e) { console.error("Sidepanel: generateIntervalMarkers failed", e); }
+
+                try {
+                    renderTOCList();
+                } catch (e) { console.error("Sidepanel: renderTOCList failed", e); }
+            }, isLazy ? 50 : 200); // Small delay to let rehydration blobs propagate
         }
 
     } catch (err) {
@@ -6648,28 +7390,105 @@ function displayTranscript(segments) {
 }
 
 async function copyTranscriptToClipboard() {
+    const copyModeSelect = document.getElementById('transcript-copy-mode');
+    const copyMode = copyModeSelect ? copyModeSelect.value : 'all';
     const segments = document.querySelectorAll('.transcript-item');
     if (segments.length === 0) return;
 
-    let fullText = "";
-    segments.forEach(s => {
-        const time = s.querySelector('.transcript-time').textContent;
-        const text = s.querySelector('.transcript-text').textContent;
-        fullText += `[${time}] ${text}\n`;
+    var filteredSegments = [];
+    var copyStatus = document.getElementById('copy-status');
+    var copyBtnText = document.getElementById('copy-btn-text');
+
+    if (copyMode === 'interval') {
+        var intervalSelect = document.getElementById('transcript-interval-select');
+        var rangeVal = intervalSelect ? intervalSelect.value : '';
+        if (!rangeVal) {
+            showToast("Please select an interval range first.", "warning");
+            return;
+        }
+        var parts = rangeVal.split('-');
+        var startMs = parseFloat(parts[0]);
+        var endMs = parseFloat(parts[1]);
+
+        segments.forEach(function(s) {
+            var timeEl = s.querySelector('.transcript-time');
+            var textEl = s.querySelector('.transcript-text');
+            if (!timeEl || !textEl) return;
+            var time = timeEl.textContent;
+            var text = textEl.textContent;
+            var segMs = parseTimeToMs(time);
+            if (segMs !== null && segMs >= startMs && segMs <= endMs) {
+                filteredSegments.push({ time: time, text: text });
+            }
+        });
+    } else if (copyMode === 'range') {
+        var startInput = document.getElementById('transcript-range-start');
+        var endInput = document.getElementById('transcript-range-end');
+        var startVal = startInput ? startInput.value : '';
+        var endVal = endInput ? endInput.value : '';
+
+        if (!startVal || !endVal) {
+            showToast("Please enter both start and end times.", "warning");
+            return;
+        }
+
+        var startMs = parseTimeToMs(startVal);
+        if (startMs === null) startMs = parseTimeToMs('00:' + startVal);
+        var endMs = parseTimeToMs(endVal);
+        if (endMs === null) endMs = parseTimeToMs('00:' + endVal);
+
+        if (startMs === null || endMs === null) {
+            showToast("Invalid time format. Use MM:SS or HH:MM:SS.", "error");
+            return;
+        }
+
+        segments.forEach(function(s) {
+            var timeEl = s.querySelector('.transcript-time');
+            var textEl = s.querySelector('.transcript-text');
+            if (!timeEl || !textEl) return;
+            var time = timeEl.textContent;
+            var text = textEl.textContent;
+            var segMs = parseTimeToMs(time);
+            if (segMs !== null && segMs >= startMs && segMs <= endMs) {
+                filteredSegments.push({ time: time, text: text });
+            }
+        });
+    } else {
+        segments.forEach(function(s) {
+            var timeEl = s.querySelector('.transcript-time');
+            var textEl = s.querySelector('.transcript-text');
+            if (!timeEl || !textEl) return;
+            var time = timeEl.textContent;
+            var text = textEl.textContent;
+            filteredSegments.push({ time: time, text: text });
+        });
+    }
+
+    if (filteredSegments.length === 0) {
+        showToast("No transcript segments found in the selected range.", "warning");
+        return;
+    }
+
+    var fullText = "";
+    filteredSegments.forEach(function(seg) {
+        fullText += '[' + seg.time + '] ' + seg.text + '\n';
     });
 
     try {
         await navigator.clipboard.writeText(fullText);
-        const btn = document.getElementById('btn-copy-transcript');
-        const oldText = btn.textContent;
-        btn.textContent = 'Copied!';
-        btn.style.background = 'var(--status-success)';
-        setTimeout(() => {
-            btn.textContent = oldText;
-            btn.style.background = '';
+        if (copyBtnText) copyBtnText.classList.add('hidden');
+        if (copyStatus) {
+            copyStatus.classList.remove('hidden');
+            copyStatus.textContent = 'Copied!';
+        }
+
+        setTimeout(function() {
+            if (copyBtnText) copyBtnText.classList.remove('hidden');
+            if (copyStatus) copyStatus.classList.add('hidden');
         }, 2000);
     } catch (err) {
         console.error("Copy failed", err);
+        showToast("Failed to copy to clipboard.", "error");
     }
 }
 
@@ -6689,21 +7508,9 @@ function parseTimeToMs(timeStr) {
 }
 
 
-// ==========================================
-// Time Formatter
-// ==========================================
-function formatTime(ms) {
-    if (ms < 0) return "00:00";
-    let seconds = Math.floor(ms / 1000);
-    let minutes = Math.floor(seconds / 60);
-    seconds = seconds % 60;
-    let hours = Math.floor(minutes / 60);
-    minutes = minutes % 60;
-    if (hours > 0) {
-        return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-    }
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-}
+// Time Formatter - uses shared TimeUtils.formatTime() for consistency
+// See utils/time.js for implementation
+const formatTime = TimeUtils.formatTime;
 
 // ==========================================
 // Playback Duration Calculator
@@ -7011,6 +7818,16 @@ function generateIntervalMarkers() {
         console.warn("Sidepanel: timeline-markers container not found in DOM");
         return;
     }
+    container.innerHTML = '';
+    // Clear previous density classes
+    container.classList.remove('compact-flags', 'mini-flags', 'micro-flags');
+    state.intervalMarkers = [];
+
+    if (!intervalStr || intervalStr === "None") {
+        console.log("Sidepanel: Markers disabled (interval is None)");
+        updateIntervalSelect(); // Clear interval select
+        return;
+    }
 
     container.innerHTML = '';
     // Clear previous density classes
@@ -7075,6 +7892,7 @@ function generateIntervalMarkers() {
         }
     }
 
+    updateIntervalSelect();
     console.log(`Sidepanel: Success! Generated ${count - 1} interval markers for ${intervalStr}s interval`);
 }
 
@@ -7377,25 +8195,6 @@ async function handleAddCountdownPrompt() {
     }
 }
 
-// Fix #16: Batch DOM creation in renderTOCList using DocumentFragment
-function renderTOCList() {
-    const list = document.getElementById('toc-list');
-    if (!list) return;
-
-    list.innerHTML = "";
-    if (!state.toc || state.toc.length === 0) {
-        list.innerHTML = '<div class="empty-state">No markers yet. Use the timeline or click a screenshot button to add.</div>';
-        return;
-    }
-
-    const fragment = document.createDocumentFragment();
-    state.toc.forEach(entry => {
-        const item = createTOCGalleryElement(entry);
-        fragment.appendChild(item);
-    });
-    list.appendChild(fragment);
-}
-
 function renderCountdowns() {
     const list = document.getElementById('countdown-list');
     if (!list) return;
@@ -7621,63 +8420,3 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
         }
     }
 });
-
-// ==========================================
-// Image Hash Utilities (dHash)
-// ==========================================
-/**
- * Calculates a 64-bit Perceptual Difference Hash (dHash) for a given image DataURL.
- * Uses a hidden 9x8 canvas to detect horizontal gradients.
- */
-async function calculateDHash(dataUrl) {
-    return new Promise((resolve) => {
-        const img = new Image();
-        img.onload = () => {
-            const width = 9;
-            const height = 8;
-            const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext('2d');
-            
-            // Draw resized grayscale version
-            ctx.filter = 'grayscale(100%)';
-            ctx.drawImage(img, 0, 0, width, height);
-            
-            const imageData = ctx.getImageData(0, 0, width, height).data;
-            let hash = "";
-            
-            for (let y = 0; y < height; y++) {
-                for (let x = 0; x < width - 1; x++) {
-                    const leftIdx = (y * width + x) * 4;
-                    const rightIdx = (y * width + (x + 1)) * 4;
-                    
-                    // Since it's grayscale, R=G=B. Use R value.
-                    const leftVal = imageData[leftIdx];
-                    const rightVal = imageData[rightIdx];
-                    
-                    hash += leftVal < rightVal ? "1" : "0";
-                }
-            }
-            
-            // Cleanup and resolve
-            canvas.width = 0; canvas.height = 0;
-            resolve(hash);
-        };
-        img.onerror = () => resolve(null);
-        img.src = dataUrl;
-    });
-}
-
-/**
- * Calculates the Hamming distance between two binary hash strings.
- * Lower distance = more visually similar.
- */
-function compareHashes(hash1, hash2) {
-    if (!hash1 || !hash2 || hash1.length !== hash2.length) return 999;
-    let distance = 0;
-    for (let i = 0; i < hash1.length; i++) {
-        if (hash1[i] !== hash2[i]) distance++;
-    }
-    return distance;
-}
