@@ -293,7 +293,13 @@ const FileSystemModule = {
 
         // 2. Multi-attempt save logic for transient errors (e.g. file locks)
         const maxAttempts = 3;
+        const SAVE_TIMEOUT_MS = 2000; // Overall timeout for all retries combined
+        const saveStartTime = Date.now();
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (Date.now() - saveStartTime > SAVE_TIMEOUT_MS) {
+                console.warn("FileSystem: Save timed out after " + SAVE_TIMEOUT_MS + "ms");
+                break;
+            }
             try {
                 const fileHandle = await targetHandle.getFileHandle(filename, { create: true });
                 const writable = await fileHandle.createWritable();

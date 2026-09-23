@@ -115,6 +115,9 @@ describe('Screenshot Capture Logic', () => {
           <div id="screenshots-list" style="height: 800px;"></div>
         </div>
       `;
+      const scrollContainer = document.querySelector('.scrollable');
+      Object.defineProperty(scrollContainer, 'scrollHeight', { value: 1000, configurable: true });
+      Object.defineProperty(scrollContainer, 'clientHeight', { value: 400, configurable: true });
     });
 
     test('should scroll when user is near bottom', () => {

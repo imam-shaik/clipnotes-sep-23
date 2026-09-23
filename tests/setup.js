@@ -3,7 +3,7 @@
  * Initializes global mocks, utilities, and test helpers
  */
 
-import '@testing-library/jest-dom';
+require('@testing-library/jest-dom');
 
 // ==========================================
 // Chrome API Mocks
@@ -295,8 +295,14 @@ class MockImage {
   set src(value) {
     this._src = value;
     setTimeout(() => {
-      if (this.onload) {
-        this.onload();
+      if (value && (value.includes('invalid') || value === 'invalid-url')) {
+        if (this.onerror) {
+          this.onerror();
+        }
+      } else {
+        if (this.onload) {
+          this.onload();
+        }
       }
     }, 0);
   }

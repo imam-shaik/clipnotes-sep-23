@@ -8,16 +8,17 @@ window.TimeUtils = (function() {
      * @returns {string} Formatted time (HH:MM:SS or MM:SS)
      */
     function formatTime(ms) {
-        if (ms < 0) return "00:00";
+        if (ms === null || ms === undefined || isNaN(ms)) return "0:00";
+        if (ms <= 0) return "0:00";
         let seconds = Math.floor(ms / 1000);
         let minutes = Math.floor(seconds / 60);
         seconds = seconds % 60;
         let hours = Math.floor(minutes / 60);
         minutes = minutes % 60;
         if (hours > 0) {
-            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
         }
-        return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
     }
 
     /**
@@ -26,20 +27,25 @@ window.TimeUtils = (function() {
      * @returns {number} Time in milliseconds
      */
     function parseTimeToMs(timeStr) {
+        if (timeStr === null || timeStr === undefined) return 0;
+        timeStr = String(timeStr).trim();
         if (!timeStr) return 0;
 
-        // Handle "HH:MM:SS" or "MM:SS"
-        const parts = timeStr.split(':').map(Number);
+        const parts = timeStr.split(':');
+        if (parts.length > 3) return 0;
+        
+        const numericParts = parts.map(Number);
+        if (numericParts.some(isNaN)) return 0;
+
         if (parts.length === 2) {
-            return (parts[0] * 60 + parts[1]) * 1000;
+            return (numericParts[0] * 60 + numericParts[1]) * 1000;
         }
         if (parts.length === 3) {
-            return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
+            return (numericParts[0] * 3600 + numericParts[1] * 60 + numericParts[2]) * 1000;
         }
 
         // Handle raw seconds
-        const seconds = parseFloat(timeStr);
-        return isNaN(seconds) ? 0 : seconds * 1000;
+        return numericParts[0] * 1000;
     }
 
     /**
@@ -70,8 +76,21 @@ window.TimeUtils = (function() {
         if (options.showMs) {
             result += `.${milliseconds.toString().padStart(3, '0')}`;
         }
-        
         return result;
+    }
+
+    /**
+     * Normalize time input string
+     * @param {string} timeStr - Input time string
+     * @returns {string} Normalized time string or empty string if invalid
+     */
+    function normalizeTimeInput(timeStr) {
+        if (!timeStr || typeof timeStr !== 'string') return '';
+        const trimmed = timeStr.trim();
+        if (/^\d+:\d+(:\d+)?$/.test(trimmed)) {
+            return trimmed;
+        }
+        return '';
     }
 
     // Public API
@@ -79,6 +98,12 @@ window.TimeUtils = (function() {
         formatTime,
         formatTimeHelper: formatTime,
         parseTimeToMs,
-        formatTimeWithOptions
+        formatTimeWithOptions,
+        normalizeTimeInput
     };
 })();
+
+// Node.js/Jest support
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = window.TimeUtils;
+}

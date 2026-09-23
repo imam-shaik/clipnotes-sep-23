@@ -22,6 +22,8 @@ let isCaptionEnabled = false; // CC-on-Screenshot toggle: OFF by default (clean 
 let lastCaptureTime = 0; // Prevent spamming screenshots too fast
 let lastScreenshotHash = null; // Track perceptual hash of last captured image
 let lastScreenshotTime = 0; // Track time of last screenshot for time-based duplicate exemption
+let currentRehydrationTaskId = 0; // Track active rehydration task ID for cancellation support
+const currentlyRehydrating = new Set(); // Track screenshot IDs currently in the process of rehydrating
 let panelHeartbeatTimer = null;
 let disconnectedPollCount = 0;
 let detachedHostMissingCount = 0;
@@ -39,6 +41,8 @@ let savedScrollPositions = new Map(); // videoId -> scrollTop for scroll persist
 const DUPLICATE_HASH_THRESHOLD = 6; // Hamming distance threshold for "too similar"
 const FRAME_CHANGE_HASH_THRESHOLD = 12; // More tolerant for frame-change mode (ignore tiny changes/noise)
 const DUPLICATE_TIME_WINDOW_MS = 3000; // 3 seconds - allow duplicates after this time
+const AUTO_SCREENSHOT_DETECT_WINDOW_MS = 5000; // 5s window for auto-screenshot detection
+const NEAR_BOTTOM_THRESHOLD = 100; // Pixels from bottom to trigger auto-scroll
 const VIDEO_STATE_FILENAME = 'video_notes_state.json';
 const HISTORY_INDEX_FILENAME = 'history_index.json';
 const WATCH_LATER_FILENAME = 'watch_later_list.json';
@@ -210,47 +214,204 @@ setInterval(() => {
     });
 }, 60000);
 
-// FIX #2: Visibility change cleanup - clean up when tab is backgrounded
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-        // Aggressively clean up blob URLs when tab is backgrounded to free memory
-        const revokedCount = state.blobUrls.size;
-        state.blobUrls.forEach(url => {
-            try { URL.revokeObjectURL(url); } catch (e) {
-                console.debug('[Panel] Failed to revoke blob on visibility change:', url, e);
-            }
-        });
-        state.blobUrls.clear();
+// FIX #2: Unified Visibility & Focus Management
+let isPanelVisible = true;
+let visibilityCheckTimeout = null;
 
-        // Clear references in state so they are recognized as needing re-hydration
-        state.screenshots.forEach(shot => {
-            if (shot.dataUrl && shot.dataUrl.startsWith('blob:')) {
-                shot.dataUrl = null;
-            }
-        });
-
-        if (revokedCount > 0) {
-            console.debug('[Panel] Revoked', revokedCount, 'blob URLs and cleared references on tab background');
+function handlePanelVisibilityChange(newState) {
+    if (visibilityCheckTimeout) clearTimeout(visibilityCheckTimeout);
+    
+    visibilityCheckTimeout = setTimeout(() => {
+        if (newState === isPanelVisible) return;
+        
+        isPanelVisible = newState;
+        if (!isPanelVisible) {
+            console.log("[Visibility] Panel hidden/blurred - executing cleanup");
+            performPanelHiddenCleanup();
+        } else {
+            console.log("[Visibility] Panel visible/focused - executing rehydration");
+            rehydrateActiveScreenshots();
         }
-    } else if (document.visibilityState === 'visible') {
-        // Re-hydrate when returning to the tab
-        // GHOST BUG FIX: Only re-hydrate/re-render if we AREN'T actively typing in a note
-        const activeNode = document.activeElement;
-        const isEditingNote = activeNode && (activeNode.classList.contains('note-editor') || activeNode.isContentEditable);
+    }, 150); // 150ms debounce to filter rapid duplicate events
+}
 
-        if (currentVideoId && currentVideoTitle && state.screenshots.length > 0) {
-            if (isEditingNote) {
-                console.debug('[Panel] Visibility restored, but user is typing. Skipping full re-render to prevent focus loss.');
-                // We still want to re-hydrate the images eventually, but let's not wipe the DOM yet.
-                // Re-hydration of blobs happens in loadVideoState
-                loadVideoState(currentVideoId, currentVideoTitle, { lazy: true, skipRender: true });
-            } else {
-                console.debug('[Panel] Visibility restored, triggering lazy re-hydration');
-                loadVideoState(currentVideoId, currentVideoTitle, { lazy: true });
-            }
+function performPanelHiddenCleanup() {
+    const BLOB_MAX_AGE_MS = 5 * 60 * 1000;
+    const now = Date.now();
+    let revokedCount = 0;
+    
+    state.screenshots.forEach(shot => {
+        if (shot.dataUrl && shot.dataUrl.startsWith('blob:') && shot.createdAt && (now - shot.createdAt) > BLOB_MAX_AGE_MS) {
+            try { 
+                URL.revokeObjectURL(shot.dataUrl); 
+                state.blobUrls.delete(shot.dataUrl); 
+                revokedCount++; 
+            } catch (e) { /* ignore */ }
+            shot.dataUrl = null; // Mark as null to force rehydration when visible again
+            console.log(`[Rehydrate] Revoked blob URL for older screenshot: ${shot.filename}`);
         }
+    });
+    
+    // Revoke any orphaned tracked blobs
+    state.blobUrls.forEach(trackedBlob => {
+        const stillUsed = state.screenshots.some(s => s.dataUrl === trackedBlob);
+        if (!stillUsed) {
+            try { URL.revokeObjectURL(trackedBlob); } catch (e) { /* ignore */ }
+            state.blobUrls.delete(trackedBlob);
+        }
+    });
+
+    if (revokedCount > 0) {
+        console.debug('[Panel] Revoked', revokedCount, 'blob URLs and cleared references on tab background');
     }
+}
+
+// Register multiple triggers for visibility state transitions
+document.addEventListener('visibilitychange', () => {
+    handlePanelVisibilityChange(document.visibilityState === 'visible');
 });
+
+window.addEventListener('pageshow', () => {
+    handlePanelVisibilityChange(true);
+});
+
+window.addEventListener('pagehide', () => {
+    handlePanelVisibilityChange(false);
+});
+
+window.addEventListener('focus', () => {
+    handlePanelVisibilityChange(true);
+});
+
+window.addEventListener('blur', () => {
+    // Avoid false positives when user focuses on an input element inside the panel
+    setTimeout(() => {
+        if (!document.hasFocus() && document.visibilityState === 'hidden') {
+            handlePanelVisibilityChange(false);
+        }
+    }, 50);
+});
+
+// Surgical, targeted re-hydration helper
+async function rehydrateActiveScreenshots(options = {}) {
+    if (!FileSystemModule.dirHandle || !currentVideoId || !currentVideoTitle) return;
+
+    // Check directory permission
+    const permOpts = { mode: 'readwrite' };
+    if ((await FileSystemModule.dirHandle.queryPermission(permOpts)) !== 'granted') {
+        return;
+    }
+
+    const isPreview = options.isPreview === true;
+    const taskId = ++currentRehydrationTaskId;
+    console.log(`[Rehydrate] Started (Task ID: ${taskId})`);
+
+    try {
+        const subFolder = await FileSystemModule.getVideoFolderHandle(currentVideoTitle, false, currentVideoId);
+        if (!subFolder) {
+            console.log(`[Rehydrate] Finished (Task ID: ${taskId}) - No subfolder found`);
+            return;
+        }
+
+        // Filter screenshots that need rehydration
+        const toRehydrate = state.screenshots.filter(shot => {
+            if (shot.dataUrl) return false; // Skip if already has a valid Blob URL
+            if (currentlyRehydrating.has(shot.id)) {
+                console.log(`[Rehydrate] Skipped (already running) for: ${shot.filename}`);
+                return false;
+            }
+            if (shot.loadFailed) return false; // Skip failed to prevent infinite retries
+            return !!shot.filename;
+        });
+
+        if (toRehydrate.length === 0) {
+            console.log(`[Rehydrate] Finished (Task ID: ${taskId}) - Nothing to rehydrate`);
+            return;
+        }
+
+        // Concurrency limit of 3 to keep UI highly responsive
+        const CONCURRENCY_LIMIT = 3;
+        const batches = [];
+        for (let i = 0; i < toRehydrate.length; i += CONCURRENCY_LIMIT) {
+            batches.push(toRehydrate.slice(i, i + CONCURRENCY_LIMIT));
+        }
+
+        for (const batch of batches) {
+            // Check cancellation before processing the batch
+            if (taskId !== currentRehydrationTaskId) {
+                console.log(`[Rehydrate] Cancelled (Task ID: ${taskId}) - Obsoleted by a newer task`);
+                return;
+            }
+
+            await Promise.all(batch.map(async (shot) => {
+                currentlyRehydrating.add(shot.id);
+                try {
+                    const imgHandle = await subFolder.getFileHandle(shot.filename);
+                    const imgFile = await imgHandle.getFile();
+                    
+                    // Verify cancellation after disk read
+                    if (taskId !== currentRehydrationTaskId) return;
+
+                    const blobUrl = URL.createObjectURL(imgFile);
+                    
+                    // Verify state changes during await (e.g., screenshot deleted)
+                    const stillExists = state.screenshots.some(s => s.id === shot.id);
+                    if (!stillExists || taskId !== currentRehydrationTaskId) {
+                        console.log(`[Rehydrate] Cancelled - Screenshot ${shot.id} deleted or task obsoleted`);
+                        URL.revokeObjectURL(blobUrl);
+                        return;
+                    }
+
+                    shot.dataUrl = blobUrl;
+                    delete shot.missingOnDisk;
+                    delete shot.loadFailed;
+                    state.blobUrls.add(blobUrl);
+
+                    // Update UI element directly
+                    if (!isPreview) {
+                        const cardImg = document.getElementById(shot.id)?.querySelector('.card-img');
+                        if (cardImg) {
+                            cardImg.src = blobUrl;
+                            cardImg.classList.remove('loading');
+                        }
+                    } else {
+                        const shotIdAttr = shot.id || shot.filename;
+                        const previewImgs = document.querySelectorAll(`[data-shot-id="${shotIdAttr}"] .preview-shot-image`);
+                        previewImgs.forEach(img => {
+                            img.src = blobUrl;
+                            img.classList.remove('loading');
+                        });
+                    }
+                } catch (e) {
+                    console.error(`[Rehydrate] Failed for ${shot.filename}:`, e);
+                    shot.loadFailed = true;
+
+                    // Show missing placeholder immediately
+                    if (!isPreview) {
+                        const cardImg = document.getElementById(shot.id)?.querySelector('.card-img');
+                        if (cardImg) {
+                            cardImg.src = MISSING_SCREENSHOT_PLACEHOLDER_DATA_URL;
+                            cardImg.classList.remove('loading');
+                        }
+                    } else {
+                        const shotIdAttr = shot.id || shot.filename;
+                        const previewImgs = document.querySelectorAll(`[data-shot-id="${shotIdAttr}"] .preview-shot-image`);
+                        previewImgs.forEach(img => {
+                            img.src = MISSING_SCREENSHOT_PLACEHOLDER_DATA_URL;
+                            img.classList.remove('loading');
+                        });
+                    }
+                } finally {
+                    currentlyRehydrating.delete(shot.id);
+                }
+            }));
+        }
+
+        console.log(`[Rehydrate] Finished (Task ID: ${taskId})`);
+    } catch (err) {
+        console.error(`[Rehydrate] Error (Task ID: ${taskId}):`, err);
+    }
+}
 
 // --- UI Utilities ---
 function showToast(message, type = 'info') {
@@ -302,7 +463,68 @@ function safeSetInnerHTML(idOrEl, html) {
  * Calculates a 64-bit Difference Hash (dHash) for an image.
  * Resizes to 9x8, grayscales, and compares adjacent pixels.
  */
-async function calculateDHash(dataUrl) {
+async function calculateDHash(dataUrl, precomputedBlob = null) {
+    // PERFORMANCE: Use createImageBitmap with resize to avoid decoding full-resolution image.
+    // Falls back to Image-based approach if createImageBitmap is unavailable.
+    const WIDTH = 9;
+    const HEIGHT = 8;
+
+    async function computeHashFromBitmap(bitmap) {
+        const canvas = document.createElement('canvas');
+        canvas.width = WIDTH;
+        canvas.height = HEIGHT;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0, WIDTH, HEIGHT);
+        bitmap.close(); // Release memory immediately
+        const imageData = ctx.getImageData(0, 0, WIDTH, HEIGHT);
+        const pixels = imageData.data;
+        const gray = [];
+        for (let i = 0; i < pixels.length; i += 4) {
+            gray.push(0.299 * pixels[i] + 0.587 * pixels[i+1] + 0.114 * pixels[i+2]);
+        }
+        let hash = "";
+        for (let y = 0; y < HEIGHT; y++) {
+            for (let x = 0; x < WIDTH - 1; x++) {
+                hash += (gray[y * WIDTH + x] > gray[y * WIDTH + (x + 1)] ? "1" : "0");
+            }
+        }
+        let hexHash = "";
+        for (let i = 0; i < hash.length; i += 4) {
+            hexHash += parseInt(hash.substr(i, 4), 2).toString(16);
+        }
+        return hexHash;
+    }
+
+    return new Promise((resolve) => {
+        // Fast path: createImageBitmap decodes directly to target size (avoids full-resolution decode)
+        if (typeof createImageBitmap === 'function') {
+            try {
+                // Convert data URL to blob for createImageBitmap
+                const blob = precomputedBlob || (() => {
+                    const arr = dataUrl.split(',');
+                    const mimeMatch = arr[0].match(/:(.*?);/);
+                    const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+                    const bstr = atob(arr[1]);
+                    let n = bstr.length;
+                    const u8arr = new Uint8Array(n);
+                    while (n--) u8arr[n] = bstr.charCodeAt(n);
+                    return new Blob([u8arr], { type: mime });
+                })();
+                createImageBitmap(blob, { resizeWidth: WIDTH, resizeHeight: HEIGHT, resizeQuality: 'low' })
+                    .then((bitmap) => computeHashFromBitmap(bitmap))
+                    .then(resolve)
+                    .catch(() => _dHashViaImage(dataUrl).then(resolve));
+                return;
+            } catch (e) {
+                // Fallback to Image-based approach
+            }
+        }
+        _dHashViaImage(dataUrl).then(resolve);
+    });
+}
+
+/** Fallback dHash using Image element (slower - decodes full image) */
+function _dHashViaImage(dataUrl) {
     return new Promise((resolve) => {
         const img = new Image();
         img.onload = () => {
@@ -312,31 +534,19 @@ async function calculateDHash(dataUrl) {
             canvas.width = width;
             canvas.height = height;
             const ctx = canvas.getContext('2d');
-            
-            // Draw resized
             ctx.drawImage(img, 0, 0, width, height);
-            
-            // Get grayscale data
             const imageData = ctx.getImageData(0, 0, width, height);
             const pixels = imageData.data;
             const gray = [];
             for (let i = 0; i < pixels.length; i += 4) {
-                // Standard luminance weights
-                const g = 0.299 * pixels[i] + 0.587 * pixels[i+1] + 0.114 * pixels[i+2];
-                gray.push(g);
+                gray.push(0.299 * pixels[i] + 0.587 * pixels[i+1] + 0.114 * pixels[i+2]);
             }
-            
-            // Compute differences
             let hash = "";
             for (let y = 0; y < height; y++) {
                 for (let x = 0; x < width - 1; x++) {
-                    const left = gray[y * width + x];
-                    const right = gray[y * width + (x + 1)];
-                    hash += (left > right ? "1" : "0");
+                    hash += (gray[y * width + x] > gray[y * width + (x + 1)] ? "1" : "0");
                 }
             }
-            
-            // Convert to hex for compact storage
             let hexHash = "";
             for (let i = 0; i < hash.length; i += 4) {
                 hexHash += parseInt(hash.substr(i, 4), 2).toString(16);
@@ -365,6 +575,13 @@ function getHammingDistance(h1, h2) {
 }
 
 function isDuplicate(newHash, options = {}) {
+    if (!state.screenshots || state.screenshots.length === 0) {
+        if (lastScreenshotHash !== null) {
+            console.log("[Duplicate] Hash reset: screenshot list is empty");
+        }
+        lastScreenshotHash = null;
+        return false;
+    }
     if (!lastScreenshotHash) return false;
 
     const ignoreTimeWindow = options.ignoreTimeWindow === true;
@@ -376,7 +593,12 @@ function isDuplicate(newHash, options = {}) {
 
     const distance = getHammingDistance(newHash, lastScreenshotHash);
     console.log(`[dHash] Distance: ${distance}, Time: ${timeSinceLast}ms (Threshold: >${DUPLICATE_HASH_THRESHOLD})`);
-    return distance <= DUPLICATE_HASH_THRESHOLD;
+    
+    const duplicateMatch = distance <= DUPLICATE_HASH_THRESHOLD;
+    if (duplicateMatch) {
+        console.log(`[Duplicate] Match found: distance ${distance} <= threshold ${DUPLICATE_HASH_THRESHOLD}`);
+    }
+    return duplicateMatch;
 }
 
 function isMissingFileSystemEntryError(err) {
@@ -1518,7 +1740,7 @@ async function handleAreaCapture() {
                 if (subFolder) {
                     const saved = await FileSystemModule.saveFile(filename, blob, subFolder);
                     if (saved && targetVideoId === currentVideoId) {
-                        addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, false);
+                        addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, false, blob /* precomputedBlob: skip redundant atob */);
                         await saveVideoState(targetVideoId, targetVideoTitle);
                     } else if (!saved) {
                         showFolderPermissionBannerIfNeeded();
@@ -1725,6 +1947,8 @@ function initOptInToggle() {
 
     toggle.addEventListener('change', (e) => {
         setNotebookToggleState(!!e.target.checked);
+        lastScreenshotHash = null;
+        console.log("[Duplicate] Hash reset: Notebook toggle changed");
         if (isNotebookEnabled && currentVideoId && FileSystemModule.dirHandle) {
             // If they just turned it on, auto-save state to create the folder immediately
             saveVideoState(currentVideoId);
@@ -1974,7 +2198,7 @@ async function handleCapture(isAuto = false) {
                         chrome.tabs.sendMessage(tabId, { action: 'hideCaptions' }, () => {});
                     }
                     
-                    finalImageData = await chrome.tabs.captureVisibleTab(captureWinId, { format: 'png', quality: 100 });
+                    finalImageData = await chrome.tabs.captureVisibleTab(captureWinId, { format: 'jpeg', quality: 90 });
                     
                     // Restore captions after capture (non-blocking)
                     if (!activeCaptionState) {
@@ -2002,8 +2226,9 @@ async function handleCapture(isAuto = false) {
                 return; // Exit inner try, finally will run
             }
 
-            // --- PERCEPTUAL DUPLICATE DETECTION (dHash) ---
-            const newHash = await calculateDHash(finalImageData);
+            // --- PERFORMANCE: Compute blob once, then use for both dHash and save ---
+            const blob = await dataURLtoBlobAsync(finalImageData);
+            const newHash = await calculateDHash(finalImageData, blob);
             const isAutoFrameMode = isAuto && autoScreenshotMode === 'frame';
 
             // Frame-mode: compare against last sampled frame to detect visual changes
@@ -2016,35 +2241,29 @@ async function handleCapture(isAuto = false) {
                 if (lastAutoFrameHash) {
                     const sampleDistance = getHammingDistance(newHash, lastAutoFrameHash);
                     if (sampleDistance <= FRAME_CHANGE_HASH_THRESHOLD) {
-                        // Frame unchanged - skip capture BUT update reference for next comparison
-                        // This ensures gradual changes (fades, pans, zooms) are tracked properly
                         console.log(`[AutoShot] Frame unchanged (distance=${sampleDistance}); skipping.`);
-                        lastAutoFrameHash = newHash; // CRITICAL FIX: Update reference even on skip
-                        return; // Exit inner try, finally will run
+                        lastAutoFrameHash = newHash;
+                        return;
                     }
-                    // Frame changed significantly - update reference and allow save
                     console.log(`[AutoShot] Frame changed (distance=${sampleDistance}); capturing.`);
                     lastAutoFrameHash = newHash;
                 } else {
-                    // First frame in frame-change mode - set as reference and capture
                     console.log("[AutoShot] First frame - setting reference.");
                     lastAutoFrameHash = newHash;
                 }
-                // In frame mode, skip the standard isDuplicate() check entirely
-                // to avoid conflicts between lastAutoFrameHash and lastScreenshotHash
             } else {
-                // Timer mode or manual capture - use standard duplicate detection
                 if (newHash && isDuplicate(newHash)) {
                     if (isAuto) {
                         console.log("[AutoShot] Skipping duplicate frame.");
                     } else {
                         showToast("Skipping duplicate screenshot.", "info");
                     }
-                    return; // Exit inner try, finally will run
+                    return;
                 }
             }
 
-            const blob = await dataURLtoBlobAsync(finalImageData);
+            // Yield to browser before expensive I/O operations
+            await new Promise(r => setTimeout(r, 0));
             const timeF = formatTime(finalTimeMs);
             const safeTimeStr = timeF.replace(/:/g, '-');
             const fileUnique = Date.now().toString().slice(-4);
@@ -2072,7 +2291,7 @@ async function handleCapture(isAuto = false) {
                 // Track screenshot time for duplicate detection exemption
                 lastScreenshotTime = Date.now();
                 // Let addScreenshotToUI decide auto-scroll behavior (it already detects auto shots).
-                addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, false);
+                addScreenshotToUI(finalImageData, timeF, finalTimeMs, filename, "", false, null, null, false, blob);
                 lastScreenshotHash = newHash; // Update tracker for next comparison
             } else {
                 // If save failed but didn't throw (retries exhausted or permission lost)
@@ -3126,7 +3345,7 @@ async function handleCreateBoard() {
         console.error("Board canvas extraction failed:", e);
         dataUrl = TRANSPARENT_PIXEL_DATA_URL; // Fallback
     }
-    const blob = await dataURLtoBlobAsync(dataUrl);
+    const blob = precomputedBlob || await dataURLtoBlobAsync(dataUrl);
 
     // Get current time from content script
     let timeMs = 0;
@@ -3183,7 +3402,7 @@ function normalizeScreenshotRecord(shot, index = 0) {
 }
 
 // Add screenshot to the UI list and local state
-async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml = "", isRestoring = false, existingId = null, existingCreatedAt = null, skipScroll = false) {
+async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNoteHtml = "", isRestoring = false, existingId = null, existingCreatedAt = null, skipScroll = false, precomputedBlob = null) {
     const shotId = existingId || `shot-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     let finalDataUrl = dataUrl;
@@ -3226,12 +3445,12 @@ async function addScreenshotToUI(dataUrl, timeStr, timeMs, filename, initialNote
             const scrollTopBefore = scrollContainer.scrollTop;
             const clientHeight = scrollContainer.clientHeight;
             const scrollHeightBefore = scrollContainer.scrollHeight;
-            const wasNearBottom = (scrollHeightBefore - scrollTopBefore - clientHeight) < 150;
+            const wasNearBottom = (scrollHeightBefore - scrollTopBefore - clientHeight) < NEAR_BOTTOM_THRESHOLD;
 
             // Detect auto-screenshots to suppress scroll thrashing during review
             const isAutoScreenshot = filename.startsWith('AutoShot_') ||
                                      filename.startsWith('AreaShot_') ||
-                                     (lastAutoScreenshotTime > 0 && (Date.now() - lastAutoScreenshotTime) < 5000);
+                                     (lastAutoScreenshotTime > 0 && (Date.now() - lastAutoScreenshotTime) < AUTO_SCREENSHOT_DETECT_WINDOW_MS);
 
             // Manual shots ALWAYS scroll into view. Auto-shots only scroll if near bottom.
             const shouldAutoScroll = !skipScroll && (isAutoScreenshot ? wasNearBottom : true);
@@ -6794,7 +7013,7 @@ async function saveVideoStateExecution(forVideoId = null, forTitle = null) {
             return;
         }
 
-        await upsertHistoryIndexEntry(snapshot, subFolder.name);
+        upsertHistoryIndexEntry(snapshot, subFolder.name).catch(e => console.warn("[Panel] History index update failed:", e));
     } catch (e) {
         console.error("Failed to auto-save state", e);
     }
@@ -6810,6 +7029,11 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
     const isPreview = (typeof isPreviewOrOptions === 'object') ? !!isPreviewOrOptions.isPreview : !!isPreviewOrOptions;
     const isLazy = (typeof isPreviewOrOptions === 'object') ? !!isPreviewOrOptions.lazy : false;
     const skipRender = (typeof isPreviewOrOptions === 'object') ? !!isPreviewOrOptions.skipRender : false;
+
+    if (!isLazy) {
+        lastScreenshotHash = null;
+        console.log("[Duplicate] Hash reset: loadVideoState started (non-lazy)");
+    }
 
     // console.log("[STABILITY] loadVideoState starting for:", forVideoId, "isPreview:", isPreview, "isLazy:", isLazy);
     try {
@@ -6883,118 +7107,8 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
                 state.screenshots = loadedState.screenshots.map((shot, idx) => normalizeScreenshotRecord(shot, idx));
             }
 
-            const missingFilesDuringRehydration = [];
-            const removedMissingShotIds = [];
-            const permissionDeniedDuringRehydration = [];
-            const otherRehydrationFailures = [];
-
-            // PARALLEL REHYDRATION with concurrency limit to prevent UI hang
-            // Process images in batches of 10 to avoid overwhelming file system
-            const CONCURRENCY_LIMIT = 10;
-            
-            async function processRehydrationBatch(batch) {
-                await Promise.all(batch.map(async (shot) => {
-                    if (!shot.dataUrl && shot.filename) {
-                        try {
-                            const imgHandle = await subFolder.getFileHandle(shot.filename);
-                            const imgFile = await imgHandle.getFile();
-                            const blobUrl = URL.createObjectURL(imgFile);
-                            shot.dataUrl = blobUrl;
-                            delete shot.missingOnDisk;
-                            state.blobUrls.add(blobUrl);
-
-                            // Update UI if already rendered
-                            if (!isPreview) {
-                                const cardImg = document.getElementById(shot.id)?.querySelector('.card-img');
-                                if (cardImg) {
-                                    cardImg.src = blobUrl;
-                                    cardImg.classList.remove('loading');
-                                }
-                            }
-
-                            if (isPreview) {
-                                const shotIdAttr = shot.id || shot.filename;
-                                const previewImgs = document.querySelectorAll(`[data-shot-id="${shotIdAttr}"] .preview-shot-image`);
-                                previewImgs.forEach(img => {
-                                    img.src = blobUrl;
-                                    img.classList.remove('loading');
-                                });
-                            }
-                        } catch (e) {
-                            if (isMissingFileSystemEntryError(e)) {
-                                removedMissingShotIds.push(shot.id);
-                                missingFilesDuringRehydration.push(shot.filename);
-                                return;
-                            }
-                            if (isPermissionDeniedFileSystemError(e)) {
-                                permissionDeniedDuringRehydration.push(shot.filename);
-                                return;
-                            }
-
-                            const errName = String(e?.name || "UnknownError");
-                            const errMsg = String(e?.message || e || "Unknown rehydration failure");
-                            otherRehydrationFailures.push(`${shot.filename}: ${errName} - ${errMsg}`);
-                        }
-                    }
-                }));
-            }
-            
-            // Split into batches
-            const batches = [];
-            for (let i = 0; i < state.screenshots.length; i += CONCURRENCY_LIMIT) {
-                batches.push(state.screenshots.slice(i, i + CONCURRENCY_LIMIT));
-            }
-            
-            // Process batches sequentially
-            for (const batch of batches) {
-                await processRehydrationBatch(batch);
-            }
-
-            if (removedMissingShotIds.length > 0) {
-                const removedSet = new Set(removedMissingShotIds);
-                state.screenshots = state.screenshots.filter((shot) => !removedSet.has(shot.id));
-
-                if (isPreview) {
-                    removedSet.forEach((shotId) => {
-                        const previewWrap = document.querySelector(`[data-shot-id="${shotId}"]`);
-                        if (previewWrap) previewWrap.remove();
-                    });
-                }
-            }
-
-            if (missingFilesDuringRehydration.length > 0) {
-                if (ENABLE_REHYDRATION_DEBUG_LOGS) {
-                    console.info(
-                        `[REHYDRATION] Removed ${missingFilesDuringRehydration.length} screenshot record(s) because files are missing on disk.`,
-                        missingFilesDuringRehydration
-                    );
-                }
-                if (!isPreview) {
-                    // Persist cleanup immediately so stale entries do not reappear on next open.
-                    // Use saveVideoState to respect mutex lock and prevent race conditions
-                    saveVideoState(forVideoId, forTitle);
-                }
-            }
-
-            if (permissionDeniedDuringRehydration.length > 0) {
-                if (ENABLE_REHYDRATION_DEBUG_LOGS) {
-                    console.warn(
-                        `[REHYDRATION] Permission denied for ${permissionDeniedDuringRehydration.length} screenshot file(s).`
-                    );
-                }
-                if (!isPreview) {
-                    showFolderPermissionBannerIfNeeded();
-                }
-            }
-
-            if (otherRehydrationFailures.length > 0) {
-                if (ENABLE_REHYDRATION_DEBUG_LOGS) {
-                    console.warn(
-                        `[REHYDRATION] ${otherRehydrationFailures.length} screenshot file(s) could not be rehydrated.`,
-                        otherRehydrationFailures
-                    );
-                }
-            }
+            // Trigger asynchronous parallel rehydration with custom options
+            rehydrateActiveScreenshots(isPreviewOrOptions);
 
             // Sort by capture order
             state.screenshots.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));

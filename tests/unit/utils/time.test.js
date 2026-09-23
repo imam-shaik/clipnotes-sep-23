@@ -3,7 +3,7 @@
  * Tests for utils/time.js - time formatting and parsing functions
  */
 
-import { formatTime, parseTimeToMs, normalizeTimeInput } from '../../utils/time';
+const { formatTime, parseTimeToMs, normalizeTimeInput } = require('../../../utils/time');
 
 describe('Time Utilities', () => {
   describe('formatTime', () => {

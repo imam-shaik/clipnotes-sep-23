@@ -10,7 +10,7 @@ describe('PDF Export - Critical Path Tests', () => {
       this.orientation = options?.orientation || 'portrait';
       this.unit = options?.unit || 'mm';
       this.format = options?.format || 'a4';
-      this.pages = [];
+      this.pages = [{ elements: [] }];
       this.currentPage = 1;
     }
 
@@ -80,7 +80,6 @@ describe('PDF Export - Critical Path Tests', () => {
     test('should add pages correctly', () => {
       const doc = new MockJsPDF();
       
-      doc.addPage();
       doc.addPage();
       doc.addPage();
       
@@ -257,7 +256,6 @@ describe('PDF Export - Critical Path Tests', () => {
       const doc = new MockJsPDF();
       
       // Add cover page
-      doc.addPage();
       doc.text('Video Notes', 10, 20);
       
       expect(doc.pages.length).toBe(1);
@@ -271,7 +269,6 @@ describe('PDF Export - Critical Path Tests', () => {
         { title: 'Chapter 2', page: 2 }
       ];
 
-      doc.addPage();
       doc.text('Table of Contents', 10, 10);
       
       tocEntries.forEach((entry, i) => {
@@ -286,11 +283,10 @@ describe('PDF Export - Critical Path Tests', () => {
       const doc = new MockJsPDF();
       const screenshots = Array(5).fill(null).map((_, i) => ({
         id: `shot-${i}`,
-        dataUrl: 'data:image;base64,test',
+        dataUrl: 'data:image/base64,test',
         timeFormatted: '00:00'
       }));
 
-      doc.addPage();
       screenshots.forEach((shot, i) => {
         doc.addImage(shot.dataUrl, 'PNG', 10, 10 + (i * 50), 100, 40);
       });
@@ -303,12 +299,11 @@ describe('PDF Export - Critical Path Tests', () => {
       const doc = new MockJsPDF();
       const shotWithNote = {
         id: 'shot-1',
-        dataUrl: 'data:image;base64,test',
+        dataUrl: 'data:image/base64,test',
         timeFormatted: '00:00',
         noteHtml: '<p>Important note</p>'
       };
 
-      doc.addPage();
       doc.addImage(shotWithNote.dataUrl, 'PNG', 10, 10, 100, 40);
       doc.text('Important note', 10, 60);
 

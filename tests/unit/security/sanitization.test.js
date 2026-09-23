@@ -8,30 +8,135 @@ describe('HTML Sanitization - XSS Prevention', () => {
   function sanitizeNoteHtml(html) {
     if (!html || typeof html !== 'string') return "";
 
-    const allowedTags = new Set([
-      'b', 'i', 'em', 'strong', 'u', 'span', 'div', 'p', 'br', 'hr',
-      'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-      'mark', 'code', 'pre', 'blockquote', 'a'
-    ]);
-
-    const dangerousTags = new Set([
-      'script', 'iframe', 'object', 'embed', 'form', 'input',
-      'button', 'select', 'textarea', 'style', 'link', 'meta',
-      'base', 'applet', 'frame', 'frameset', 'layer', 'ilayer'
-    ]);
-
     const tempDiv = document.createElement('div');
     tempDiv.innerHTML = html;
 
-    // Remove dangerous tags
-    dangerousTags.forEach(tag => {
-      const elements = tempDiv.getElementsByTagName(tag);
-      while (elements.length > 0) {
-        elements[0].parentNode.removeChild(elements[0]);
-      }
-    });
+    const allowedTags = new Set([
+        'b', 'i', 'em', 'strong', 'u', 'span', 'div', 'p', 'br', 'hr',
+        'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'mark', 'code', 'pre', 'blockquote', 'a'
+    ]);
 
-    return tempDiv.innerHTML;
+    const allowedAttrs = {
+        '*': ['style', 'class'],
+        'a': ['href', 'title', 'target'],
+        'span': ['style', 'class'],
+        'div': ['style', 'class'],
+        'p': ['style', 'class'],
+        'h1': ['style', 'class'],
+        'h2': ['style', 'class'],
+        'h3': ['style', 'class'],
+        'h4': ['style', 'class'],
+        'h5': ['style', 'class'],
+        'h6': ['style', 'class'],
+        'mark': ['style', 'class'],
+        'code': ['style', 'class'],
+        'pre': ['style', 'class'],
+        'blockquote': ['style', 'class']
+    };
+
+    const allowedStyles = new Set([
+        'color', 'background-color', 'background',
+        'font-weight', 'font-style', 'font-family', 'font-size',
+        'text-decoration', 'text-align',
+        'margin', 'padding', 'border',
+        'white-space', 'word-wrap', 'line-height'
+    ]);
+
+    const dangerousTags = new Set([
+        'script', 'iframe', 'object', 'embed', 'form', 'input',
+        'button', 'select', 'textarea', 'style', 'link', 'meta',
+        'base', 'applet', 'frame', 'frameset', 'layer', 'ilayer'
+    ]);
+
+    function sanitizeNode(node) {
+        if (node.nodeType === 3) { // Node.TEXT_NODE
+            return node.cloneNode();
+        }
+
+        if (node.nodeType !== 1) { // Node.ELEMENT_NODE
+            return null;
+        }
+
+        const tagName = node.nodeName.toLowerCase();
+
+        if (dangerousTags.has(tagName)) {
+            return null;
+        }
+
+        if (!allowedTags.has(tagName) && tagName !== 'div') {
+            const fragment = document.createDocumentFragment();
+            Array.from(node.childNodes).forEach(child => {
+                const sanitized = sanitizeNode(child);
+                if (sanitized) fragment.appendChild(sanitized);
+            });
+            return fragment;
+        }
+
+        const sanitizedEl = document.createElement(tagName);
+
+        Array.from(node.attributes).forEach(attr => {
+            const attrName = attr.name.toLowerCase();
+            const allowedForTag = allowedAttrs[tagName] || allowedAttrs['*'] || [];
+
+            if (allowedForTag.includes(attrName)) {
+                if (attrName === 'style') {
+                    const sanitizedStyle = sanitizeStyleAttribute(attr.value);
+                    if (sanitizedStyle) {
+                        sanitizedEl.setAttribute(attrName, sanitizedStyle);
+                    }
+                } else if (attrName === 'href') {
+                    const hrefValue = attr.value.trim();
+                    if (hrefValue.startsWith('#') ||
+                        hrefValue.startsWith('http://') ||
+                        hrefValue.startsWith('https://') ||
+                        hrefValue.startsWith('mailto:')) {
+                        sanitizedEl.setAttribute(attrName, hrefValue);
+                    }
+                } else {
+                    sanitizedEl.setAttribute(attrName, attr.value);
+                }
+            }
+        });
+
+        Array.from(node.childNodes).forEach(child => {
+            const sanitized = sanitizeNode(child);
+            if (sanitized) sanitizedEl.appendChild(sanitized);
+        });
+
+        return sanitizedEl;
+    }
+
+    function sanitizeStyleAttribute(styleValue) {
+        if (!styleValue || typeof styleValue !== 'string') return '';
+
+        const declarations = styleValue.split(';');
+        const sanitized = [];
+
+        declarations.forEach(declaration => {
+            const colonIndex = declaration.indexOf(':');
+            if (colonIndex === -1) return;
+
+            const property = declaration.substring(0, colonIndex).trim().toLowerCase();
+            const value = declaration.substring(colonIndex + 1).trim();
+
+            if (allowedStyles.has(property)) {
+                if (!value.includes('url(') &&
+                    !value.includes('expression(') &&
+                    !value.includes('javascript:')) {
+                    sanitized.push(`${property}: ${value}`);
+                }
+            }
+        });
+
+        return sanitized.join('; ');
+    }
+
+    const sanitized = sanitizeNode(tempDiv);
+    if (!sanitized) return '';
+
+    const result = sanitized.nodeType === 1 ? sanitized.innerHTML : sanitized.textContent;
+    return result || '';
   }
 
   describe('Dangerous Tag Removal', () => {
