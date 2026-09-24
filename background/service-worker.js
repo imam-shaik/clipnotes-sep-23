@@ -637,6 +637,8 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
 async function openNotesPanelForTab(tabId, hostWindowIdHint = null) {
   if (!Number.isInteger(tabId)) return false;
 
+  const windowId = Number.isInteger(hostWindowIdHint) ? hostWindowIdHint : null;
+
   if (chrome.sidePanel?.setOptions && chrome.sidePanel?.open) {
     try {
       // Session claim: panel adopts this if Chrome strips ?tabId= from the path.
@@ -644,14 +646,17 @@ async function openNotesPanelForTab(tabId, hostWindowIdHint = null) {
         try {
           await chrome.storage.session.set({
             pendingSidePanelTabId: tabId,
+            pendingSidePanelWindowId: windowId,
             pendingSidePanelToken: `${tabId}:${Date.now()}`,
             pendingSidePanelOpenedAt: Date.now()
           });
         } catch (_) { /* session storage optional */ }
       }
+      const pathQuery = new URLSearchParams({ tabId: String(tabId) });
+      if (Number.isInteger(windowId)) pathQuery.set('hostWindowId', String(windowId));
       await chrome.sidePanel.setOptions({
         tabId,
-        path: `sidepanel/panel.html?tabId=${tabId}`,
+        path: `sidepanel/panel.html?${pathQuery.toString()}`,
         enabled: true
       });
       await chrome.sidePanel.open({ tabId });
@@ -680,6 +685,7 @@ async function closeNotesPanelForTab(tabId) {
     try {
       await chrome.storage.session.remove([
         'pendingSidePanelTabId',
+        'pendingSidePanelWindowId',
         'pendingSidePanelToken',
         'pendingSidePanelOpenedAt'
       ]);
@@ -979,6 +985,23 @@ chrome.windows.onBoundsChanged.addListener((window) => {
 });
 
 const autoOpenTimers = new Map();
+
+// Keep per-tab side panel paths unique so switching tabs reloads the panel
+// bound to THAT tab (Chrome may skip reload when path strings match).
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.url || !tab.url.includes('youtube.com/watch')) return;
+    if (!chrome.sidePanel?.setOptions) return;
+    const pathQuery = new URLSearchParams({ tabId: String(tabId) });
+    if (Number.isInteger(tab.windowId)) pathQuery.set('hostWindowId', String(tab.windowId));
+    await chrome.sidePanel.setOptions({
+      tabId,
+      path: `sidepanel/panel.html?${pathQuery.toString()}`,
+      enabled: true
+    });
+  } catch (_) { /* tab may be gone */ }
+});
 
 // Auto-open logic on navigation
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {

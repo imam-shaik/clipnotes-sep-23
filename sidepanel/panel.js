@@ -5,11 +5,21 @@ let currentVideoId = null;
 let currentVideoTitle = null;
 let currentTabId = null;
 const initialPanelUrlParams = new URLSearchParams(window.location.search);
+
+// Number(null) === 0 — never treat a missing query param as tab/window id 0.
+function parsePositiveIntParam(params, key) {
+    const raw = params.get(key);
+    if (raw === null || raw === '') return null;
+    const n = Number(raw);
+    return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 // Mutable so native side panels can adopt a tabId from storage.session when
 // Chrome strips the query string from sidePanel.setOptions({ path }).
-let boundTabId = Number(initialPanelUrlParams.get('tabId'));
+let boundTabId = parsePositiveIntParam(initialPanelUrlParams, 'tabId');
+// Host browser window for THIS panel instance (native side panel or detached).
+let hostWindowId = parsePositiveIntParam(initialPanelUrlParams, 'hostWindowId');
 const panelMode = initialPanelUrlParams.get('mode') || '';
-const launchedForHostWindowId = Number(initialPanelUrlParams.get('hostWindowId'));
 const isDetachedPanel = panelMode === 'detached';
 if (Number.isInteger(boundTabId)) {
     currentTabId = boundTabId;
@@ -19,11 +29,16 @@ function getBoundTabId() {
     return Number.isInteger(boundTabId) ? boundTabId : null;
 }
 
+function getHostWindowId() {
+    return Number.isInteger(hostWindowId) ? hostWindowId : null;
+}
+
 async function clearPendingSidePanelClaim() {
     try {
         if (!chrome?.storage?.session?.remove) return;
         await chrome.storage.session.remove([
             'pendingSidePanelTabId',
+            'pendingSidePanelWindowId',
             'pendingSidePanelToken',
             'pendingSidePanelOpenedAt'
         ]);
@@ -44,20 +59,58 @@ async function claimPendingSidePanelTabIfNeeded() {
 
         const data = await chrome.storage.session.get([
             'pendingSidePanelTabId',
+            'pendingSidePanelWindowId',
             'pendingSidePanelToken',
             'pendingSidePanelOpenedAt'
         ]);
         const pending = Number(data?.pendingSidePanelTabId);
+        const pendingWin = Number(data?.pendingSidePanelWindowId);
         const openedAt = Number(data?.pendingSidePanelOpenedAt);
         // Ignore claims older than 5s (stale after a crashed/slow panel load).
         const fresh = Number.isFinite(openedAt) && (Date.now() - openedAt) <= 5000;
-        if (Number.isInteger(pending) && fresh) {
+        if (Number.isInteger(pending) && pending > 0 && fresh) {
             boundTabId = pending;
             currentTabId = pending;
+            if (!Number.isInteger(hostWindowId) && Number.isInteger(pendingWin) && pendingWin > 0) {
+                hostWindowId = pendingWin;
+            }
         }
         await clearPendingSidePanelClaim();
     } catch (err) {
         console.debug('[Panel] Session tab claim failed:', err);
+    }
+}
+
+// Native side panel opened via default_path (no ?tabId=): bind to the active
+// YouTube watch tab in THIS panel's browser window — never a global "latest" tab.
+async function adoptTabFromOwnWindowIfNeeded() {
+    if (Number.isInteger(boundTabId)) return;
+    if (isDetachedPanel) return;
+    try {
+        if (!Number.isInteger(hostWindowId)) {
+            const win = await chrome.windows.getCurrent();
+            if (Number.isInteger(win?.id)) hostWindowId = win.id;
+        }
+        if (!Number.isInteger(hostWindowId)) return;
+
+        const [active] = await chrome.tabs.query({ windowId: hostWindowId, active: true });
+        if (active && isYouTubeWatchUrl(active.url)) {
+            boundTabId = active.id;
+            currentTabId = active.id;
+            return;
+        }
+
+        const watchTabs = await chrome.tabs.query({
+            windowId: hostWindowId,
+            url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
+        });
+        const watch = pickBestYouTubeWatchTab(watchTabs);
+        if (watch && Number.isInteger(watch.id)) {
+            boundTabId = watch.id;
+            currentTabId = watch.id;
+        }
+    } catch (err) {
+        console.debug('[Panel] Own-window tab adopt failed:', err);
     }
 }
 let videoScrapeTimer = null;
@@ -189,6 +242,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Preview mode is a full-tab viewer — never claims a side-panel tab or heartbeats.
         if (panelMode !== 'preview') {
             await claimPendingSidePanelTabIfNeeded();
+            await adoptTabFromOwnWindowIfNeeded();
 
             // Notify content script that panel is open
             if (Number.isInteger(boundTabId)) {
@@ -770,10 +824,9 @@ function shouldTrackSenderTab(tab) {
     }
 
     if (
-        isDetachedPanel &&
-        Number.isInteger(launchedForHostWindowId) &&
+        Number.isInteger(hostWindowId) &&
         Number.isInteger(tab.windowId) &&
-        tab.windowId !== launchedForHostWindowId
+        tab.windowId !== hostWindowId
     ) {
         return false;
     }
@@ -821,7 +874,7 @@ function pickBestYouTubeWatchTab(candidates) {
     const scored = list.map((tab) => {
         let score = 0;
         if (Number.isInteger(boundTabId) && tab.id === boundTabId) score += 300;
-        if (Number.isInteger(launchedForHostWindowId) && tab.windowId === launchedForHostWindowId) score += 150;
+        if (Number.isInteger(hostWindowId) && tab.windowId === hostWindowId) score += 150;
         if (Number.isInteger(currentTabId) && tab.id === currentTabId) score += 80;
         if (currentVideoId && extractVideoIdFromWatchUrl(tab.url) === currentVideoId) score += 120;
         return { tab, score };
@@ -1028,6 +1081,7 @@ async function checkMetadataImmediate() {
     // Increased retry count for immediate check to handle initialization
     const response = await sendMessageWithRetry(tabId, { action: 'getMetadata' }, 5, 400);
     if (response && response.videoId) {
+        // Only accept metadata from the tab we asked.
         handleMetadataResponse(response);
     }
 }
@@ -1035,11 +1089,20 @@ async function checkMetadataImmediate() {
 function handleMetadataResponse(response) {
     if (!response || !response.videoId) return;
 
+    const rawTitle = String(response.title || '').trim();
+    // Reject notification/homepage junk titles: "(11) YouTube", bare "YouTube", etc.
+    if (/^\(\d+\)\s*YouTube$/i.test(rawTitle) || rawTitle === 'YouTube') {
+        return;
+    }
+    // Reject non-watch URLs when provided.
+    if (response.url && !isYouTubeWatchUrl(response.url)) {
+        return;
+    }
+
     // Better generic check: skip if it's literally just "YouTube" or "YouTube Video"
-    const isGeneric = !response.title ||
-        response.title === "YouTube" ||
-        response.title === "YouTube Video" ||
-        response.title === "";
+    const isGeneric = !rawTitle ||
+        rawTitle === "YouTube Video" ||
+        rawTitle === "";
 
     // Update basic metadata info in DOM
     const titleForUI = response.title || "Loading...";
@@ -1301,21 +1364,27 @@ async function resolveActiveYouTubeTabId() {
             return currentTabId;
         }
 
-        // Bound tab is closed or not on /watch: never rebind to a foreign window's tab.
-        if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+        // Bound tab closed/not on /watch: rebind only within THIS panel's host window.
+        if (Number.isInteger(hostWindowId)) {
             try {
-                const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: launchedForHostWindowId });
-                if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url)) {
-                    currentTabId = tabInHostWindow.id;
-                    return currentTabId;
+                const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: hostWindowId });
+                if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url) && tabInHostWindow.id !== boundTabId) {
+                    // Only rebind for detached panels; native side panel keeps its tabId
+                    // so Chrome can swap panels correctly on tab switch.
+                    if (isDetachedPanel) {
+                        currentTabId = tabInHostWindow.id;
+                        return currentTabId;
+                    }
                 }
             } catch (e) {
                 console.debug('[Panel] Failed to query active tab in host window:', e);
             }
+        }
 
+        if (isDetachedPanel && Number.isInteger(hostWindowId)) {
             try {
                 const hostTabs = await chrome.tabs.query({
-                    windowId: launchedForHostWindowId,
+                    windowId: hostWindowId,
                     url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
                 });
                 const fallback = hostTabs.find(tab => isYouTubeWatchUrl(tab?.url));
@@ -1339,11 +1408,10 @@ async function resolveActiveYouTubeTabId() {
         currentTabId = null;
     }
 
-    // Detached panel must stay bound to its original host window.
-    // Do not rebind globally to another random YouTube tab.
-    if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+    // Prefer THIS panel's browser window — never the globally "latest" YouTube tab.
+    if (Number.isInteger(hostWindowId)) {
         try {
-            const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: launchedForHostWindowId });
+            const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: hostWindowId });
             if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url)) {
                 currentTabId = tabInHostWindow.id;
                 return currentTabId;
@@ -1354,11 +1422,11 @@ async function resolveActiveYouTubeTabId() {
 
         try {
             const hostTabs = await chrome.tabs.query({
-                windowId: launchedForHostWindowId,
+                windowId: hostWindowId,
                 url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
             });
-            const fallback = hostTabs.find(tab => isYouTubeWatchUrl(tab?.url));
-            if (fallback) {
+            const fallback = pickBestYouTubeWatchTab(hostTabs);
+            if (fallback && Number.isInteger(fallback.id)) {
                 currentTabId = fallback.id;
                 return currentTabId;
             }
@@ -1369,40 +1437,28 @@ async function resolveActiveYouTubeTabId() {
         return null;
     }
 
-    // Unbound side-panel fallback (legacy path only): last focused, then scored global pick.
+    // Last resort: adopt our own window, then its active watch tab only.
     try {
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (tab && isYouTubeWatchUrl(tab.url)) {
-            currentTabId = tab.id;
-            return currentTabId;
-        }
-    } catch (e) {
-        console.debug('[Panel] Failed to query active tab in last focused window:', e);
-    }
-
-    if (Date.now() - window.lastGlobalTabQueryFallback > 2000 || !window.lastGlobalTabQueryFallback) {
-        window.lastGlobalTabQueryFallback = Date.now();
-        try {
-            const allWatchTabs = await chrome.tabs.query({
-                url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
-            });
-            const best = pickBestYouTubeWatchTab(allWatchTabs);
-            if (best && Number.isInteger(best.id)) {
-                currentTabId = best.id;
+        const win = await chrome.windows.getCurrent();
+        if (Number.isInteger(win?.id)) {
+            hostWindowId = win.id;
+            const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+            if (tab && isYouTubeWatchUrl(tab.url)) {
+                currentTabId = tab.id;
                 return currentTabId;
             }
-        } catch (e) {
-            console.debug('[Panel] Failed to query all watch tabs:', e);
         }
+    } catch (e) {
+        console.debug('[Panel] Failed to adopt own window for tab resolve:', e);
     }
 
     return null;
 }
 
 async function closeDetachedPanelIfHostMissing() {
-    if (!isDetachedPanel || !Number.isInteger(launchedForHostWindowId)) return false;
+    if (!isDetachedPanel || !Number.isInteger(hostWindowId)) return false;
     try {
-        await chrome.windows.get(launchedForHostWindowId);
+        await chrome.windows.get(hostWindowId);
         detachedHostMissingCount = 0;
         return false;
     } catch (e) {
@@ -2409,7 +2465,7 @@ async function handleCapture(isAuto = false) {
                 // Fallback: Capture the entire visible tab via Chrome API
                 try {
                     // CRITICAL: When detached, we must capture the HOST window, not the panel window
-                    const captureWinId = (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) ? launchedForHostWindowId : null;
+                    const captureWinId = (isDetachedPanel && Number.isInteger(hostWindowId)) ? hostWindowId : null;
 
                     // Hide captions before capture (non-blocking, best effort)
                     if (!activeCaptionState) {

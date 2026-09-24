@@ -226,6 +226,10 @@ class YouTubeNotesContent {
         // 3. Navigation away from watch page
         if (!this.isWatchPage()) {
             console.log("YouTube Notes: Navigated away from watch page. Cleaning up watch-specific tasks.");
+            // Drop stale videoId so getMetadata cannot report the previous video
+            // with document.title like "(11) YouTube".
+            this.videoId = null;
+            this.video = null;
             if (this._playerInterval) clearTimeout(this._playerInterval);
             this._playerInterval = null;
             if (this._playerInjectionInterval) clearInterval(this._playerInjectionInterval);
@@ -656,15 +660,28 @@ class YouTubeNotesContent {
 
     getVideoMetadata() {
         const currentId = this.extractVideoId();
+        // Only report a video when we are actually on a watch URL.
+        if (!this.isWatchPage() || !currentId) {
+            return {
+                videoId: null,
+                title: '',
+                channel: '',
+                url: window.location.href
+            };
+        }
         // Modern YouTube title selectors
         const titleEl = document.querySelector('ytd-watch-metadata h1, ytd-video-primary-info-renderer h1, #title h1, h1.ytd-video-primary-info-renderer, h1.title');
         const channelEl = document.querySelector('#channel-name a, ytd-channel-name a, #text-container.ytd-channel-name a');
         let title = titleEl?.textContent?.trim();
         if (!title || title === "" || title === "YouTube Video") {
-            title = document.title.replace(' - YouTube', '').trim();
+            // Never use notification-style document.title like "(11) YouTube".
+            const docTitle = document.title.replace(' - YouTube', '').trim();
+            if (docTitle && !/^\(\d+\)\s*YouTube$/i.test(docTitle) && docTitle !== 'YouTube') {
+                title = docTitle;
+            }
         }
         return {
-            videoId: currentId || this.videoId,
+            videoId: currentId,
             title: title || 'YouTube Video',
             channel: channelEl?.textContent?.trim() || 'Unknown Channel',
             url: window.location.href
