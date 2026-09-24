@@ -257,11 +257,6 @@ body {
     background: transparent;
 }
 
-#btn-close-panel:hover {
-    color: var(--danger-color);
-    background-color: rgba(231, 76, 60, 0.14);
-}
-
 .action-btn-extra-small {
     display: inline-flex;
     align-items: center;

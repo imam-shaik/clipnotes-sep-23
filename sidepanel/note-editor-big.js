@@ -13,7 +13,8 @@
     const shotId = urlParams.get('shotId');
     const videoTitle = urlParams.get('videoTitle');
     const videoId = urlParams.get('videoId');
-    const editorTabId = Number(urlParams.get('tabId'));
+    const rawTabId = urlParams.get('tabId');
+    const editorTabId = Number.isFinite(Number(rawTabId)) && Number(rawTabId) > 0 ? Number(rawTabId) : null;
 
     if (videoTitle) {
         videoInfo.textContent = `Video: ${videoTitle}`;

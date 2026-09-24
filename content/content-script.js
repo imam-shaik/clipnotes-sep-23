@@ -753,44 +753,11 @@ class YouTubeNotesContent {
                 this.isPanelOpen = false;
                 this.setActivationLauncherVisible(true);
                 sendResponse({ success: true });
-            } else if (message.action === 'OPEN_FLOATING_REPORT') {
-                this.showFloatingReport(message.url);
-                sendResponse({ success: true });
-            } else if (message.action === 'CLOSE_FLOATING_REPORT') {
-                this.closeFloatingReport();
-                sendResponse({ success: true });
             }
             return true;
         };
 
         chrome.runtime.onMessage.addListener(this._messageListener);
-    }
-
-    showFloatingReport(url) {
-        this.closeFloatingReport(); // Ensure old ones are removed
-
-        const overlay = document.createElement('div');
-        overlay.id = 'yt-notes-report-overlay';
-        overlay.className = 'yt-notes-report-overlay';
-
-        const container = document.createElement('div');
-        container.className = 'yt-notes-report-container';
-
-        const iframe = document.createElement('iframe');
-        iframe.src = url;
-        iframe.className = 'yt-notes-report-iframe';
-        iframe.setAttribute('frameborder', '0');
-
-        container.appendChild(iframe);
-        overlay.appendChild(container);
-
-        // Close on overlay click (optional, but keep it for UX)
-        overlay.onclick = (e) => {
-            if (e.target === overlay) this.closeFloatingReport();
-        };
-
-        document.body.appendChild(overlay);
-        document.body.style.overflow = 'hidden'; // Prevent page scroll
     }
 
     closeFloatingReport() {

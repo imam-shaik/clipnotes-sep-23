@@ -105,8 +105,31 @@ async function saveDetachedPanelState() {
   }
 }
 
-// Initialize: Load persisted state
-loadDetachedPanelState();
+// Initialize: Load persisted state, then drop entries whose panel/host window
+// no longer exists (stale storage after browser restart / closed popups).
+loadDetachedPanelState().then(async () => {
+  if (detachedPanelWindowByTab.size === 0) return;
+  let pruned = 0;
+  for (const [tabId, entry] of Array.from(detachedPanelWindowByTab.entries())) {
+    const panelWindowId = Number(entry?.panelWindowId);
+    let alive = false;
+    if (Number.isInteger(panelWindowId)) {
+      try {
+        await chrome.windows.get(panelWindowId);
+        alive = true;
+      } catch (_) { /* dead */ }
+    }
+    if (!alive) {
+      detachedPanelWindowByTab.delete(tabId);
+      relatedWindowsByTab.delete(tabId);
+      pruned += 1;
+    }
+  }
+  if (pruned > 0) {
+    console.log(`[SW] Pruned ${pruned} stale detached panel(s)`);
+    await saveDetachedPanelState();
+  }
+});
 
 // Helper to wait for a window to reach a certain state (Fix #3)
 async function waitForWindowState(windowId, targetState, maxWaitMs = 2000) {
@@ -137,6 +160,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'closeSidePanel') {
     handleCloseSidePanel(message, sender, sendResponse);
     return true;
+  } else if (message.action === 'rebindDetachedPanel') {
+    handleRebindDetachedPanel(message, sender, sendResponse);
+    return false;
   } else if (message.action === 'panelHeartbeat') {
     handlePanelHeartbeat(message, sender, sendResponse);
     return false;
@@ -241,6 +267,81 @@ function handlePanelClosed(message, sender, sendResponse) {
     clearPanelHeartbeat(tabId, message.panelInstanceId || LEGACY_PANEL_INSTANCE);
   }
   sendResponse({ success: true });
+}
+
+// Detached panel rebinds YT→YT: move its window/related maps to the new tabId
+// so closeNotesPanelForTab(newTab) still finds the popup.
+function handleRebindDetachedPanel(message, sender, sendResponse) {
+  const oldTabId = Number(message.oldTabId);
+  const newTabId = Number(message.newTabId);
+  if (!Number.isInteger(oldTabId) || !Number.isInteger(newTabId) || oldTabId === newTabId) {
+    sendResponse({ success: false, error: 'bad tab ids' });
+    return;
+  }
+  const entry = detachedPanelWindowByTab.get(oldTabId);
+  if (!entry) {
+    sendResponse({ success: false, error: 'no detached entry for old tab' });
+    return;
+  }
+  detachedPanelWindowByTab.delete(oldTabId);
+  detachedPanelWindowByTab.set(newTabId, entry);
+  if (relatedWindowsByTab.has(oldTabId)) {
+    relatedWindowsByTab.set(newTabId, relatedWindowsByTab.get(oldTabId));
+    relatedWindowsByTab.delete(oldTabId);
+  }
+  console.log('[TabFollow][SW] rebindDetachedPanel', { oldTabId, newTabId, panelWindowId: entry.panelWindowId });
+  saveDetachedPanelState();
+  sendResponse({ success: true });
+}
+
+// Close every detached panel hosted in this browser window (New Tab / non-watch).
+// Goes through closeNotesPanelForTab so hostResizeRestore always un-tiles the browser.
+async function closeDetachedPanelsForHostWindow(winId) {
+  if (!Number.isInteger(winId)) return 0;
+  let closed = 0;
+  const tabIds = [];
+  for (const [tabId, entry] of detachedPanelWindowByTab.entries()) {
+    if (Number(entry?.hostWindowId) === winId) tabIds.push(tabId);
+  }
+  for (const tabId of tabIds) {
+    const entry = detachedPanelWindowByTab.get(tabId);
+    const hostResizeRestore = entry?.hostResizeRestore;
+    try {
+      const ok = await closeNotesPanelForTab(tabId);
+      if (ok) closed += 1;
+    } catch (_) {
+      // Fall through to manual restore if close path threw.
+    }
+    // Belt-and-suspenders: if entry was already gone, still un-tile using saved restore.
+    if (hostResizeRestore && Number.isInteger(hostResizeRestore.hostWindowId)) {
+      await restoreHostWindowBounds(hostResizeRestore);
+    }
+  }
+  if (closed > 0 || tabIds.length > 0) {
+    console.log('[TabFollow][SW] closed', closed, '/', tabIds.length, 'detached panel(s) for host window', winId);
+    await saveDetachedPanelState();
+  }
+  return closed;
+}
+
+async function restoreHostWindowBounds(hostResizeRestore) {
+  if (!hostResizeRestore || !Number.isInteger(hostResizeRestore.hostWindowId)) return;
+  try {
+    await chrome.windows.update(hostResizeRestore.hostWindowId, {
+      left: hostResizeRestore.left,
+      top: hostResizeRestore.top,
+      width: hostResizeRestore.width,
+      height: hostResizeRestore.height
+    });
+    if (hostResizeRestore.restoreState && hostResizeRestore.restoreState !== "normal") {
+      await chrome.windows.update(hostResizeRestore.hostWindowId, {
+        state: hostResizeRestore.restoreState
+      });
+    }
+    console.log('[TabFollow][SW] restored host window bounds', hostResizeRestore);
+  } catch (_) {
+    // Host window may have been closed or moved manually.
+  }
 }
 
 function handleIsPanelOpen(message, sender, sendResponse) {
@@ -634,8 +735,9 @@ async function openDetachedPanelWindow(tabId, hostWindowIdHint) {
   }
 }
 
-async function openNotesPanelForTab(tabId, hostWindowIdHint = null) {
+async function openNotesPanelForTab(tabId, hostWindowIdHint = null, options = {}) {
   if (!Number.isInteger(tabId)) return false;
+  const allowDetached = options.allowDetached !== false;
 
   const windowId = Number.isInteger(hostWindowIdHint) ? hostWindowIdHint : null;
 
@@ -661,18 +763,26 @@ async function openNotesPanelForTab(tabId, hostWindowIdHint = null) {
       });
       await chrome.sidePanel.open({ tabId });
       setPanelHeartbeat(tabId);
+      console.log('[TabFollow][SW] sidePanel.open ok', tabId, pathQuery.toString());
       return true;
-    } catch (_) {
-      // Fall back to detached panel window (installed app windows may block sidePanel.open()).
+    } catch (openErr) {
+      // Fall back to detached panel window (installed app windows / no user
+      // gesture may block sidePanel.open() — New Tab → YT return must still reopen).
+      console.log('[TabFollow][SW] sidePanel.open failed:', openErr?.message || openErr, { allowDetached });
+      if (!allowDetached) return false;
     }
+  } else if (!allowDetached) {
+    return false;
   }
 
   const detachedOpened = await openDetachedPanelWindow(tabId, hostWindowIdHint);
   if (detachedOpened) {
     setPanelHeartbeat(tabId);
+    console.log('[TabFollow][SW] detached panel open fallback ok', tabId);
     return true;
   }
 
+  console.log('[TabFollow][SW] openNotesPanelForTab failed', tabId, { allowDetached });
   return false;
 }
 
@@ -703,7 +813,7 @@ async function closeNotesPanelForTab(tabId) {
       closedAnything = true;
     } catch (e) {
       // Window already closed or inaccessible.
-      console.debug('[SW] Window already closed or inaccessible:', winId, e);
+      console.debug('[SW] Window already closed or inaccessible:', detachedWindowId, e);
     }
   }
 
@@ -723,21 +833,7 @@ async function closeNotesPanelForTab(tabId) {
     hostResizeRestore &&
     Number.isInteger(hostResizeRestore.hostWindowId)
   ) {
-    try {
-      await chrome.windows.update(hostResizeRestore.hostWindowId, {
-        left: hostResizeRestore.left,
-        top: hostResizeRestore.top,
-        width: hostResizeRestore.width,
-        height: hostResizeRestore.height
-      });
-      if (hostResizeRestore.restoreState && hostResizeRestore.restoreState !== "normal") {
-        await chrome.windows.update(hostResizeRestore.hostWindowId, {
-          state: hostResizeRestore.restoreState
-        });
-      }
-    } catch (_) {
-      // Host window may have been closed or moved manually.
-    }
+    await restoreHostWindowBounds(hostResizeRestore);
   }
 
   if (chrome.sidePanel?.setOptions) {
@@ -807,9 +903,10 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
-// Automatically trigger side panel globally or on icon click
+// Toolbar icon: only open on a YouTube watch tab (never on New Tab / other sites).
 chrome.action.onClicked.addListener((tab) => {
-  openNotesPanelForTab(tab?.id, tab?.windowId).catch((err) => {
+  if (!tab?.url || !tab.url.includes('youtube.com/watch')) return;
+  openNotesPanelForTab(tab.id, tab.windowId).catch((err) => {
     console.error('[SW] Failed to open notes panel from action click:', err);
   });
 });
@@ -986,26 +1083,144 @@ chrome.windows.onBoundsChanged.addListener((window) => {
 
 const autoOpenTimers = new Map();
 
-// Keep per-tab side panel paths unique so switching tabs reloads the panel
-// bound to THAT tab (Chrome may skip reload when path strings match).
-chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+// Per-tab side panel options: unique path when on a watch video (so switching
+// YouTube tabs reloads/follows the right panel); disabled on non-YouTube tabs
+// so an open panel does not stick on New Tab / other sites.
+// Broadcast activeTabChanged so an already-open panel document can rebind
+// immediately (Chrome often reuses one side panel instance across tab switches).
+function broadcastActiveTabChanged(tabId, windowId, isWatch, url = '') {
+  const payload = {
+    action: 'activeTabChanged',
+    tabId,
+    windowId: Number.isInteger(windowId) ? windowId : null,
+    isWatch: !!isWatch,
+    url: url || '',
+    ts: Date.now()
+  };
+  console.log('[TabFollow][SW] broadcast activeTabChanged', payload);
+  // Fallback channel: sendMessage can miss a suspended/hidden panel document.
+  try {
+    chrome.storage.session.set({ lastActiveTabSignal: payload });
+  } catch (_) { /* optional */ }
+  chrome.runtime.sendMessage(payload, () => {
+    const err = chrome.runtime.lastError;
+    if (err) console.log('[TabFollow][SW] sendMessage delivery note:', err.message);
+  });
+}
+
+function hasAnyLivePanelHeartbeat() {
+  for (const tabId of Array.from(panelHeartbeatByTab.keys())) {
+    if (isPanelOpenForTab(tabId)) return true;
+  }
+  return false;
+}
+
+chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!tab?.url || !tab.url.includes('youtube.com/watch')) return;
-    if (!chrome.sidePanel?.setOptions) return;
-    const pathQuery = new URLSearchParams({ tabId: String(tabId) });
-    if (Number.isInteger(tab.windowId)) pathQuery.set('hostWindowId', String(tab.windowId));
-    await chrome.sidePanel.setOptions({
-      tabId,
-      path: `sidepanel/panel.html?${pathQuery.toString()}`,
-      enabled: true
-    });
-  } catch (_) { /* tab may be gone */ }
+    const url = tab?.url || '';
+    const isWatch = url.includes('youtube.com/watch');
+    const winId = Number.isInteger(tab?.windowId) ? tab.windowId : windowId;
+    console.log('[TabFollow][SW] onActivated', { tabId, winId, isWatch, url });
+
+    // Broadcast FIRST so a setOptions failure can never block panel rebind/close.
+    broadcastActiveTabChanged(tabId, winId, isWatch, url);
+
+    if (chrome.sidePanel?.setOptions) {
+      try {
+        if (isWatch) {
+          const pathQuery = new URLSearchParams({ tabId: String(tabId) });
+          if (Number.isInteger(winId)) pathQuery.set('hostWindowId', String(winId));
+          await chrome.sidePanel.setOptions({
+            tabId,
+            path: `sidepanel/panel.html?${pathQuery.toString()}`,
+            enabled: true
+          });
+          console.log('[TabFollow][SW] setOptions watch tab', tabId, pathQuery.toString());
+        } else {
+          await chrome.sidePanel.setOptions({ tabId, enabled: false });
+          console.log('[TabFollow][SW] setOptions disabled for non-watch tab', tabId);
+          // Detached popup does not obey sidePanel.setOptions — remove it directly.
+          await closeDetachedPanelsForHostWindow(winId);
+        }
+      } catch (setErr) {
+        console.warn('[TabFollow][SW] sidePanel.setOptions failed:', setErr?.message || setErr);
+      }
+    }
+
+    // Returning to a YouTube video (New Tab → back, or YT→YT):
+    // - heartbeat for THIS tab → ensure native side panel is visible again
+    // - heartbeat only on another tab → live document will rebind (YT→YT); don't spawn a second panel
+    // - no heartbeat → reopen (native first, detached fallback if open() fails)
+    if (isWatch) {
+      try {
+        const data = await chrome.storage.local.get('isAutoOpenEnabled');
+        const autoOpen = data.isAutoOpenEnabled !== false;
+        if (!autoOpen) {
+          console.log('[TabFollow][SW] auto-reopen skipped (disabled)', tabId);
+        } else if (isPanelOpenForTab(tabId)) {
+          if (chrome.sidePanel?.open) {
+            try {
+              await chrome.sidePanel.open({ tabId });
+              console.log('[TabFollow][SW] sidePanel.open (heartbeat already live)', tabId);
+            } catch (openErr) {
+              console.log('[TabFollow][SW] sidePanel.open failed (heartbeat live):', openErr?.message || openErr);
+            }
+          }
+        } else if (hasAnyLivePanelHeartbeat()) {
+          console.log('[TabFollow][SW] auto-reopen skip (other panel live)', tabId);
+        } else {
+          console.log('[TabFollow][SW] auto-reopen panel for', tabId);
+          const opened = await openNotesPanelForTab(tabId, winId, { allowDetached: true });
+          console.log('[TabFollow][SW] auto-reopen result', { tabId, opened });
+        }
+      } catch (reopenErr) {
+        console.warn('[TabFollow][SW] auto-reopen failed:', reopenErr?.message || reopenErr);
+      }
+    }
+  } catch (err) {
+    console.warn('[TabFollow][SW] onActivated failed:', err?.message || err);
+  }
 });
 
-// Auto-open logic on navigation
+// Auto-open logic on navigation; close panel when leaving a watch URL in-place.
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete' && tab.url && tab.url.includes('youtube.com/watch')) {
+  if (!changeInfo.url && changeInfo.status !== 'complete') return;
+
+  const url = tab?.url || changeInfo.url || '';
+  const isWatch = url.includes('youtube.com/watch');
+  const winId = Number.isInteger(tab?.windowId) ? tab.windowId : null;
+
+  // Navigated away from /watch in the same tab — hide panel + tell open panel to close.
+  if (changeInfo.url && !isWatch) {
+    console.log('[TabFollow][SW] onUpdated leave-watch', { tabId, url });
+    broadcastActiveTabChanged(tabId, winId, false, url);
+    try {
+      if (chrome.sidePanel?.setOptions) {
+        await chrome.sidePanel.setOptions({ tabId, enabled: false });
+      }
+      // Close this tab's detached popup if it owns one.
+      const ownsDetached = detachedPanelWindowByTab.has(tabId);
+      if (ownsDetached) {
+        await closeNotesPanelForTab(tabId);
+      } else if (Number.isInteger(winId)) {
+        // Only sweep host-window detached panels when THIS tab is still active
+        // (background tab navigations must not kill a panel bound to another tab).
+        try {
+          const [active] = await chrome.tabs.query({ active: true, windowId: winId });
+          if (active?.id === tabId) {
+            await closeDetachedPanelsForHostWindow(winId);
+          }
+        } catch (_) { /* ignore */ }
+      }
+    } catch (e) {
+      console.warn('[TabFollow][SW] leave-watch setOptions failed:', e?.message || e);
+    }
+    return;
+  }
+
+  if (changeInfo.status === 'complete' && isWatch) {
+    console.log('[TabFollow][SW] onUpdated watch complete', { tabId, url });
     try {
       // Check if auto-open is enabled (default true)
       const data = await chrome.storage.local.get('isAutoOpenEnabled');

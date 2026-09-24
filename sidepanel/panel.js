@@ -21,6 +21,13 @@ let boundTabId = parsePositiveIntParam(initialPanelUrlParams, 'tabId');
 let hostWindowId = parsePositiveIntParam(initialPanelUrlParams, 'hostWindowId');
 const panelMode = initialPanelUrlParams.get('mode') || '';
 const isDetachedPanel = panelMode === 'detached';
+console.log('[TabFollow][Panel] init', {
+    search: window.location.search,
+    panelMode,
+    isDetachedPanel,
+    boundTabId,
+    hostWindowId
+});
 if (Number.isInteger(boundTabId)) {
     currentTabId = boundTabId;
 }
@@ -81,8 +88,9 @@ async function claimPendingSidePanelTabIfNeeded() {
     }
 }
 
-// Native side panel opened via default_path (no ?tabId=): bind to the active
-// YouTube watch tab in THIS panel's browser window — never a global "latest" tab.
+// Native side panel opened via default_path (no ?tabId=): bind only to the
+// ACTIVE YouTube watch tab in THIS panel's browser window. Never adopt a
+// background watch tab when the active tab is New Tab / another site.
 async function adoptTabFromOwnWindowIfNeeded() {
     if (Number.isInteger(boundTabId)) return;
     if (isDetachedPanel) return;
@@ -94,24 +102,211 @@ async function adoptTabFromOwnWindowIfNeeded() {
         if (!Number.isInteger(hostWindowId)) return;
 
         const [active] = await chrome.tabs.query({ windowId: hostWindowId, active: true });
-        if (active && isYouTubeWatchUrl(active.url)) {
+        if (active && Number.isInteger(active.id) && isYouTubeWatchUrl(active.url)) {
             boundTabId = active.id;
             currentTabId = active.id;
-            return;
-        }
-
-        const watchTabs = await chrome.tabs.query({
-            windowId: hostWindowId,
-            url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
-        });
-        const watch = pickBestYouTubeWatchTab(watchTabs);
-        if (watch && Number.isInteger(watch.id)) {
-            boundTabId = watch.id;
-            currentTabId = watch.id;
         }
     } catch (err) {
         console.debug('[Panel] Own-window tab adopt failed:', err);
     }
+}
+
+// Active tab in this window is not a YouTube video — tear down and close
+// the panel (native side panel OR detached popup window).
+async function closeNativePanelBecauseNoWatchTab() {
+    if (panelMode === 'preview') return;
+    console.log('[TabFollow][Panel] closeNativePanel', {
+        boundTabId, currentTabId, currentVideoId, hostWindowId, panelMode, isDetachedPanel
+    });
+    const previousBound = Number.isInteger(boundTabId) ? boundTabId : currentTabId;
+    if (previousBound !== null && previousBound !== undefined) {
+        safeSendMessage(previousBound, { action: 'TAB_PANEL_CLOSED' });
+        // Clear SW heartbeat BEFORE nulling boundTabId so panelClosed still has a tabId
+        // (otherwise reopen is blocked until the 4s heartbeat TTL expires).
+        stopPanelHeartbeat(previousBound);
+    }
+
+    // Detached popup: remove the real browser window via SW (window.close alone
+    // can be ignored) using the tabId that owns detachedPanelWindowByTab.
+    if (isDetachedPanel && Number.isInteger(previousBound)) {
+        try {
+            chrome.runtime.sendMessage({ action: 'closeSidePanel', tabId: previousBound }, () => {
+                void chrome.runtime.lastError;
+            });
+            console.log('[TabFollow][Panel] asked SW closeSidePanel (detached) for', previousBound);
+        } catch (e) {
+            console.warn('[TabFollow][Panel] closeSidePanel failed:', e?.message || e);
+        }
+    }
+
+    // Native side panel: disable per-tab options so Chrome hides the panel.
+    if (!isDetachedPanel) {
+        try {
+            const [active] = Number.isInteger(hostWindowId)
+                ? await chrome.tabs.query({ windowId: hostWindowId, active: true })
+                : [];
+            const disableTabId = Number.isInteger(active?.id) ? active.id : previousBound;
+            if (Number.isInteger(disableTabId) && chrome.sidePanel?.setOptions) {
+                await chrome.sidePanel.setOptions({ tabId: disableTabId, enabled: false });
+                console.log('[TabFollow][Panel] sidePanel.setOptions enabled:false for', disableTabId);
+            }
+            if (Number.isInteger(disableTabId)) {
+                chrome.runtime.sendMessage({ action: 'closeSidePanel', tabId: disableTabId }, () => {
+                    void chrome.runtime.lastError;
+                });
+            }
+        } catch (e) {
+            console.warn('[TabFollow][Panel] disable sidePanel failed:', e?.message || e);
+        }
+    }
+
+    boundTabId = null;
+    currentTabId = null;
+    currentVideoId = null;
+    currentVideoTitle = null;
+    isDataLoadedForId = null;
+    loadInFlightForId = null;
+    titleUsedForLoad = null;
+    isVideoPlaying = false;
+    clearVideoStateUI();
+    try { window.close(); } catch (_) { /* side panel may ignore close */ }
+}
+
+// Native side panel AND detached popup both follow the ACTIVE watch tab in
+// hostWindowId. Preview mode never follows.
+async function rebindToActiveWatchTabInHostWindow() {
+    if (panelMode === 'preview') return false;
+    try {
+        if (!Number.isInteger(hostWindowId)) {
+            // windows.getCurrent() inside a detached popup returns the POPUP,
+            // not the host browser — never use it to discover the host window.
+            if (isDetachedPanel) {
+                console.log('[TabFollow][Panel] rebind: detached missing hostWindowId', { boundTabId, currentVideoId });
+                return false;
+            }
+            const win = await chrome.windows.getCurrent();
+            if (Number.isInteger(win?.id)) hostWindowId = win.id;
+        }
+        if (!Number.isInteger(hostWindowId)) {
+            console.log('[TabFollow][Panel] rebind: no hostWindowId', { boundTabId, currentTabId, currentVideoId });
+            return false;
+        }
+
+        const [active] = await chrome.tabs.query({ windowId: hostWindowId, active: true });
+        const activeWatch = !!(active && Number.isInteger(active.id) && isYouTubeWatchUrl(active.url));
+        const urlVideoId = activeWatch ? extractVideoIdFromWatchUrl(active.url) : '';
+        const tabChanged = !activeWatch || active.id !== boundTabId || active.id !== currentTabId;
+        const videoChanged = activeWatch && !!urlVideoId && urlVideoId !== currentVideoId;
+
+        if (!activeWatch) {
+            console.log('[TabFollow][Panel] rebind: active not watch → close', {
+                activeId: active?.id, activeUrl: active?.url, boundTabId, currentTabId, currentVideoId, panelMode
+            });
+            await closeNativePanelBecauseNoWatchTab();
+            return false;
+        }
+
+        if (!tabChanged && !videoChanged) {
+            return false;
+        }
+
+        console.log('[TabFollow][Panel] rebind →', {
+            from: { boundTabId, currentTabId, currentVideoId },
+            to: { tabId: active.id, videoId: urlVideoId },
+            tabChanged, videoChanged, panelMode
+        });
+
+        const previousBound = Number.isInteger(boundTabId) ? boundTabId : null;
+        boundTabId = active.id;
+        currentTabId = active.id;
+
+        if (videoChanged) {
+            currentVideoId = urlVideoId;
+            currentVideoTitle = null;
+            isDataLoadedForId = null;
+            loadInFlightForId = null;
+            titleUsedForLoad = null;
+            clearVideoStateUI();
+            checkMetadataImmediate();
+        }
+
+        if (previousBound !== null && previousBound !== boundTabId) {
+            safeSendMessage(previousBound, { action: 'TAB_PANEL_CLOSED' });
+            // Stop counting the old tab as "panel open" after a YT→YT rebind.
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'panelClosed',
+                    tabId: previousBound,
+                    panelInstanceId
+                }, () => { void chrome.runtime.lastError; });
+            } catch (_) { /* ignore */ }
+            // Detached popup is keyed by tabId in the SW — move the mapping.
+            if (isDetachedPanel) {
+                try {
+                    chrome.runtime.sendMessage({
+                        action: 'rebindDetachedPanel',
+                        oldTabId: previousBound,
+                        newTabId: boundTabId
+                    }, () => { void chrome.runtime.lastError; });
+                } catch (_) { /* ignore */ }
+            }
+        }
+        safeSendMessage(boundTabId, { action: 'TAB_PANEL_OPENED' });
+        syncNotebookStateToContent(isNotebookEnabled);
+        return true;
+    } catch (err) {
+        console.warn('[TabFollow][Panel] rebind failed:', err);
+        return false;
+    }
+}
+
+// Chrome reuses one side panel document when switching YT tabs (and may strip
+// query strings from setOptions paths). Hard-reload bound to the new tabId so
+// metadata/screenshots always match the active video.
+function forceReloadPanelForTab(tabId, windowId) {
+    if (panelMode === 'preview') {
+        console.log('[TabFollow][Panel] forceReload skip (preview)', { tabId, panelMode });
+        return;
+    }
+    if (!Number.isInteger(tabId) || tabId <= 0) {
+        console.log('[TabFollow][Panel] forceReload skip (bad tabId)', { tabId });
+        return;
+    }
+    if (tabId === boundTabId && tabId === currentTabId) {
+        // Search may already match while video state is stale — still hard-reload.
+        console.log('[TabFollow][Panel] forceReload: ids already match, hard reload', { tabId, currentVideoId, panelMode });
+        try { window.location.reload(); } catch (_) { /* ignore */ }
+        return;
+    }
+
+    // Preserve existing params (mode=detached, etc.) — only retarget tab binding.
+    const qs = new URLSearchParams(window.location.search);
+    qs.set('tabId', String(tabId));
+    if (Number.isInteger(windowId) && windowId > 0) {
+        qs.set('hostWindowId', String(windowId));
+    }
+    const nextSearch = `?${qs.toString()}`;
+
+    // Seed session claim so a query-stripped reload still binds correctly.
+    try {
+        if (chrome?.storage?.session?.set) {
+            chrome.storage.session.set({
+                pendingSidePanelTabId: tabId,
+                pendingSidePanelWindowId: Number.isInteger(windowId) && windowId > 0 ? windowId : null,
+                pendingSidePanelToken: `${tabId}:${Date.now()}`,
+                pendingSidePanelOpenedAt: Date.now()
+            });
+        }
+    } catch (_) { /* optional */ }
+
+    console.log('[TabFollow][Panel] forceReload', {
+        from: window.location.search, to: nextSearch, boundTabId, currentTabId, currentVideoId, tabId, panelMode
+    });
+    if (window.location.search === nextSearch) {
+        try { window.location.reload(); } catch (_) { /* ignore */ }
+        return;
+    }
+    window.location.replace(`${window.location.pathname}${nextSearch}`);
 }
 let videoScrapeTimer = null;
 let isNotebookEnabled = false;
@@ -127,6 +322,7 @@ let lastScreenshotTime = 0; // Track time of last screenshot for time-based dupl
 let currentRehydrationTaskId = 0; // Track active rehydration task ID for cancellation support
 const currentlyRehydrating = new Set(); // Track screenshot IDs currently in the process of rehydrating
 let panelHeartbeatTimer = null;
+let lastAppliedTabSignalTs = 0;
 // Unique per panel document so two panels on one tab do not clear each other.
 const panelInstanceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 let disconnectedPollCount = 0;
@@ -244,6 +440,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             await claimPendingSidePanelTabIfNeeded();
             await adoptTabFromOwnWindowIfNeeded();
 
+            // Sync to the host window's active watch tab (closes if New Tab, etc.).
+            await rebindToActiveWatchTabInHostWindow();
+
             // Notify content script that panel is open
             if (Number.isInteger(boundTabId)) {
                 safeSendMessage(boundTabId, { action: 'TAB_PANEL_OPENED' });
@@ -269,8 +468,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             initTranscriptRangeSettings();
             initWatchLaterTab();
             
-            // Performance: Only poll if the panel is currently visible
+            // Always rebind on a fixed cadence (side-panel documents can report
+            // visibilityState 'hidden' while the user is on another browser tab —
+            // gating rebind on visibility left the panel stuck on the old video).
             setInterval(() => {
+                rebindToActiveWatchTabInHostWindow().catch(() => {});
                 if (document.visibilityState === 'visible') {
                     pollCurrentVideo();
                 }
@@ -288,10 +490,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 window.addEventListener('beforeunload', () => {
     // Notify content script that panel is closed (not for preview mode — never opened)
     if (panelMode !== 'preview') {
-        if (Number.isInteger(boundTabId)) {
-            safeSendMessage(boundTabId, { action: 'TAB_PANEL_CLOSED' });
+        const closingTabId = Number.isInteger(boundTabId) ? boundTabId : null;
+        if (closingTabId !== null) {
+            safeSendMessage(closingTabId, { action: 'TAB_PANEL_CLOSED' });
         }
-        stopPanelHeartbeat();
+        stopPanelHeartbeat(closingTabId);
     }
     
     // Revoke all blob URLs to prevent memory leaks
@@ -388,11 +591,18 @@ function performPanelHiddenCleanup() {
 
 // Register multiple triggers for visibility state transitions
 document.addEventListener('visibilitychange', () => {
-    handlePanelVisibilityChange(document.visibilityState === 'visible');
+    const visible = document.visibilityState === 'visible';
+    handlePanelVisibilityChange(visible);
+    if (visible && panelMode !== 'preview') {
+        rebindToActiveWatchTabInHostWindow();
+    }
 });
 
 window.addEventListener('pageshow', () => {
     handlePanelVisibilityChange(true);
+    if (panelMode !== 'preview') {
+        rebindToActiveWatchTabInHostWindow();
+    }
 });
 
 window.addEventListener('pagehide', () => {
@@ -401,6 +611,9 @@ window.addEventListener('pagehide', () => {
 
 window.addEventListener('focus', () => {
     handlePanelVisibilityChange(true);
+    if (panelMode !== 'preview') {
+        rebindToActiveWatchTabInHostWindow();
+    }
 });
 
 window.addEventListener('blur', () => {
@@ -895,9 +1108,62 @@ async function seekActiveYouTubeTab(timeMs) {
     return true;
 }
 
+function handleActiveTabChangedPayload(message, sendResponse = null) {
+    if (panelMode === 'preview') {
+        console.log('[TabFollow][Panel] activeTabChanged ignored (preview)');
+        return;
+    }
+    const actWinId = Number.isInteger(Number(message.windowId)) && Number(message.windowId) > 0
+        ? Number(message.windowId)
+        : null;
+    if (Number.isInteger(hostWindowId) && Number.isInteger(actWinId) && actWinId !== hostWindowId) {
+        console.log('[TabFollow][Panel] activeTabChanged ignored (window mismatch)', { hostWindowId, actWinId });
+        return;
+    }
+    // Left YouTube (New Tab / other site) — close this panel.
+    if (message.isWatch === false) {
+        console.log('[TabFollow][Panel] activeTabChanged → close (not watch)', { panelMode, isDetachedPanel });
+        closeNativePanelBecauseNoWatchTab();
+        if (sendResponse) sendResponse({ success: true });
+        return;
+    }
+    const actTabId = Number(message.tabId);
+    if (!Number.isInteger(actTabId) || actTabId <= 0) {
+        console.log('[TabFollow][Panel] activeTabChanged ignored (bad tabId)', message.tabId);
+        return;
+    }
+    // Different tab: hard-reload (native document reuse) or soft rebind (detached).
+    if (actTabId !== boundTabId || actTabId !== currentTabId) {
+        console.log('[TabFollow][Panel] activeTabChanged → follow new tab', {
+            actTabId, boundTabId, currentTabId, panelMode
+        });
+        if (isDetachedPanel) {
+            // Popup window: soft rebind keeps window bounds; preserve mode=detached.
+            rebindToActiveWatchTabInHostWindow().then((changed) => {
+                console.log('[TabFollow][Panel] detached rebind result', changed);
+                if (sendResponse) sendResponse({ success: true, rebind: changed });
+            });
+            return true;
+        }
+        forceReloadPanelForTab(actTabId, actWinId);
+        if (sendResponse) sendResponse({ success: true, reloading: true });
+        return;
+    }
+    console.log('[TabFollow][Panel] activeTabChanged → soft rebind (ids match)', { actTabId, panelMode });
+    rebindToActiveWatchTabInHostWindow().then((changed) => {
+        console.log('[TabFollow][Panel] soft rebind result', changed);
+        if (changed && sendResponse) sendResponse({ success: true });
+    });
+}
+
 function initMessageListeners() {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        // console.log("Sidepanel: Message received:", message.action || message.type, message);
+        if (message?.action === 'activeTabChanged' || message?.type === 'CONTENT_READY') {
+            console.log('[TabFollow][Panel] onMessage', message.action || message.type, {
+                from: sender?.id ? 'ext' : (sender?.tab?.id ?? 'sw/none'),
+                message
+            });
+        }
         // Keep tab binding stable in detached mode; avoid drifting to unrelated YouTube tabs.
         if (sender && sender.tab && shouldTrackSenderTab(sender.tab)) {
             currentTabId = sender.tab.id;
@@ -935,6 +1201,24 @@ function initMessageListeners() {
             checkMetadataImmediate();
             // Late-injected content has no memory of the notebook toggle — push current state.
             syncNotebookStateToContent(isNotebookEnabled);
+        } else if (message.action === 'activeTabChanged') {
+            // SW fired when the user switched browser tabs.
+            console.log('[TabFollow][Panel] msg activeTabChanged', {
+                msg: message,
+                boundTabId, currentTabId, currentVideoId, hostWindowId,
+                panelMode, isDetachedPanel,
+                loc: window.location.search
+            });
+            const handledTs = Number(message.ts);
+            if (Number.isFinite(handledTs)) {
+                if (handledTs <= lastAppliedTabSignalTs) return;
+                lastAppliedTabSignalTs = handledTs;
+            } else {
+                // Message path without ts — still mark as applied so storage replay is ignored.
+                lastAppliedTabSignalTs = Date.now();
+            }
+            handleActiveTabChangedPayload(message, sendResponse);
+            return true;
         } else if (message.action === 'shortcutPressed') {
             // Only the panel bound to the source tab may run shortcuts.
             if (!isSenderOurBoundTab(sender)) return;
@@ -1034,6 +1318,24 @@ function initMessageListeners() {
             return true;
         }
     });
+
+    // Fallback: SW also writes lastActiveTabSignal to session storage —
+    // runtime.sendMessage can miss a suspended/hidden side-panel document.
+    try {
+        if (chrome.storage?.onChanged) {
+            chrome.storage.onChanged.addListener((changes, areaName) => {
+                if (areaName !== 'session' || !changes?.lastActiveTabSignal) return;
+                const sig = changes.lastActiveTabSignal.newValue;
+                if (!sig || !Number.isFinite(Number(sig.ts))) return;
+                if (Number(sig.ts) <= Number(lastAppliedTabSignalTs || 0)) return;
+                lastAppliedTabSignalTs = Number(sig.ts);
+                console.log('[TabFollow][Panel] storage.signal', sig);
+                handleActiveTabChangedPayload(sig, null);
+            });
+        }
+    } catch (e) {
+        console.warn('[TabFollow][Panel] storage.onChanged unavailable:', e);
+    }
 }
 
 async function handleScreenshotEditedResult(shotId, newDataUrl) {
@@ -1357,101 +1659,38 @@ function showAlert(message) {
 
 
 async function resolveActiveYouTubeTabId() {
-    if (Number.isInteger(boundTabId)) {
-        const lockedTab = await getValidatedWatchTab(boundTabId);
-        if (lockedTab) {
-            currentTabId = lockedTab.id;
+    // Preview is a full-tab viewer — never follows browser tabs.
+    if (panelMode === 'preview') {
+        return Number.isInteger(boundTabId) ? boundTabId : null;
+    }
+
+    // Native AND detached: ONLY the active watch tab in hostWindowId.
+    // Never fall back to a background /watch tab (that kept New Tab from closing).
+    if (!Number.isInteger(hostWindowId)) {
+        if (isDetachedPanel) {
+            // windows.getCurrent() in a popup is the popup itself — do not use it.
+            return Number.isInteger(boundTabId) ? boundTabId : null;
+        }
+        try {
+            const win = await chrome.windows.getCurrent();
+            if (Number.isInteger(win?.id)) hostWindowId = win.id;
+        } catch (e) {
+            console.debug('[Panel] Failed to adopt host window:', e);
+        }
+    }
+    if (!Number.isInteger(hostWindowId)) {
+        return Number.isInteger(boundTabId) ? boundTabId : null;
+    }
+    try {
+        const [active] = await chrome.tabs.query({ active: true, windowId: hostWindowId });
+        if (active && Number.isInteger(active.id) && isYouTubeWatchUrl(active.url)) {
+            currentTabId = active.id;
             return currentTabId;
         }
-
-        // Bound tab closed/not on /watch: rebind only within THIS panel's host window.
-        if (Number.isInteger(hostWindowId)) {
-            try {
-                const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: hostWindowId });
-                if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url) && tabInHostWindow.id !== boundTabId) {
-                    // Only rebind for detached panels; native side panel keeps its tabId
-                    // so Chrome can swap panels correctly on tab switch.
-                    if (isDetachedPanel) {
-                        currentTabId = tabInHostWindow.id;
-                        return currentTabId;
-                    }
-                }
-            } catch (e) {
-                console.debug('[Panel] Failed to query active tab in host window:', e);
-            }
-        }
-
-        if (isDetachedPanel && Number.isInteger(hostWindowId)) {
-            try {
-                const hostTabs = await chrome.tabs.query({
-                    windowId: hostWindowId,
-                    url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
-                });
-                const fallback = hostTabs.find(tab => isYouTubeWatchUrl(tab?.url));
-                if (fallback) {
-                    currentTabId = fallback.id;
-                    return currentTabId;
-                }
-            } catch (e) {
-                console.debug('[Panel] Failed to query host tabs:', e);
-            }
-        }
-
-        return null;
-    }
-
-    if (Number.isInteger(currentTabId)) {
-        const trackedTab = await getValidatedWatchTab(currentTabId);
-        if (trackedTab) {
-            return trackedTab.id;
-        }
-        currentTabId = null;
-    }
-
-    // Prefer THIS panel's browser window — never the globally "latest" YouTube tab.
-    if (Number.isInteger(hostWindowId)) {
-        try {
-            const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: hostWindowId });
-            if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url)) {
-                currentTabId = tabInHostWindow.id;
-                return currentTabId;
-            }
-        } catch (e) {
-            console.debug('[Panel] Failed to query active tab in host window:', e);
-        }
-
-        try {
-            const hostTabs = await chrome.tabs.query({
-                windowId: hostWindowId,
-                url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
-            });
-            const fallback = pickBestYouTubeWatchTab(hostTabs);
-            if (fallback && Number.isInteger(fallback.id)) {
-                currentTabId = fallback.id;
-                return currentTabId;
-            }
-        } catch (e) {
-            console.debug('[Panel] Failed to query host tabs:', e);
-        }
-
-        return null;
-    }
-
-    // Last resort: adopt our own window, then its active watch tab only.
-    try {
-        const win = await chrome.windows.getCurrent();
-        if (Number.isInteger(win?.id)) {
-            hostWindowId = win.id;
-            const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-            if (tab && isYouTubeWatchUrl(tab.url)) {
-                currentTabId = tab.id;
-                return currentTabId;
-            }
-        }
     } catch (e) {
-        console.debug('[Panel] Failed to adopt own window for tab resolve:', e);
+        console.debug('[Panel] Failed to query active tab in host window:', e);
     }
-
+    // Active tab is not a YouTube video — do not resurrect a background watch tab.
     return null;
 }
 
@@ -1500,8 +1739,10 @@ async function sendPanelHeartbeat() {
     });
 }
 
-async function sendPanelClosed() {
-    const tabId = await resolveActiveYouTubeTabId() ?? getBoundTabId();
+async function sendPanelClosed(explicitTabId = null) {
+    const tabId = Number.isInteger(explicitTabId)
+        ? explicitTabId
+        : (await resolveActiveYouTubeTabId() ?? getBoundTabId());
     if (!Number.isInteger(tabId)) return;
     chrome.runtime.sendMessage({ action: 'panelClosed', tabId, panelInstanceId }, () => {
         if (chrome.runtime.lastError) {
@@ -1518,12 +1759,12 @@ function startPanelHeartbeat() {
     panelHeartbeatTimer = setInterval(sendPanelHeartbeat, 2500);
 }
 
-function stopPanelHeartbeat() {
+function stopPanelHeartbeat(explicitTabId = null) {
     if (panelHeartbeatTimer) {
         clearInterval(panelHeartbeatTimer);
         panelHeartbeatTimer = null;
     }
-    sendPanelClosed();
+    sendPanelClosed(explicitTabId);
 }
 
 
@@ -1709,7 +1950,6 @@ function initButtons() {
     const btnExportPDF = document.getElementById('btn-export-pdf');
     const btnPreviewPDF = document.getElementById('btn-preview-pdf');
     const btnClosePreview = document.getElementById('btn-close-preview');
-    const btnClosePanel = document.getElementById('btn-close-panel');
     const btnCopyTranscript = document.getElementById('btn-copy-transcript');
     const btnDeleteAllScreenshots = document.getElementById('btn-delete-all-screenshots');
     const btnExportWatchLater = document.getElementById('btn-export-watch-later');
@@ -1722,6 +1962,8 @@ function initButtons() {
 
     // Listeners
     if (btnCaptureFull) btnCaptureFull.addEventListener('click', handleCapture);
+    if (btnCaptureArea) btnCaptureArea.addEventListener('click', handleAreaCapture);
+    if (btnDurationCalc) btnDurationCalc.addEventListener('click', handleDurationCalculator);
     if (btnCountdownManager) btnCountdownManager.addEventListener('click', () => {
         const tabBtn = document.querySelector('.tab-btn[data-tab="tab-countdown"]');
         if (tabBtn) tabBtn.click();
@@ -1781,9 +2023,18 @@ function initButtons() {
 
     if (btnCreateBoard) btnCreateBoard.addEventListener('click', handleCreateBoard);
     if (btnDeleteAllScreenshots) btnDeleteAllScreenshots.addEventListener('click', handleDeleteAllScreenshotsForCurrentVideo);
-    const btnCaptureAuto = document.getElementById('btn-capture-auto');
-    if (btnCaptureAuto) {
-        // Initialization handled by initAutoShotToggle
+
+    const timelineTrack = document.querySelector('.timeline-track');
+    if (timelineTrack) {
+        timelineTrack.addEventListener('click', async (e) => {
+            const rect = timelineTrack.getBoundingClientRect();
+            if (rect.width <= 0) return;
+            const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+            const durationMs = state?.metadata?.durationMs || 0;
+            if (durationMs <= 0) return;
+            const seekMs = Math.round(pct * durationMs);
+            await seekActiveYouTubeTab(seekMs);
+        });
     }
 
     if (document.getElementById('btn-set-interval')) {
@@ -1794,7 +2045,6 @@ function initButtons() {
     const tocModal = document.getElementById('toc-modal-overlay');
     const tocModalClose = document.getElementById('toc-modal-close');
     const tocModalCloseBottom = document.getElementById('toc-modal-close-bottom');
-    const tocModalList = document.getElementById('toc-modal-list');
 
     if (document.getElementById('btn-toc')) {
         document.getElementById('btn-toc').addEventListener('click', () => {
@@ -1828,6 +2078,9 @@ function initButtons() {
         } else if (key === 'z') {
             e.preventDefault();
             openLastScreenshotNote();
+        } else if (key === 't') {
+            e.preventDefault();
+            handleAddTOC();
         } else if (key === 'a') {
             e.preventDefault();
             handleAreaCapture();
@@ -2240,6 +2493,12 @@ async function pollCurrentVideo() {
     isPollInProgress = true;
 
     try {
+        // Follow tab switches in this window before reading the locked bound tab.
+        const rebound = await rebindToActiveWatchTabInHostWindow();
+        if (rebound) {
+            console.log('[TabFollow][Panel] poll rebound before resolve', { boundTabId, currentVideoId });
+        }
+
         const tab = await resolveTrackedYouTubeTab();
         if (tab && isYouTubeWatchUrl(tab.url)) {
             disconnectedPollCount = 0;
@@ -3620,7 +3879,7 @@ async function handleCreateBoard() {
         console.error("Board canvas extraction failed:", e);
         dataUrl = TRANSPARENT_PIXEL_DATA_URL; // Fallback
     }
-    const blob = precomputedBlob || await dataURLtoBlobAsync(dataUrl);
+    const blob = await dataURLtoBlobAsync(dataUrl);
 
     // Get current time from content script
     let timeMs = 0;
@@ -4370,7 +4629,7 @@ function renderHistoryEntry(list, entry) {
         ${thumbUrl ? `<img class="history-thumb" src="${thumbUrl}" alt="thumb">` : '<div class="history-thumb"></div>'}
         <div class="history-info">
             <div class="history-header">
-                <div class="history-title">${title}</div>
+                <div class="history-title">${escapeHtml(title)}</div>
                 <button class="history-delete-btn" title="Delete all data for this video">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                 </button>
@@ -4378,9 +4637,9 @@ function renderHistoryEntry(list, entry) {
             <div class="history-meta">
                 <div class="history-stats">
                     <span class="stat-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg> ${entry.shotCount || 0}</span>
-                    <span class="stat-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg> ${entry.tocCount || 0}</span>
+                    <span class="stat-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></path></svg> ${entry.tocCount || 0}</span>
                 </div>
-                <div class="history-channel"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg> ${entry.channel || 'YouTube'}</div>
+                <div class="history-channel"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg> ${escapeHtml(entry.channel || 'YouTube')}</div>
             </div>
         </div>
     `;
@@ -4664,9 +4923,9 @@ function renderTOCModal() {
         item.style.paddingLeft = `${16 + indentSize}px`;
         item.dataset.entryId = entry.id;
         item.innerHTML = `
-            <span class="toc-heading-label">${entry.level}</span>
-            <span class="toc-marker-title">${entry.title}</span>
-            <span class="toc-marker-time">${entry.timeFormatted || formatTime(entry.timestampMs)}</span>
+            <span class="toc-heading-label">${escapeHtml(entry.level)}</span>
+            <span class="toc-marker-title">${escapeHtml(entry.title)}</span>
+            <span class="toc-marker-time">${escapeHtml(entry.timeFormatted || formatTime(entry.timestampMs))}</span>
         `;
 
         item.addEventListener('click', async () => {
@@ -4713,21 +4972,34 @@ function clearVideoStateUI() {
     state.metadata = {};
     state.activeIntervalCount = 0;
 
+    // Always drop stale title/channel/progress so a tab swap never keeps the old video header.
+    const titleEl = document.getElementById('video-title');
+    if (titleEl) titleEl.textContent = 'Clip Notes';
+    const detailsEl = document.getElementById('video-details');
+    if (detailsEl) detailsEl.textContent = 'Connect to a video...';
+    const fillEl = document.getElementById('progress-fill');
+    if (fillEl) fillEl.style.width = '0%';
+    const pctEl = document.getElementById('progress-percentage');
+    if (pctEl) pctEl.textContent = '0%';
+    const timeEl = document.getElementById('time-display');
+    if (timeEl) timeEl.textContent = '00:00 / 00:00';
+
     // Fix #10: Clear auto-screenshot interval on video change
     if (autoScreenshotInterval) {
         clearTimeout(autoScreenshotInterval);
         autoScreenshotInterval = null;
+    }
+    if (autoScreenshotActive || lastAutoFrameHash) {
         autoScreenshotActive = false;
         lastAutoFrameHash = null;
-        cachedPlaybackRate = 1.0; // Reset playback rate cache
+        cachedPlaybackRate = 1.0;
         lastPlaybackRateFetch = 0;
-        const toggle = document.getElementById('toggle-auto-screenshot');
-        if (toggle) toggle.checked = false;
-        const text = document.getElementById('auto-screenshot-text');
-        if (text) {
-            text.textContent = 'Off';
-            text.classList.remove('active');
+        const autoBtn = document.getElementById('btn-capture-auto');
+        if (autoBtn) {
+            autoBtn.classList.remove('primary');
+            autoBtn.title = 'Toggle Auto Screenshot';
         }
+        lastAutoScreenshotTime = 0;
     }
 
     // Fix #17: Clear transcript cache on video change
@@ -4775,6 +5047,14 @@ function escapeHtmlForExport(text) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+function escapeHtml(text) {
+    return escapeHtmlForExport(text);
+}
+
+function escapeAttr(text) {
+    return escapeHtmlForExport(text);
 }
 
 function normalizeInlineStyleForExport(styleText, maxFontPx = 16) {
@@ -7849,8 +8129,8 @@ function displayTranscript(segments) {
         const item = document.createElement('div');
         item.className = 'transcript-item';
         item.innerHTML = `
-            <span class="transcript-time">${seg.time}</span>
-            <span class="transcript-text">${seg.text}</span>
+            <span class="transcript-time">${escapeHtml(seg.time)}</span>
+            <span class="transcript-text">${escapeHtml(seg.text)}</span>
         `;
 
         item.addEventListener('click', () => {
@@ -8307,16 +8587,6 @@ function generateIntervalMarkers() {
         return;
     }
 
-    container.innerHTML = '';
-    // Clear previous density classes
-    container.classList.remove('compact-flags', 'mini-flags', 'micro-flags');
-    state.intervalMarkers = [];
-
-    if (!intervalStr || intervalStr === "None") {
-        console.log("Sidepanel: Markers disabled (interval is None)");
-        return;
-    }
-
     const intervalSecs = parseInt(intervalStr);
     const durationMs = state.metadata.durationMs || 0;
 
@@ -8535,14 +8805,14 @@ function renderWatchLaterList() {
         card.innerHTML = `
             <div class="wl-main-info">
                 <div class="wl-thumb-container">
-                    <img src="${item.thumbnail}" class="wl-thumb" loading="lazy">
-                    <div class="wl-priority-badge">${item.priority}</div>
+                    <img src="${escapeAttr(item.thumbnail)}" class="wl-thumb" loading="lazy">
+                    <div class="wl-priority-badge">${escapeHtml(String(item.priority))}</div>
                 </div>
                 <div class="wl-details">
-                    <div class="wl-title" title="${item.title}">${item.title}</div>
-                    <div class="wl-meta">Added: ${dateStr} • Priority: ${item.priority}</div>
-                    <div class="wl-progress" title="${item.progressPercentage}% watched">
-                        <div class="wl-progress-fill" style="width: ${item.progressPercentage}%"></div>
+                    <div class="wl-title" title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</div>
+                    <div class="wl-meta">Added: ${escapeHtml(dateStr)} • Priority: ${escapeHtml(String(item.priority))}</div>
+                    <div class="wl-progress" title="${escapeAttr(String(item.progressPercentage))}% watched">
+                        <div class="wl-progress-fill" style="width: ${escapeAttr(String(item.progressPercentage))}%"></div>
                     </div>
                 </div>
             </div>
@@ -8634,20 +8904,23 @@ async function handleAddCountdownPrompt() {
     const startDateStr = today.toISOString().split('T')[0];
     let endDateStr = "";
 
-    if (!isNaN(parseInt(durationInput))) {
-        // It's a number (duration in days)
-        const days = parseInt(durationInput);
+    const trimmedInput = String(durationInput).trim();
+    const exactDateMatch = trimmedInput.match(/^(\d{4}-\d{2}-\d{2})$/);
+    if (exactDateMatch) {
+        const parsed = new Date(`${exactDateMatch[1]}T00:00:00`);
+        if (Number.isNaN(parsed.getTime())) {
+            showToast("Invalid date format. Use YYYY-MM-DD.", "error");
+            return;
+        }
+        endDateStr = exactDateMatch[1];
+    } else if (/^\d+$/.test(trimmedInput)) {
+        const days = parseInt(trimmedInput, 10);
         const endDate = new Date(today);
         endDate.setDate(today.getDate() + days);
         endDateStr = endDate.toISOString().split('T')[0];
     } else {
-        // Assume it's a date string
-        endDateStr = durationInput;
-        // Validate
-        if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(endDateStr)) {
-            showToast("Invalid date format. Use YYYY-MM-DD.", "error");
-            return;
-        }
+        showToast("Invalid input. Use days (e.g. 30) or YYYY-MM-DD.", "error");
+        return;
     }
 
     const newId = Date.now();
@@ -8716,7 +8989,7 @@ function renderCountdowns() {
         }
 
         if (parseError) {
-            card.innerHTML = `<div class="cd-error">Error parsing dates for ${c.title}</div>`;
+            card.innerHTML = `<div class="cd-error">Error parsing dates for ${escapeHtml(c.title)}</div>`;
             list.appendChild(card);
             return;
         }
@@ -8743,7 +9016,7 @@ function renderCountdowns() {
 
         let html = `
             <div class="cd-header">
-                <div class="cd-title">${c.title}</div>
+                <div class="cd-title">${escapeHtml(c.title)}</div>
                 <div class="cd-header-actions">
                     <label class="cd-transparency-toggle" title="Transparency Mode">
                         <input type="checkbox" class="cd-trans-check" data-id="${c.id}" ${isTransparent ? 'checked' : ''}>
@@ -8757,7 +9030,7 @@ function renderCountdowns() {
             </div>
             
             <div class="cd-meta">
-                <span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg> ${c.startDate} - ${c.endDate}</span>
+                <span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg> ${escapeHtml(c.startDate)} - ${escapeHtml(c.endDate)}</span>
                 <span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg> ${totalDays} days total</span>
                 ${alertBadge}
             </div>

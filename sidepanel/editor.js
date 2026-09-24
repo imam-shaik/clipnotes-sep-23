@@ -24,7 +24,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const params = new URLSearchParams(window.location.search);
     shotId = params.get('shotId');
     videoId = params.get('videoId');
-    editorTabId = Number(params.get('tabId'));
+    const rawTabId = params.get('tabId');
+    editorTabId = Number.isFinite(Number(rawTabId)) && Number(rawTabId) > 0 ? Number(rawTabId) : null;
 
     if (!shotId) return window.close();
 
