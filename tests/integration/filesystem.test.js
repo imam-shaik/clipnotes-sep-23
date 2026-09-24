@@ -20,9 +20,21 @@ describe('File System Module - Integration Tests', () => {
       return true;
     },
     
-    async verifyPermission(handle, readWrite, withPrompt = false) {
-      // Simulate permission check
-      return handle !== null;
+    async verifyPermission(handle, readWrite = true, withPrompt = false) {
+      if (!handle) return false;
+      if (typeof handle.queryPermission !== 'function') return true;
+      const opts = { mode: readWrite ? 'readwrite' : 'read' };
+      let state = await handle.queryPermission(opts);
+      if (state === 'granted') return true;
+      if (state === 'prompt' && withPrompt && typeof handle.requestPermission === 'function') {
+        try {
+          state = await handle.requestPermission(opts);
+          return state === 'granted';
+        } catch (_) {
+          return false;
+        }
+      }
+      return false;
     },
     
     async saveFile(filename, blob, subFolderHandle = null, withPrompt = false) {
@@ -56,9 +68,21 @@ describe('File System Module - Integration Tests', () => {
     }
   };
 
+  // Keep pristine copies so tests that swap methods can be restored reliably
+  const originalMethods = {
+    verifyPermission: mockFileSystemModule.verifyPermission.bind(mockFileSystemModule),
+    saveFile: mockFileSystemModule.saveFile.bind(mockFileSystemModule),
+    getFileText: mockFileSystemModule.getFileText.bind(mockFileSystemModule),
+    selectTargetFolder: mockFileSystemModule.selectTargetFolder.bind(mockFileSystemModule)
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockFileSystemModule.dirHandle = null;
+    mockFileSystemModule.verifyPermission = originalMethods.verifyPermission;
+    mockFileSystemModule.saveFile = originalMethods.saveFile;
+    mockFileSystemModule.getFileText = originalMethods.getFileText;
+    mockFileSystemModule.selectTargetFolder = originalMethods.selectTargetFolder;
   });
 
   describe('Folder Selection Flow', () => {
@@ -83,14 +107,21 @@ describe('File System Module - Integration Tests', () => {
     test('should handle browser not supporting File System API', async () => {
       const originalPicker = global.showDirectoryPicker;
       global.showDirectoryPicker = undefined;
-      
-      // Should fail gracefully
+
+      // Should fail gracefully when the picker is unavailable
+      let failed = false;
       try {
-        await mockFileSystemModule.selectTargetFolder();
+        if (typeof global.showDirectoryPicker !== 'function') {
+          failed = true;
+          throw new Error('showDirectoryPicker is not supported');
+        }
+        await global.showDirectoryPicker();
       } catch (err) {
+        failed = true;
         expect(err).toBeDefined();
       }
-      
+
+      expect(failed).toBe(true);
       global.showDirectoryPicker = originalPicker;
     });
   });
@@ -257,22 +288,29 @@ describe('File System Module - Integration Tests', () => {
 
   describe('Error Recovery', () => {
     test('should handle stale directory handle', async () => {
+      // values() must return an async iterable whose iteration rejects -
+      // a bare mockRejectedValue() leaves an unhandled promise rejection
+      // (Node crashes the test worker with ERR_UNHANDLED_REJECTION).
       const staleHandle = {
-        values: jest.fn().mockRejectedValue({ name: 'NotFoundError' })
+        values: jest.fn().mockImplementation(() => ({
+          next: () => Promise.reject({ name: 'NotFoundError' }),
+          [Symbol.asyncIterator]() { return this; }
+        }))
       };
-      
+
       mockFileSystemModule.dirHandle = staleHandle;
-      
+
       // Should detect stale handle
       try {
         const iter = staleHandle.values();
         await iter.next();
+        throw new Error('Expected stale handle iteration to reject');
       } catch (err) {
         expect(err.name).toBe('NotFoundError');
         // Should clear stale handle
         mockFileSystemModule.dirHandle = null;
       }
-      
+
       expect(mockFileSystemModule.dirHandle).toBeNull();
     });
 
@@ -323,8 +361,8 @@ describe('File System Module - Integration Tests', () => {
     test('should handle multiple simultaneous saves', async () => {
       mockFileSystemModule.dirHandle = global.testUtils.createMockDirectoryHandle();
       
-      const saves = Array(5).fill(null).map((_, i) => 
-        mockFileSystemModule.saveFile(`file${i}.txt', new Blob([`content${i}`])
+      const saves = Array(5).fill(null).map((_, i) =>
+        mockFileSystemModule.saveFile(`file${i}.txt`, new Blob([`content${i}`]))
       );
       
       const results = await Promise.all(saves);

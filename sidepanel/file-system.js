@@ -521,7 +521,7 @@ const FileSystemModule = {
             // VERIFICATION: Check if this folder belongs to a DIFFERENT videoId
             if (videoId) {
                 try {
-                    const fileHandle = await subDirHandle.getFileHandle("video_state.json");
+                    const fileHandle = await subDirHandle.getFileHandle("video_notes_state.json");
                     const file = await fileHandle.getFile();
                     const text = await file.text();
                     const state = JSON.parse(text);

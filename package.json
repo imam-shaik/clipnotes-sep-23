@@ -4,7 +4,7 @@
   "description": "YouTube video note-taking extension with screenshot capture and PDF export",
   "private": true,
   "scripts": {
-    "test": "jest --config jest.config.js --coverage",
+    "test": "jest --config jest.config.js",
     "test:watch": "jest --config jest.config.js --watch",
     "test:coverage": "jest --config jest.config.js --coverage --coverageReporters=html",
     "test:unit": "jest --config jest.config.js --testPathPattern=tests/unit",

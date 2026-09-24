@@ -1,6 +1,5 @@
 // background/service-worker.js
 
-const panelHeartbeatByTab = new Map();
 const detachedPanelWindowByTab = new Map();
 const relatedWindowsByTab = new Map(); // tabId -> Set of windowIds (detached panels, editors)
 const DETACHED_PANEL_MIN_WIDTH = 180;
@@ -21,6 +20,33 @@ const TIMEOUT_CONFIG = {
 
 // Keep track of original maximize states during tiling
 const tilingRestoreStates = new Map();
+
+// tabId -> Map<panelInstanceId, lastHeartbeatTs>
+// Multiple panel instances may share a tab; close one must not mark the tab closed.
+const panelHeartbeatByTab = new Map();
+const LEGACY_PANEL_INSTANCE = '__default__';
+
+function setPanelHeartbeat(tabId, instanceId = LEGACY_PANEL_INSTANCE) {
+  if (!Number.isInteger(tabId)) return;
+  let byInstance = panelHeartbeatByTab.get(tabId);
+  if (!byInstance) {
+    byInstance = new Map();
+    panelHeartbeatByTab.set(tabId, byInstance);
+  }
+  byInstance.set(String(instanceId || LEGACY_PANEL_INSTANCE), Date.now());
+}
+
+function clearPanelHeartbeat(tabId, instanceId) {
+  if (!Number.isInteger(tabId)) return;
+  if (instanceId == null) {
+    panelHeartbeatByTab.delete(tabId);
+    return;
+  }
+  const byInstance = panelHeartbeatByTab.get(tabId);
+  if (!byInstance) return;
+  byInstance.delete(String(instanceId));
+  if (byInstance.size === 0) panelHeartbeatByTab.delete(tabId);
+}
 
 // Fix #1: Persist detached panel state to survive service worker restarts
 const STORAGE_KEY_DETACHED_PANELS = 'detachedPanelState_v1';
@@ -123,16 +149,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'contentScriptReady') {
     handleContentScriptReady(message, sender, sendResponse);
     return false;
+  } else if (message.action === 'getMyTabId') {
+    sendResponse({
+      success: true,
+      tabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null
+    });
+    return false;
   }
 });
 
 function handleOpenBigEditor(message, sender, sendResponse) {
   const { shotId, videoId, videoTitle, html } = message;
-  chrome.storage.local.set({ bigEditorBuffer: { shotId, html } }, () => {
+  // Per-shot buffer key so concurrent big editors cannot clobber each other.
+  const bufferKey = shotId ? `bigEditorBuffer:${shotId}` : 'bigEditorBuffer';
+  chrome.storage.local.set({ [bufferKey]: { shotId, html }, bigEditorBuffer: { shotId, html } }, () => {
     const query = new URLSearchParams({
       shotId,
       videoId,
-      videoTitle: videoTitle || "Video Note"
+      videoTitle: videoTitle || "Video Note",
+      tabId: Number.isInteger(message.tabId) ? String(message.tabId) : ''
     });
     const url = chrome.runtime.getURL(`sidepanel/note-editor-big.html?${query.toString()}`);
 
@@ -162,6 +197,7 @@ function handleSyncNoteEdit(message, sender, sendResponse) {
     type: 'NOTE_SYNCED',
     shotId: message.shotId,
     videoId: message.videoId,
+    tabId: Number.isInteger(message.tabId) ? message.tabId : null,
     html: message.html
   });
   sendResponse({ success: true });
@@ -193,7 +229,7 @@ function handleCloseSidePanel(message, sender, sendResponse) {
 function handlePanelHeartbeat(message, sender, sendResponse) {
   const tabId = Number(message.tabId);
   if (Number.isInteger(tabId)) {
-    panelHeartbeatByTab.set(tabId, Date.now());
+    setPanelHeartbeat(tabId, message.panelInstanceId || LEGACY_PANEL_INSTANCE);
   }
   sendResponse({ success: true });
 }
@@ -201,7 +237,8 @@ function handlePanelHeartbeat(message, sender, sendResponse) {
 function handlePanelClosed(message, sender, sendResponse) {
   const tabId = Number(message.tabId);
   if (Number.isInteger(tabId)) {
-    panelHeartbeatByTab.delete(tabId);
+    // Only remove this panel instance; other panels on the tab keep the heartbeat alive.
+    clearPanelHeartbeat(tabId, message.panelInstanceId || LEGACY_PANEL_INSTANCE);
   }
   sendResponse({ success: true });
 }
@@ -214,7 +251,11 @@ function handleIsPanelOpen(message, sender, sendResponse) {
 function handleContentScriptReady(message, sender, sendResponse) {
   try {
     chrome.runtime.sendMessage(
-      { type: 'CONTENT_READY', videoId: message.videoId },
+      {
+        type: 'CONTENT_READY',
+        videoId: message.videoId,
+        tabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null
+      },
       () => {
         if (chrome.runtime.lastError) { /* ignore */ }
       }
@@ -226,9 +267,19 @@ function handleContentScriptReady(message, sender, sendResponse) {
 }
 function isPanelOpenForTab(tabId) {
   if (!Number.isInteger(tabId)) return false;
-  const ts = panelHeartbeatByTab.get(tabId);
-  if (!ts) return false;
-  return (Date.now() - ts) <= 4000;
+  const byInstance = panelHeartbeatByTab.get(tabId);
+  if (!byInstance || byInstance.size === 0) return false;
+  const now = Date.now();
+  let anyLive = false;
+  for (const [instanceId, ts] of Array.from(byInstance.entries())) {
+    if (now - ts <= 4000) {
+      anyLive = true;
+    } else {
+      byInstance.delete(instanceId);
+    }
+  }
+  if (byInstance.size === 0) panelHeartbeatByTab.delete(tabId);
+  return anyLive;
 }
 
 async function resolveHostWindowForTab(tabId, hostWindowIdHint) {
@@ -333,7 +384,7 @@ async function syncDetachedPairFromHost(tabId) {
     });
 
     entry.panelWidth = panelWidth;
-    panelHeartbeatByTab.set(tabId, Date.now());
+    setPanelHeartbeat(tabId);
 
     // Persist widths
     chrome.storage.local.set({
@@ -403,7 +454,7 @@ async function syncDetachedPairFromPanel(tabId) {
     });
 
     entry.panelWidth = panelWidth;
-    panelHeartbeatByTab.set(tabId, Date.now());
+    setPanelHeartbeat(tabId);
 
     // Persist widths
     chrome.storage.local.set({
@@ -588,13 +639,23 @@ async function openNotesPanelForTab(tabId, hostWindowIdHint = null) {
 
   if (chrome.sidePanel?.setOptions && chrome.sidePanel?.open) {
     try {
+      // Session claim: panel adopts this if Chrome strips ?tabId= from the path.
+      if (chrome.storage?.session?.set) {
+        try {
+          await chrome.storage.session.set({
+            pendingSidePanelTabId: tabId,
+            pendingSidePanelToken: `${tabId}:${Date.now()}`,
+            pendingSidePanelOpenedAt: Date.now()
+          });
+        } catch (_) { /* session storage optional */ }
+      }
       await chrome.sidePanel.setOptions({
         tabId,
-        path: "sidepanel/panel.html",
+        path: `sidepanel/panel.html?tabId=${tabId}`,
         enabled: true
       });
       await chrome.sidePanel.open({ tabId });
-      panelHeartbeatByTab.set(tabId, Date.now());
+      setPanelHeartbeat(tabId);
       return true;
     } catch (_) {
       // Fall back to detached panel window (installed app windows may block sidePanel.open()).
@@ -603,7 +664,7 @@ async function openNotesPanelForTab(tabId, hostWindowIdHint = null) {
 
   const detachedOpened = await openDetachedPanelWindow(tabId, hostWindowIdHint);
   if (detachedOpened) {
-    panelHeartbeatByTab.set(tabId, Date.now());
+    setPanelHeartbeat(tabId);
     return true;
   }
 
@@ -614,6 +675,16 @@ async function closeNotesPanelForTab(tabId) {
   if (!Number.isInteger(tabId)) return false;
 
   panelHeartbeatByTab.delete(tabId);
+
+  if (chrome.storage?.session?.remove) {
+    try {
+      await chrome.storage.session.remove([
+        'pendingSidePanelTabId',
+        'pendingSidePanelToken',
+        'pendingSidePanelOpenedAt'
+      ]);
+    } catch (_) { /* ignore */ }
+  }
 
   let closedAnything = false;
 

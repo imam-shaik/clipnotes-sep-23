@@ -20,6 +20,7 @@ class YouTubeNotesContent {
         this.activationLauncher = null;
         this.notebookEnabled = false;
         this.isPanelOpen = false;
+        this.myTabId = null;
         this.panelStatePollTimer = null;
         this.storageListenerAttached = false;
         this._playerInterval = null;
@@ -39,8 +40,34 @@ class YouTubeNotesContent {
         this.setupActivationLauncher();
         this.setupMessageListener();
         this.setupKeyboardShortcuts();
-        this.setupMiniViewListener();
+        this.resolveMyTabId().finally(() => this.setupMiniViewListener());
         // console.log("YouTube Notes Extension: Content Script Initialized.");
+    }
+
+    resolveMyTabId() {
+        if (!chrome?.runtime?.sendMessage) return Promise.resolve(null);
+        return new Promise((resolve) => {
+            try {
+                chrome.runtime.sendMessage({ action: 'getMyTabId' }, (response) => {
+                    if (chrome.runtime.lastError) {
+                        resolve(null);
+                        return;
+                    }
+                    this.myTabId = Number.isInteger(response?.tabId) ? response.tabId : null;
+                    resolve(this.myTabId);
+                });
+            } catch (_) {
+                resolve(null);
+            }
+        });
+    }
+
+    shouldRenderMiniView(cd) {
+        if (!cd) return false;
+        // Require explicit target tab so other windows never show this overlay.
+        if (!Number.isInteger(cd.tabId)) return false;
+        if (!Number.isInteger(this.myTabId)) return false;
+        return cd.tabId === this.myTabId;
     }
 
     isRuntimeAvailable() {
@@ -241,25 +268,9 @@ class YouTubeNotesContent {
     }
 
     attachStorageListener() {
-        if (!chrome?.storage?.onChanged) return;
-
-        // Idempotency: Remove existing listener if any
-        if (this._storageChangeListener) {
-            try {
-                chrome.storage.onChanged.removeListener(this._storageChangeListener);
-            } catch (e) { /* Extension context might be invalidated */ }
-        }
-
-        this._storageChangeListener = (changes, areaName) => {
-            if (areaName !== 'local') return;
-            if (Object.prototype.hasOwnProperty.call(changes, 'ynNotebookEnabled')) {
-                this.notebookEnabled = changes.ynNotebookEnabled?.newValue === true;
-                this.setActivationLauncherVisible(true);
-            }
-        };
-
-        chrome.storage.onChanged.addListener(this._storageChangeListener);
-        this.storageListenerAttached = true;
+        // Notebook toggle is scoped to the bound tab via setNotebookEnabled messages.
+        // Do not mirror a global ynNotebookEnabled key (it reflected across all windows).
+        this.storageListenerAttached = false;
     }
 
     ensureActivationLauncher() {
@@ -317,15 +328,9 @@ class YouTubeNotesContent {
     }
 
     refreshActivationLauncherFromStorage() {
-        if (!chrome.runtime?.id) return;
-        chrome.storage.local.get(['ynNotebookEnabled'], (result) => {
-            if (!chrome.runtime?.id || chrome.runtime.lastError) {
-                this.setActivationLauncherVisible(true);
-                return;
-            }
-            this.notebookEnabled = result?.ynNotebookEnabled === true;
-            this.setActivationLauncherVisible(true);
-        });
+        // Launcher visibility depends on watch page + panel open state only.
+        // Notebook flag is delivered per-tab via setNotebookEnabled, not global storage.
+        this.setActivationLauncherVisible(true);
     }
 
     extractVideoId() {
@@ -1616,9 +1621,21 @@ class YouTubeNotesContent {
     setupMiniViewListener() {
         if (!chrome?.storage?.onChanged) return;
 
-        chrome.storage.local.get(['activeCountdownMiniView', 'activeCountdownMiniViewPos'], (result) => {
-            if (result.activeCountdownMiniView) {
-                this.renderMiniView(result.activeCountdownMiniView, result.activeCountdownMiniViewPos);
+        const myViewKey = Number.isInteger(this.myTabId) ? `activeCountdownMiniView:${this.myTabId}` : null;
+        const myPosKey = Number.isInteger(this.myTabId) ? `activeCountdownMiniViewPos:${this.myTabId}` : null;
+        const readKeys = ['activeCountdownMiniView', 'activeCountdownMiniViewPos'];
+        if (myViewKey) readKeys.push(myViewKey);
+        if (myPosKey) readKeys.push(myPosKey);
+
+        chrome.storage.local.get(readKeys, (result) => {
+            const own = myViewKey ? result[myViewKey] : null;
+            const legacy = result.activeCountdownMiniView;
+            const cd = (own && this.shouldRenderMiniView(own))
+                ? own
+                : ((legacy && this.shouldRenderMiniView(legacy)) ? legacy : null);
+            if (cd) {
+                const pos = (myPosKey && result[myPosKey]) || result.activeCountdownMiniViewPos;
+                this.renderMiniView(cd, pos);
             }
         });
 
@@ -1631,13 +1648,33 @@ class YouTubeNotesContent {
         this._miniViewStorageChangeListener = (changes, areaName) => {
             if (areaName !== 'local') return;
 
+            // Prefer this tab's scoped key; ignore other tabs' keys entirely.
+            if (myViewKey && changes[myViewKey]) {
+                const cd = changes[myViewKey].newValue;
+                if (cd && this.shouldRenderMiniView(cd)) {
+                    const posRead = myPosKey ? [myPosKey] : [];
+                    if (posRead.length) {
+                        chrome.storage.local.get(posRead, (posRes) => {
+                            this.renderMiniView(cd, posRes[myPosKey]);
+                        });
+                    } else {
+                        this.renderMiniView(cd, null);
+                    }
+                } else if (!cd) {
+                    this.removeMiniView();
+                }
+                return;
+            }
+
+            // Legacy single-key path: never tear down because ANOTHER tab wrote.
             if (changes.activeCountdownMiniView) {
                 const cd = changes.activeCountdownMiniView.newValue;
-                if (cd) {
+                if (cd && this.shouldRenderMiniView(cd)) {
                     chrome.storage.local.get(['activeCountdownMiniViewPos'], (posRes) => {
                         this.renderMiniView(cd, posRes.activeCountdownMiniViewPos);
                     });
-                } else {
+                } else if (!cd || (Number.isInteger(cd?.tabId) && cd.tabId === this.myTabId)) {
+                    // Cleared, or was ours and is now invalid — not a foreign-tab write.
                     this.removeMiniView();
                 }
             }
@@ -1744,7 +1781,14 @@ class YouTubeNotesContent {
         `;
 
         container.querySelector('.cd-mini-close').onclick = () => {
-            chrome.storage.local.remove(['activeCountdownMiniView', 'activeCountdownMiniViewPos']);
+            const keys = ['activeCountdownMiniView', 'activeCountdownMiniViewPos'];
+            if (Number.isInteger(this.myTabId)) {
+                keys.push(
+                    `activeCountdownMiniView:${this.myTabId}`,
+                    `activeCountdownMiniViewPos:${this.myTabId}`
+                );
+            }
+            chrome.storage.local.remove(keys);
         };
 
         const header = container.querySelector('#yt-notes-cd-header');
@@ -1768,7 +1812,14 @@ class YouTubeNotesContent {
             initialX = currentX;
             initialY = currentY;
             isDragging = false;
-            chrome.storage.local.set({ activeCountdownMiniViewPos: { x: currentX, y: currentY } });
+            if (Number.isInteger(this.myTabId)) {
+                chrome.storage.local.set({
+                    [`activeCountdownMiniViewPos:${this.myTabId}`]: { x: currentX, y: currentY },
+                    activeCountdownMiniViewPos: { x: currentX, y: currentY }
+                });
+            } else {
+                chrome.storage.local.set({ activeCountdownMiniViewPos: { x: currentX, y: currentY } });
+            }
         };
 
         const drag = (e) => {

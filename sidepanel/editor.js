@@ -1,6 +1,6 @@
 // ── YouTube Notes Pro - Refined Drawing Engine ──
 
-let shotId, videoId;
+let shotId, videoId, editorTabId;
 let bgCanvas, drawCanvas, previewCanvas;
 let bgCtx, drawCtx, previewCtx;
 let isDrawing = false;
@@ -24,6 +24,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const params = new URLSearchParams(window.location.search);
     shotId = params.get('shotId');
     videoId = params.get('videoId');
+    editorTabId = Number(params.get('tabId'));
 
     if (!shotId) return window.close();
 
@@ -53,7 +54,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         
         async function attemptFetch(retryCount) {
             return new Promise((resolve) => {
-                chrome.runtime.sendMessage({ action: 'requestEditState', shotId }, (resp) => {
+                chrome.runtime.sendMessage({ action: 'requestEditState', shotId, videoId, tabId: editorTabId }, (resp) => {
                     const err = chrome.runtime.lastError;
                     if (err || !resp || !resp.success || !resp.dataUrl) {
                         if (retryCount > 0) {
@@ -355,6 +356,8 @@ function setupInteractions() {
         chrome.runtime.sendMessage({
             action: 'screenshotEdited',
             shotId: shotId,
+            videoId: videoId,
+            tabId: editorTabId,
             dataUrl: finalCanvas.toDataURL('image/png')
         }, () => window.close());
     });

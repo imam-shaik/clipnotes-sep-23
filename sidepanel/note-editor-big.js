@@ -13,6 +13,7 @@
     const shotId = urlParams.get('shotId');
     const videoTitle = urlParams.get('videoTitle');
     const videoId = urlParams.get('videoId');
+    const editorTabId = Number(urlParams.get('tabId'));
 
     if (videoTitle) {
         videoInfo.textContent = `Video: ${videoTitle}`;
@@ -20,18 +21,41 @@
 
     // Load content from opener if available, otherwise from storage
     function loadInitialContent() {
-        // Try to get data from chrome storage if opener isn't available
-        chrome.storage.local.get(['bigEditorBuffer'], (result) => {
-            if (result.bigEditorBuffer && result.bigEditorBuffer.shotId === shotId) {
+        const perShotKey = shotId ? `bigEditorBuffer:${shotId}` : 'bigEditorBuffer';
+        // Prefer per-shot buffer; fall back to legacy shared key.
+        chrome.storage.local.get([perShotKey, 'bigEditorBuffer'], (result) => {
+            const buf = (result[perShotKey] && result[perShotKey].shotId === shotId)
+                ? result[perShotKey]
+                : (result.bigEditorBuffer && result.bigEditorBuffer.shotId === shotId
+                    ? result.bigEditorBuffer
+                    : null);
+            if (buf) {
                 // Sanitize HTML to prevent XSS - use opener's sanitizeNoteHtml if available
-                editor.innerHTML = (typeof sanitizeNoteHtml === 'function') 
-                    ? sanitizeNoteHtml(result.bigEditorBuffer.html) 
-                    : result.bigEditorBuffer.html;
+                editor.innerHTML = (typeof sanitizeNoteHtml === 'function')
+                    ? sanitizeNoteHtml(buf.html)
+                    : buf.html;
             }
         });
     }
 
     loadInitialContent();
+
+    function cleanupEditorBuffers() {
+        try {
+            const keys = [];
+            if (shotId) keys.push(`bigEditorBuffer:${shotId}`);
+            // Drop shared legacy key only when it still points at this shot.
+            chrome.storage.local.get(['bigEditorBuffer'], (result) => {
+                if (result?.bigEditorBuffer?.shotId === shotId) {
+                    keys.push('bigEditorBuffer');
+                }
+                if (keys.length) chrome.storage.local.remove(keys);
+            });
+        } catch (_) { /* context invalidated */ }
+    }
+
+    window.addEventListener('pagehide', cleanupEditorBuffers);
+    window.addEventListener('beforeunload', cleanupEditorBuffers);
 
     // Toolbar logic
     toolbar.querySelectorAll('button:not(.list-style-btn)').forEach(btn => {
@@ -100,15 +124,20 @@
             action: 'syncNoteEdit',
             shotId: shotId,
             videoId: videoId,
+            tabId: editorTabId,
             html: finalHtml
         }, (response) => {
+            cleanupEditorBuffers();
             window.close();
         });
     });
 
     btnCancel.addEventListener('click', async () => {
         const confirmed = await showConfirm("Discard unsaved changes?");
-        if (confirmed) window.close();
+        if (confirmed) {
+            cleanupEditorBuffers();
+            window.close();
+        }
     });
 
     // ── CUSTOM DIALOG OVERLAY ───────────────────────────────────
@@ -142,6 +171,7 @@
 
         if (e.key === 'Escape') {
             e.preventDefault();
+            cleanupEditorBuffers();
             window.close();
         }
 

@@ -5,16 +5,65 @@ let currentVideoId = null;
 let currentVideoTitle = null;
 let currentTabId = null;
 const initialPanelUrlParams = new URLSearchParams(window.location.search);
-const launchedForTabId = Number(initialPanelUrlParams.get('tabId'));
+// Mutable so native side panels can adopt a tabId from storage.session when
+// Chrome strips the query string from sidePanel.setOptions({ path }).
+let boundTabId = Number(initialPanelUrlParams.get('tabId'));
 const panelMode = initialPanelUrlParams.get('mode') || '';
 const launchedForHostWindowId = Number(initialPanelUrlParams.get('hostWindowId'));
 const isDetachedPanel = panelMode === 'detached';
-if (Number.isInteger(launchedForTabId)) {
-    currentTabId = launchedForTabId;
+if (Number.isInteger(boundTabId)) {
+    currentTabId = boundTabId;
+}
+
+function getBoundTabId() {
+    return Number.isInteger(boundTabId) ? boundTabId : null;
+}
+
+async function clearPendingSidePanelClaim() {
+    try {
+        if (!chrome?.storage?.session?.remove) return;
+        await chrome.storage.session.remove([
+            'pendingSidePanelTabId',
+            'pendingSidePanelToken',
+            'pendingSidePanelOpenedAt'
+        ]);
+    } catch (_) { /* already cleared */ }
+}
+
+async function claimPendingSidePanelTabIfNeeded() {
+    if (isDetachedPanel) return;
+    try {
+        if (!chrome?.storage?.session?.get) return;
+
+        // URL already carried tabId: this panel is bound — drop any leftover
+        // claim so a later panel cannot adopt a stale/raced tab id.
+        if (Number.isInteger(boundTabId)) {
+            await clearPendingSidePanelClaim();
+            return;
+        }
+
+        const data = await chrome.storage.session.get([
+            'pendingSidePanelTabId',
+            'pendingSidePanelToken',
+            'pendingSidePanelOpenedAt'
+        ]);
+        const pending = Number(data?.pendingSidePanelTabId);
+        const openedAt = Number(data?.pendingSidePanelOpenedAt);
+        // Ignore claims older than 5s (stale after a crashed/slow panel load).
+        const fresh = Number.isFinite(openedAt) && (Date.now() - openedAt) <= 5000;
+        if (Number.isInteger(pending) && fresh) {
+            boundTabId = pending;
+            currentTabId = pending;
+        }
+        await clearPendingSidePanelClaim();
+    } catch (err) {
+        console.debug('[Panel] Session tab claim failed:', err);
+    }
 }
 let videoScrapeTimer = null;
 let isNotebookEnabled = false;
 let isDataLoadedForId = null; // Track if we've already loaded state for the current ID
+let loadInFlightForId = null; // Track an in-flight loadVideoState to avoid duplicate concurrent loads
 let titleUsedForLoad = null; // Track which title was used for loading (to detect stale titles)
 let isVideoPlaying = false; // Track playback status
 let isAutoOpenEnabled = true; // New: Auto-Open toggle state
@@ -25,6 +74,8 @@ let lastScreenshotTime = 0; // Track time of last screenshot for time-based dupl
 let currentRehydrationTaskId = 0; // Track active rehydration task ID for cancellation support
 const currentlyRehydrating = new Set(); // Track screenshot IDs currently in the process of rehydrating
 let panelHeartbeatTimer = null;
+// Unique per panel document so two panels on one tab do not clear each other.
+const panelInstanceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 let disconnectedPollCount = 0;
 let detachedHostMissingCount = 0;
 let autoScreenshotInterval = null; // Auto-screenshot loop timer
@@ -128,12 +179,26 @@ async function safeSendMessage(tabId, message) {
 document.addEventListener('DOMContentLoaded', async () => {
     // console.log("[STABILITY_V3] DOMContentLoaded starting...");
     try {
-        // Notify content script that panel is open
-        if (launchedForTabId) {
-            safeSendMessage(launchedForTabId, { action: 'TAB_PANEL_OPENED' });
+        // Register message listeners BEFORE any await so CONTENT_READY sent during
+        // startup is never dropped (service worker does not buffer deliveries).
+        if (panelMode !== 'preview') {
+            initMessageListeners();
         }
 
-        startPanelHeartbeat();
+        // Adopt tab binding before any tab-scoped messaging/heartbeat.
+        // Preview mode is a full-tab viewer — never claims a side-panel tab or heartbeats.
+        if (panelMode !== 'preview') {
+            await claimPendingSidePanelTabIfNeeded();
+
+            // Notify content script that panel is open
+            if (Number.isInteger(boundTabId)) {
+                safeSendMessage(boundTabId, { action: 'TAB_PANEL_OPENED' });
+                // Push notebook state so an already-injected content script is in sync.
+                syncNotebookStateToContent(isNotebookEnabled);
+            }
+
+            startPanelHeartbeat();
+        }
         initTheme();
         await initFileSystem();
 
@@ -149,7 +214,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             initCCToggle();
             initTranscriptRangeSettings();
             initWatchLaterTab();
-            initMessageListeners();
             
             // Performance: Only poll if the panel is currently visible
             setInterval(() => {
@@ -168,11 +232,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 window.addEventListener('beforeunload', () => {
-    // Notify content script that panel is closed
-    if (launchedForTabId) {
-        safeSendMessage(launchedForTabId, { action: 'TAB_PANEL_CLOSED' });
+    // Notify content script that panel is closed (not for preview mode — never opened)
+    if (panelMode !== 'preview') {
+        if (Number.isInteger(boundTabId)) {
+            safeSendMessage(boundTabId, { action: 'TAB_PANEL_CLOSED' });
+        }
+        stopPanelHeartbeat();
     }
-    stopPanelHeartbeat();
     
     // Revoke all blob URLs to prevent memory leaks
     if (state.blobUrls) {
@@ -293,6 +359,17 @@ window.addEventListener('blur', () => {
 });
 
 // Surgical, targeted re-hydration helper
+let rehydrationSweepTimer = null;
+function scheduleRehydrationSweep(options = {}) {
+    // Debounced follow-up so a cancelled/stranded task is always picked up
+    // without spawning overlapping tasks that cancel each other in a loop.
+    if (rehydrationSweepTimer) return;
+    rehydrationSweepTimer = setTimeout(() => {
+        rehydrationSweepTimer = null;
+        rehydrateActiveScreenshots(options);
+    }, 300);
+}
+
 async function rehydrateActiveScreenshots(options = {}) {
     if (!FileSystemModule.dirHandle || !currentVideoId || !currentVideoTitle) return;
 
@@ -307,7 +384,9 @@ async function rehydrateActiveScreenshots(options = {}) {
     console.log(`[Rehydrate] Started (Task ID: ${taskId})`);
 
     try {
-        const subFolder = await FileSystemModule.getVideoFolderHandle(currentVideoTitle, false, currentVideoId);
+        // Resolve by videoId first so stale titles cannot miss the folder
+        const subFolder = await resolveVideoFolderHandleForVideoId(currentVideoId, currentVideoTitle)
+            || await FileSystemModule.getVideoFolderHandle(currentVideoTitle, false, currentVideoId);
         if (!subFolder) {
             console.log(`[Rehydrate] Finished (Task ID: ${taskId}) - No subfolder found`);
             return;
@@ -325,7 +404,15 @@ async function rehydrateActiveScreenshots(options = {}) {
         });
 
         if (toRehydrate.length === 0) {
-            console.log(`[Rehydrate] Finished (Task ID: ${taskId}) - Nothing to rehydrate`);
+            // Another (older) task may still be winding down with items in
+            // currentlyRehydrating; if it cancels without applying updates those
+            // shots would be stranded. Re-check after it settles.
+            if (currentlyRehydrating.size > 0) {
+                console.log(`[Rehydrate] Task ${taskId} waiting on in-flight shots, scheduling sweep`);
+                scheduleRehydrationSweep(options);
+            } else {
+                console.log(`[Rehydrate] Finished (Task ID: ${taskId}) - Nothing to rehydrate`);
+            }
             return;
         }
 
@@ -340,6 +427,8 @@ async function rehydrateActiveScreenshots(options = {}) {
             // Check cancellation before processing the batch
             if (taskId !== currentRehydrationTaskId) {
                 console.log(`[Rehydrate] Cancelled (Task ID: ${taskId}) - Obsoleted by a newer task`);
+                // Ensure shots this task was about to process are picked up again
+                scheduleRehydrationSweep(options);
                 return;
             }
 
@@ -348,19 +437,23 @@ async function rehydrateActiveScreenshots(options = {}) {
                 try {
                     const imgHandle = await subFolder.getFileHandle(shot.filename);
                     const imgFile = await imgHandle.getFile();
-                    
-                    // Verify cancellation after disk read
-                    if (taskId !== currentRehydrationTaskId) return;
 
-                    const blobUrl = URL.createObjectURL(imgFile);
-                    
-                    // Verify state changes during await (e.g., screenshot deleted)
+                    // A successful disk read is always safe to apply even if a newer
+                    // task started meanwhile - only drop it when the screenshot itself
+                    // is gone (e.g. video switch cleared state). Cancelling here used
+                    // to strand images as transparent placeholders until refresh.
                     const stillExists = state.screenshots.some(s => s.id === shot.id);
-                    if (!stillExists || taskId !== currentRehydrationTaskId) {
-                        console.log(`[Rehydrate] Cancelled - Screenshot ${shot.id} deleted or task obsoleted`);
-                        URL.revokeObjectURL(blobUrl);
+                    if (!stillExists) {
                         return;
                     }
+
+                    // If this task is obsolete, the newer task skips in-flight shots;
+                    // apply the result and let the newer task handle anything else.
+                    if (taskId !== currentRehydrationTaskId) {
+                        console.log(`[Rehydrate] Applying late result for ${shot.filename} (task superseded)`);
+                    }
+
+                    const blobUrl = URL.createObjectURL(imgFile);
 
                     shot.dataUrl = blobUrl;
                     delete shot.missingOnDisk;
@@ -407,7 +500,17 @@ async function rehydrateActiveScreenshots(options = {}) {
             }));
         }
 
-        console.log(`[Rehydrate] Finished (Task ID: ${taskId})`);
+        // After a full pass, sweep again if anything is still missing (e.g. shots
+        // skipped because they were in-flight when this task filtered).
+        const stillNeeds = state.screenshots.some(s =>
+            !s.dataUrl && !s.loadFailed && s.filename && !currentlyRehydrating.has(s.id)
+        );
+        if (stillNeeds && taskId === currentRehydrationTaskId) {
+            console.log(`[Rehydrate] Finished (Task ID: ${taskId}) - Scheduling follow-up sweep`);
+            scheduleRehydrationSweep(options);
+        } else {
+            console.log(`[Rehydrate] Finished (Task ID: ${taskId})`);
+        }
     } catch (err) {
         console.error(`[Rehydrate] Error (Task ID: ${taskId}):`, err);
     }
@@ -660,12 +763,10 @@ function isYouTubeWatchUrl(url) {
 function shouldTrackSenderTab(tab) {
     if (!tab || !Number.isInteger(tab.id)) return false;
 
-    if (isDetachedPanel && Number.isInteger(launchedForTabId) && tab.id === launchedForTabId) {
+    // Once bound (side panel query/session or detached URL), never track foreign tabs.
+    if (Number.isInteger(boundTabId)) {
+        if (tab.id !== boundTabId) return false;
         return !tab.url || isYouTubeWatchUrl(tab.url);
-    }
-
-    if (isDetachedPanel && Number.isInteger(launchedForTabId) && tab.id !== launchedForTabId) {
-        return false;
     }
 
     if (
@@ -678,6 +779,15 @@ function shouldTrackSenderTab(tab) {
     }
 
     return isYouTubeWatchUrl(tab.url);
+}
+
+function isSenderOurBoundTab(sender) {
+    const srcTabId = sender?.tab?.id;
+    if (!Number.isInteger(srcTabId)) return false;
+    const bound = getBoundTabId();
+    if (Number.isInteger(bound)) return srcTabId === bound;
+    if (Number.isInteger(currentTabId)) return srcTabId === currentTabId;
+    return shouldTrackSenderTab(sender.tab);
 }
 
 async function getValidatedWatchTab(tabId) {
@@ -710,7 +820,7 @@ function pickBestYouTubeWatchTab(candidates) {
 
     const scored = list.map((tab) => {
         let score = 0;
-        if (Number.isInteger(launchedForTabId) && tab.id === launchedForTabId) score += 300;
+        if (Number.isInteger(boundTabId) && tab.id === boundTabId) score += 300;
         if (Number.isInteger(launchedForHostWindowId) && tab.windowId === launchedForHostWindowId) score += 150;
         if (Number.isInteger(currentTabId) && tab.id === currentTabId) score += 80;
         if (currentVideoId && extractVideoIdFromWatchUrl(tab.url) === currentVideoId) score += 120;
@@ -741,6 +851,22 @@ function initMessageListeners() {
         }
 
         if (message.type === 'CONTENT_READY') {
+            // Ignore relays from other tabs/windows. Bound panels only act on their tab.
+            const srcTabId = Number.isInteger(message.tabId) ? message.tabId : null;
+            const bound = getBoundTabId();
+            if (Number.isInteger(bound) && srcTabId !== null && srcTabId !== bound) {
+                return;
+            }
+            if (Number.isInteger(bound) && srcTabId === null) {
+                // No tab stamp (legacy): allow same-video refresh only; never hijack video switch.
+                if (message.videoId && currentVideoId && message.videoId !== currentVideoId) {
+                    return;
+                }
+            }
+            if (!Number.isInteger(bound) && srcTabId !== null && Number.isInteger(currentTabId) && srcTabId !== currentTabId) {
+                return;
+            }
+
             console.log("Sidepanel: Content Script signaled READY for", message.videoId);
             // If it's a NEW video, trigger a video switch immediately
             if (message.videoId && currentVideoId !== message.videoId) {
@@ -748,12 +874,17 @@ function initMessageListeners() {
                 currentVideoId = message.videoId;
                 currentVideoTitle = null;
                 isDataLoadedForId = null;
+                loadInFlightForId = null;
+                titleUsedForLoad = null;
                 clearVideoStateUI();
             }
             // Always check metadata for the current video
             checkMetadataImmediate();
+            // Late-injected content has no memory of the notebook toggle — push current state.
+            syncNotebookStateToContent(isNotebookEnabled);
         } else if (message.action === 'shortcutPressed') {
-            // console.log("Sidepanel: Shortcut detected:", message.key);
+            // Only the panel bound to the source tab may run shortcuts.
+            if (!isSenderOurBoundTab(sender)) return;
             if (message.key === 's') {
                 handleCapture();
             } else if (message.key === 'z') {
@@ -768,6 +899,16 @@ function initMessageListeners() {
                 handleAddWatchLaterRequest(message.metadata);
             }
         } else if (message.type === 'NOTE_SYNCED') {
+            // Scope to this panel's video; other windows editing other videos must not apply.
+            if (message.videoId && currentVideoId && message.videoId !== currentVideoId) {
+                return;
+            }
+            // Same video in two windows: only the panel bound to the originating tab applies.
+            const noteSrcTab = Number.isInteger(message.tabId) ? message.tabId : null;
+            if (noteSrcTab !== null) {
+                const noteBound = getBoundTabId() ?? (Number.isInteger(currentTabId) ? currentTabId : null);
+                if (noteBound !== null && noteSrcTab !== noteBound) return;
+            }
             const { shotId, html } = message;
             const card = document.getElementById(shotId);
             if (card) {
@@ -784,21 +925,41 @@ function initMessageListeners() {
             // Update the data in state array too
             const shot = state.screenshots.find(s => s.id === shotId);
             if (shot) shot.noteHtml = html;
-        } else if (message.type === 'PLAYBACK_RATE_CHANGED' && autoScreenshotActive && autoScreenshotMode === 'frame') {
-            // Reset frame hash when playback speed changes to avoid false captures
+        } else if (message.type === 'PLAYBACK_RATE_CHANGED') {
+            // Only the bound tab's player events may reset this panel's auto-shot state.
+            if (!autoScreenshotActive || autoScreenshotMode !== 'frame' || !isSenderOurBoundTab(sender)) return;
             console.log(`[AutoShot] Playback rate changed to ${message.playbackRate}x, resetting frame hash`);
             lastAutoFrameHash = null;
             cachedPlaybackRate = message.playbackRate; // Update cache immediately
             lastPlaybackRateFetch = Date.now();
-        } else if (message.type === 'VIDEO_SEEKED' && autoScreenshotActive && autoScreenshotMode === 'frame') {
-            // Reset frame hash when user seeks to avoid comparing frames from different video positions
+        } else if (message.type === 'VIDEO_SEEKED') {
+            if (!autoScreenshotActive || autoScreenshotMode !== 'frame' || !isSenderOurBoundTab(sender)) return;
             console.log(`[AutoShot] Video seeked to ${formatTime(message.currentTimeMs)}, resetting frame hash`);
             lastAutoFrameHash = null;
         } else if (message.action === 'screenshotEdited') {
+            if (message.videoId && currentVideoId && message.videoId !== currentVideoId) {
+                return;
+            }
+            const shotSrcTab = Number.isInteger(message.tabId) ? message.tabId : null;
+            if (shotSrcTab !== null) {
+                const shotBound = getBoundTabId() ?? (Number.isInteger(currentTabId) ? currentTabId : null);
+                if (shotBound !== null && shotSrcTab !== shotBound) return;
+            }
             console.log("Sidepanel: Screenshot edited result received for", message.shotId);
             handleScreenshotEditedResult(message.shotId, message.dataUrl);
             if (sendResponse) sendResponse({ success: true });
         } else if (message.action === 'requestEditState') {
+            // Wrong video: do not respond — let the correct panel answer.
+            if (message.videoId && currentVideoId && message.videoId !== currentVideoId) {
+                return false;
+            }
+            const editSrcTab = Number.isInteger(message.tabId) ? message.tabId : null;
+            if (editSrcTab !== null) {
+                const editBound = getBoundTabId() ?? (Number.isInteger(currentTabId) ? currentTabId : null);
+                if (editBound !== null && editSrcTab !== editBound) {
+                    return false;
+                }
+            }
             (async () => {
                 const shot = state.screenshots.find(s => s.id === message.shotId);
                 if (!shot || !shot.dataUrl) {
@@ -836,11 +997,11 @@ async function handleScreenshotEditedResult(shotId, newDataUrl) {
     // 3. Overwrite file on disk
     if (currentVideoId && shot.filename) {
         try {
-            const folderHandle = await FileSystemModule.getVideoFolderHandle(
-                state.metadata.videoTitle || "Untitled",
-                true,
-                currentVideoId
-            );
+            const titleForFolder = state.metadata.videoTitle || currentVideoTitle || "Untitled";
+            let folderHandle = await resolveVideoFolderHandleForVideoId(currentVideoId, titleForFolder);
+            if (!folderHandle) {
+                folderHandle = await FileSystemModule.getVideoFolderHandle(titleForFolder, true, currentVideoId);
+            }
             if (folderHandle) {
                 const blob = await (await fetch(newDataUrl)).blob();
                 const saved = await FileSystemModule.saveFile(shot.filename, blob, folderHandle);
@@ -892,7 +1053,8 @@ function handleMetadataResponse(response) {
     }
 
     // CRITICAL: Only trigger LOAD if it's a new video and NOT the placeholder "YouTube / YouTube Video"
-    if (isDataLoadedForId !== response.videoId && !isGeneric) {
+    // loadInFlightForId prevents duplicate concurrent loads while a retry is still running.
+    if (isDataLoadedForId !== response.videoId && !isGeneric && loadInFlightForId !== response.videoId) {
         debugLog("Sidepanel: Real metadata detected, loading state for", response.videoId, "Title:", response.title);
 
         cachedTranscriptSegments = null; // Clear cached transcript on video change
@@ -909,21 +1071,46 @@ function handleMetadataResponse(response) {
         state.metadata.videoUrl = response.url;
         state.metadata.channel = response.channel;
 
-        isDataLoadedForId = response.videoId;
+        // NOTE: isDataLoadedForId is intentionally NOT set here. It is latched only
+        // after loadVideoState reports success/empty so a failed load can retry
+        // on the next poll instead of being stuck until a panel refresh.
         titleUsedForLoad = response.title;
         lastScreenshotHash = null; // Reset duplicate detection for new video
-        loadVideoState(response.videoId, response.title);
+        const loadVideoId = response.videoId;
+        loadInFlightForId = loadVideoId;
+        loadVideoState(loadVideoId, response.title)
+            .then((loadStatus) => {
+                if (loadInFlightForId === loadVideoId) loadInFlightForId = null;
+                if ((loadStatus === 'loaded' || loadStatus === 'empty') && currentVideoId === loadVideoId) {
+                    isDataLoadedForId = loadVideoId;
+                }
+            })
+            .catch((err) => {
+                if (loadInFlightForId === loadVideoId) loadInFlightForId = null;
+                console.warn("Sidepanel: loadVideoState failed, will retry via poll:", err);
+            });
     } else if (isDataLoadedForId === response.videoId && !isGeneric && titleUsedForLoad && titleUsedForLoad !== response.title) {
         // Title changed after initial load (e.g., stale SPA title -> real title)
         // Re-load with the correct title to get the right folder
         debugLog("Sidepanel: Title changed after load, re-loading:", titleUsedForLoad, "->", response.title);
+        if (loadInFlightForId === response.videoId) return;
         currentVideoTitle = response.title;
         state.metadata.videoTitle = response.title;
         titleUsedForLoad = response.title;
         lastScreenshotHash = null; // Reset duplicate detection
         clearVideoStateUI();
-        isDataLoadedForId = response.videoId; // Keep it set
-        loadVideoState(response.videoId, response.title);
+        const reloadVideoId = response.videoId;
+        loadInFlightForId = reloadVideoId;
+        loadVideoState(reloadVideoId, response.title)
+            .then((loadStatus) => {
+                if (loadInFlightForId === reloadVideoId) loadInFlightForId = null;
+                if ((loadStatus === 'loaded' || loadStatus === 'empty') && currentVideoId === reloadVideoId) {
+                    isDataLoadedForId = reloadVideoId;
+                }
+            })
+            .catch(() => {
+                if (loadInFlightForId === reloadVideoId) loadInFlightForId = null;
+            });
     }
 }
 
@@ -1107,12 +1294,41 @@ function showAlert(message) {
 
 
 async function resolveActiveYouTubeTabId() {
-    if (Number.isInteger(launchedForTabId)) {
-        const lockedTab = await getValidatedWatchTab(launchedForTabId);
+    if (Number.isInteger(boundTabId)) {
+        const lockedTab = await getValidatedWatchTab(boundTabId);
         if (lockedTab) {
             currentTabId = lockedTab.id;
             return currentTabId;
         }
+
+        // Bound tab is closed or not on /watch: never rebind to a foreign window's tab.
+        if (isDetachedPanel && Number.isInteger(launchedForHostWindowId)) {
+            try {
+                const [tabInHostWindow] = await chrome.tabs.query({ active: true, windowId: launchedForHostWindowId });
+                if (tabInHostWindow && isYouTubeWatchUrl(tabInHostWindow.url)) {
+                    currentTabId = tabInHostWindow.id;
+                    return currentTabId;
+                }
+            } catch (e) {
+                console.debug('[Panel] Failed to query active tab in host window:', e);
+            }
+
+            try {
+                const hostTabs = await chrome.tabs.query({
+                    windowId: launchedForHostWindowId,
+                    url: ['*://*.youtube.com/watch*', '*://youtube.com/watch*']
+                });
+                const fallback = hostTabs.find(tab => isYouTubeWatchUrl(tab?.url));
+                if (fallback) {
+                    currentTabId = fallback.id;
+                    return currentTabId;
+                }
+            } catch (e) {
+                console.debug('[Panel] Failed to query host tabs:', e);
+            }
+        }
+
+        return null;
     }
 
     if (Number.isInteger(currentTabId)) {
@@ -1153,6 +1369,7 @@ async function resolveActiveYouTubeTabId() {
         return null;
     }
 
+    // Unbound side-panel fallback (legacy path only): last focused, then scored global pick.
     try {
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         if (tab && isYouTubeWatchUrl(tab.url)) {
@@ -1218,9 +1435,9 @@ async function resolveTrackedYouTubeTab() {
 async function sendPanelHeartbeat() {
     if (await closeDetachedPanelIfHostMissing()) return;
 
-    const tabId = await resolveActiveYouTubeTabId();
+    const tabId = await resolveActiveYouTubeTabId() ?? getBoundTabId();
     if (!Number.isInteger(tabId)) return;
-    chrome.runtime.sendMessage({ action: 'panelHeartbeat', tabId }, () => {
+    chrome.runtime.sendMessage({ action: 'panelHeartbeat', tabId, panelInstanceId }, () => {
         if (chrome.runtime.lastError) {
             // Ignore background reload races.
         }
@@ -1228,9 +1445,9 @@ async function sendPanelHeartbeat() {
 }
 
 async function sendPanelClosed() {
-    const tabId = await resolveActiveYouTubeTabId();
+    const tabId = await resolveActiveYouTubeTabId() ?? getBoundTabId();
     if (!Number.isInteger(tabId)) return;
-    chrome.runtime.sendMessage({ action: 'panelClosed', tabId }, () => {
+    chrome.runtime.sendMessage({ action: 'panelClosed', tabId, panelInstanceId }, () => {
         if (chrome.runtime.lastError) {
             // Ignore background reload races.
         }
@@ -1923,17 +2140,15 @@ async function handleDurationCalculator() {
 function syncNotebookStateToContent(isOn) {
     const enabled = !!isOn;
 
-    try {
-        chrome.storage.local.set({ ynNotebookEnabled: enabled });
-    } catch (err) {
-        console.warn("Failed to sync notebook state to extension storage:", err);
-    }
-
+    // Scope to the bound tab only — never write a global ynNotebookEnabled key
+    // (that reflected the toggle into every YouTube window/tab).
     resolveActiveYouTubeTabId().then((tabId) => {
         if (!Number.isInteger(tabId)) return;
-        chrome.tabs.sendMessage(tabId, { action: 'setNotebookEnabled', enabled }, () => {
+        // Prefer the exact tab that signaled CONTENT_READY when available.
+        const targetTabId = Number.isInteger(boundTabId) ? boundTabId : tabId;
+        chrome.tabs.sendMessage(targetTabId, { action: 'setNotebookEnabled', enabled }, () => {
             if (chrome.runtime.lastError) {
-                // Content script may not be injected yet; storage sync covers late injection.
+                // Content script may not be injected yet; panel re-syncs on CONTENT_READY / next toggle.
             }
         });
     });
@@ -1985,6 +2200,8 @@ async function pollCurrentVideo() {
                     currentVideoId = urlVideoId;
                     currentVideoTitle = null;
                     isDataLoadedForId = null;
+                    loadInFlightForId = null;
+                    titleUsedForLoad = null;
                     clearVideoStateUI();
                 }
             } catch (urlErr) {
@@ -1994,8 +2211,10 @@ async function pollCurrentVideo() {
                 }
             }
 
-            // Fetch metadata with retry (only if title is missing)
-            if (!currentVideoTitle) {
+            // Fetch metadata when title is missing OR the last load did not latch
+            // (failed/empty-with-stale-title). This is the self-healing retry path
+            // that used to be blocked forever by a truthy stale title.
+            if (!currentVideoTitle || (isDataLoadedForId !== currentVideoId && loadInFlightForId !== currentVideoId)) {
                 const metaResponse = await sendMessageWithRetry(currentTabId, { action: 'getMetadata' }, 3, 200);
                 if (metaResponse) {
                     handleMetadataResponse(metaResponse);
@@ -3297,7 +3516,7 @@ async function openScreenshotEditor(shotId) {
     const top = (window.screen.availHeight - height) / 2;
 
     chrome.windows.create({
-        url: chrome.runtime.getURL(`sidepanel/editor.html?shotId=${shotId}&videoId=${currentVideoId}`),
+        url: chrome.runtime.getURL(`sidepanel/editor.html?shotId=${shotId}&videoId=${currentVideoId}&tabId=${getBoundTabId() ?? currentTabId ?? ''}`),
         type: 'popup',
         width: width,
         height: height,
@@ -3607,7 +3826,7 @@ async function promptTOCLevel(defaultLevel = 'H2') {
 function openBigNoteEditor(shotId, inlineEditor) {
     chrome.runtime.sendMessage({
         action: 'openBigEditor',
-        tabId: currentTabId,
+        tabId: getBoundTabId() ?? currentTabId,
         shotId: shotId,
         videoId: currentVideoId,
         videoTitle: currentVideoTitle,
@@ -3978,6 +4197,69 @@ async function removeHistoryIndexEntry(folderName, videoId = null) {
     if (!saved) {
         console.warn("removeHistoryIndexEntry: Failed to update index after removal.");
     }
+}
+
+// True only when the folder's state file explicitly belongs to this videoId.
+async function folderStateMatchesVideoId(folderHandle, videoId) {
+    try {
+        const fh = await folderHandle.getFileHandle(VIDEO_STATE_FILENAME);
+        const file = await fh.getFile();
+        const text = await file.text();
+        if (!text.trim()) return false;
+        const parsed = JSON.parse(text);
+        return parsed?.metadata?.videoId === videoId;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Resolve a video's folder PRIMARILY by videoId (not the SPA-derived title).
+ * Stale YouTube titles during navigation otherwise key the lookup to the wrong
+ * folder (or no folder), which used to fail silently until a panel refresh.
+ * Order: history index -> title-based strategies (ownership-checked) -> full scan.
+ * Returns null when no folder for this videoId exists (does not create).
+ */
+async function resolveVideoFolderHandleForVideoId(videoId, preferredTitle = null) {
+    if (!FileSystemModule.dirHandle || !videoId) return null;
+
+    // Strategy A: history index already maps videoId -> folderName (fast path)
+    try {
+        const entries = await readHistoryIndexEntries();
+        const entry = entries.find(e => e.videoId === videoId && e.folderName);
+        if (entry?.folderName) {
+            try {
+                const handle = await FileSystemModule.dirHandle.getDirectoryHandle(entry.folderName, { create: false });
+                if (await folderStateMatchesVideoId(handle, videoId)) {
+                    return handle;
+                }
+                // Index may point at a renamed/legacy folder - fall through to scan
+            } catch (_) { /* missing folder - fall through */ }
+        }
+    } catch (_) { /* unreadable index - fall through */ }
+
+    // Strategy B: title-based lookup (correct once the real title has settled)
+    if (preferredTitle) {
+        try {
+            const handle = await FileSystemModule.getVideoFolderHandle(preferredTitle, false, videoId);
+            if (handle && await folderStateMatchesVideoId(handle, videoId)) {
+                return handle;
+            }
+        } catch (_) { /* fall through */ }
+    }
+
+    // Strategy C: scan subfolders for a state file whose metadata.videoId matches
+    try {
+        const folders = await FileSystemModule.listSubFolders();
+        for (const folder of folders) {
+            if (await folderStateMatchesVideoId(folder, videoId)) {
+                return folder;
+            }
+        }
+    } catch (_) { /* scan failed */ }
+
+    if (FileSystemModule.permissionNeedsUserGesture) return null;
+    return null;
 }
 
 async function scanFoldersForHistoryEntries() {
@@ -6981,7 +7263,12 @@ async function saveVideoStateExecution(forVideoId = null, forTitle = null) {
 
     try {
         const videoTitle = forTitle || currentVideoTitle || state.metadata?.videoTitle || "Unknown Video";
-        const subFolder = await FileSystemModule.getVideoFolderHandle(videoTitle, true, targetVideoId);
+        // Prefer an existing folder resolved by videoId so a stale SPA title cannot
+        // create a brand-new wrong-titled folder for this video's notes.
+        let subFolder = await resolveVideoFolderHandleForVideoId(targetVideoId, videoTitle);
+        if (!subFolder) {
+            subFolder = await FileSystemModule.getVideoFolderHandle(videoTitle, true, targetVideoId);
+        }
         if (!subFolder) {
             showFolderPermissionBannerIfNeeded();
             return;
@@ -7035,9 +7322,10 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
         console.log("[Duplicate] Hash reset: loadVideoState started (non-lazy)");
     }
 
-    // console.log("[STABILITY] loadVideoState starting for:", forVideoId, "isPreview:", isPreview, "isLazy:", isLazy);
+    // Returns: 'loaded' | 'empty' | 'blocked' | 'stale' | 'error'
+    // Callers latch isDataLoadedForId only on 'loaded'/'empty' so failures retry.
     try {
-        if (!FileSystemModule.dirHandle || !forVideoId || !forTitle) return;
+        if (!FileSystemModule.dirHandle || !forVideoId || !forTitle) return 'blocked';
 
         // Save current scroll position BEFORE clearing UI (for returning to this video later)
         const scrollContainer = document.getElementById('tab-screenshots');
@@ -7046,36 +7334,41 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
         }
 
         // Ensure we are still on the same video that we started loading for
-        if (forVideoId !== currentVideoId) return;
+        if (forVideoId !== currentVideoId) return 'stale';
 
         // Check if we actually have permission before trying to read (it won't prompt without a gesture)
         const options = { mode: 'readwrite' };
         if ((await FileSystemModule.dirHandle.queryPermission(options)) !== 'granted') {
             FileSystemModule.permissionNeedsUserGesture = true;
             if (!isPreview) showFolderPermissionBannerIfNeeded();
-            return;
+            return 'blocked';
         }
 
         // Final sanity check before the slow FS operations
-        if (forVideoId !== currentVideoId) return;
+        if (forVideoId !== currentVideoId) return 'stale';
 
-        // CRITICAL: Use the specifically verified Title "forTitle" instead of reading from DOM
-        // Passing forVideoId allows ID-level verification to prevent mismatches
-        const subFolder = await FileSystemModule.getVideoFolderHandle(forTitle, false, forVideoId);
+        // Resolve folder BY VIDEOID first (history index / ownership scan) so a stale
+        // SPA title cannot point the lookup at the wrong video's folder.
+        const subFolder = await resolveVideoFolderHandleForVideoId(forVideoId, forTitle);
         if (!subFolder) {
-            return;
+            // Definitive "no notes yet" vs permission failure (must not latch the latter)
+            return FileSystemModule.permissionNeedsUserGesture ? 'blocked' : 'empty';
         }
 
         // FOLDER EXISTS -> This video has internal data, so it IS a notebook
         if (!isPreview) setNotebookToggleState(true);
 
         // Final sanity check
-        if (forVideoId !== currentVideoId) return;
+        if (forVideoId !== currentVideoId) return 'stale';
 
         const fileHandle = await subFolder.getFileHandle(VIDEO_STATE_FILENAME);
         const file = await fileHandle.getFile();
         const text = await file.text();
         const loadedState = JSON.parse(text);
+
+        // Re-check AFTER the awaits above: a video switch may have cleared/changed
+        // the UI while we were reading; never repopulate stale data (Fix #4).
+        if (forVideoId !== currentVideoId) return 'stale';
 
         // Restore interval setting
         if (loadedState && loadedState.metadata && loadedState.metadata.selectedInterval) {
@@ -7093,12 +7386,14 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
             }
         }
 
+        if (forVideoId !== currentVideoId) return 'stale';
+
         // CRITICAL: Verify the loaded state belongs to the video we want.
         // If the YouTube SPA returned a stale title initially, we might have opened the
         // wrong folder. This prevents us from loading old video screenshots for a new video.
         if (loadedState && loadedState.metadata && loadedState.metadata.videoId && loadedState.metadata.videoId !== forVideoId) {
             console.warn("Sidepanel: State file videoId mismatch! Rejecting stale data.", loadedState.metadata.videoId, "!=", forVideoId);
-            return;
+            return 'empty';
         }
 
         if (loadedState && loadedState.screenshots && loadedState.screenshots.length > 0) {
@@ -7132,15 +7427,17 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
         if (!isPreview && !skipRender) {
             // Wait for rehydration to finish then render the UI
             setTimeout(() => {
+                // Abort if the user navigated to another video during the delay
+                if (forVideoId !== currentVideoId) return;
                 try {
                     renderMainGallery(() => {
                         // Restore scroll position after rendering is complete
                         const scrollEl = document.getElementById('tab-screenshots');
                         const listEl = document.getElementById('screenshots-list');
                         if (!scrollEl || !listEl) return;
-                        
+
                         const savedScroll = savedScrollPositions.get(forVideoId);
-                        
+
                         // Use a double requestAnimationFrame to ensure the browser has performed layout
                         requestAnimationFrame(() => {
                             requestAnimationFrame(() => {
@@ -7155,7 +7452,7 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
                                     } else {
                                         scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'auto' });
                                     }
-                                    
+
                                     // Final safety adjustment
                                     setTimeout(() => {
                                         const finalItem = listEl.lastElementChild;
@@ -7164,6 +7461,11 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
                                 }
                             });
                         });
+
+                        // Sweep any screenshots stranded by a cancelled rehydration task
+                        if (forVideoId === currentVideoId) {
+                            rehydrateActiveScreenshots(typeof isPreviewOrOptions === 'object' ? isPreviewOrOptions : {});
+                        }
                     });
                 } catch (e) { console.error("Sidepanel: renderMainGallery failed", e); }
 
@@ -7177,9 +7479,21 @@ async function loadVideoState(forVideoId, forTitle, isPreviewOrOptions = false) 
             }, isLazy ? 50 : 200); // Small delay to let rehydration blobs propagate
         }
 
+        return 'loaded';
     } catch (err) {
+        // Folder resolved but state file missing/invalid -> treat as definitive empty
+        if (isMissingFileSystemEntryError(err)) {
+            console.log("No previous state found to load. Fresh slate.");
+            return 'empty';
+        }
+        if (isPermissionDeniedFileSystemError(err)) {
+            FileSystemModule.permissionNeedsUserGesture = true;
+            if (!isPreview) showFolderPermissionBannerIfNeeded();
+            return 'blocked';
+        }
         console.log("No previous state found to load or error reading file. Fresh slate.");
         console.error("Failed to load video state", err); // Added error logging for clarity
+        return 'error';
     }
 }
 
@@ -7196,12 +7510,6 @@ function setNotebookToggleState(isOn) {
             text.textContent = 'Off';
             text.classList.remove('active');
         }
-    }
-
-    try {
-        localStorage.setItem('ynNotebookEnabled', isNotebookEnabled.toString());
-    } catch (err) {
-        console.warn("localStorage failed:", err);
     }
 
     syncNotebookStateToContent(isOn);
@@ -8472,9 +8780,18 @@ function renderCountdowns() {
                     cdItem.isTransparent = checked;
                     const saved = await saveCountdowns();
                     if (saved) {
-                        // If this is the active mini view, refresh it
+                        // If this is the active mini view, refresh it (keep tab scope)
                         if (state.activeMiniViewId === c.id) {
-                            chrome.storage.local.set({ activeCountdownMiniView: cdItem });
+                            const refreshTabId = await resolveActiveYouTubeTabId();
+                            const scopedTabId = Number.isInteger(refreshTabId) ? refreshTabId : getBoundTabId();
+                            if (Number.isInteger(scopedTabId)) {
+                                chrome.storage.local.set({
+                                    [`activeCountdownMiniView:${scopedTabId}`]: {
+                                        ...cdItem,
+                                        tabId: scopedTabId
+                                    }
+                                });
+                            }
                         }
                     } else {
                         cdItem.isTransparent = originalVal;
@@ -8502,7 +8819,7 @@ function renderCountdowns() {
 // Mini View Overlay Logic
 // ---------------------------------------------------------
 
-function toggleMiniView(id, forceRestore = false) {
+async function toggleMiniView(id, forceRestore = false) {
     // If clicking same active ID, close it
     if (state.activeMiniViewId === id && !forceRestore) {
         closeMiniView();
@@ -8517,19 +8834,44 @@ function toggleMiniView(id, forceRestore = false) {
 
     state.activeMiniViewId = id;
 
-    // Save to chrome.storage.local so the content script can display the overlay on the YouTube page
-    chrome.storage.local.set({ activeCountdownMiniView: cd });
+    // Scope overlay to this panel's bound YouTube tab only (per-tab storage key).
+    const targetTabId = await resolveActiveYouTubeTabId();
+    const scopedTabId = Number.isInteger(targetTabId) ? targetTabId : getBoundTabId();
+    if (!Number.isInteger(scopedTabId)) return;
+    chrome.storage.local.set({
+        [`activeCountdownMiniView:${scopedTabId}`]: {
+            ...cd,
+            tabId: scopedTabId
+        }
+    });
 }
 
 function closeMiniView() {
     state.activeMiniViewId = null;
-    chrome.storage.local.remove(['activeCountdownMiniView', 'activeCountdownMiniViewPos']);
+    const ourTab = getBoundTabId() ?? (Number.isInteger(currentTabId) ? currentTabId : null);
+    const keys = ['activeCountdownMiniView', 'activeCountdownMiniViewPos'];
+    if (Number.isInteger(ourTab)) {
+        keys.push(`activeCountdownMiniView:${ourTab}`, `activeCountdownMiniViewPos:${ourTab}`);
+    }
+    chrome.storage.local.remove(keys);
 }
 
-// Listen for the content-script closing the mini view
+// Listen for the content-script closing the mini view (own tab key only)
 chrome.storage.onChanged.addListener((changes, namespace) => {
-    if (namespace === 'local' && changes.activeCountdownMiniView) {
-        if (!changes.activeCountdownMiniView.newValue) {
+    if (namespace !== 'local') return;
+    const ourTab = getBoundTabId() ?? (Number.isInteger(currentTabId) ? currentTabId : null);
+    if (Number.isInteger(ourTab)) {
+        const ownKey = `activeCountdownMiniView:${ourTab}`;
+        if (changes[ownKey] && !changes[ownKey].newValue) {
+            state.activeMiniViewId = null;
+            return;
+        }
+    }
+    // Legacy single-key path: only clear when the closed overlay was ours (or unscoped).
+    if (changes.activeCountdownMiniView && !changes.activeCountdownMiniView.newValue) {
+        const prev = changes.activeCountdownMiniView.oldValue;
+        const prevTab = Number.isInteger(prev?.tabId) ? prev.tabId : null;
+        if (prevTab === null || ourTab === null || prevTab === ourTab) {
             state.activeMiniViewId = null;
         }
     }

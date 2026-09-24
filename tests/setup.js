@@ -476,11 +476,17 @@ global.testUtils = {
   createMockDirectoryHandle: (name = 'test-dir') => ({
     name,
     kind: 'directory',
-    getFileHandle: jest.fn().mockResolvedValue(this.createMockFileHandle()),
-    getDirectoryHandle: jest.fn().mockResolvedValue(this.createMockDirectoryHandle('subdir')),
+    queryPermission: jest.fn().mockResolvedValue('granted'),
+    requestPermission: jest.fn().mockResolvedValue('granted'),
+    getFileHandle: jest.fn().mockImplementation(() =>
+      Promise.resolve(global.testUtils.createMockFileHandle())
+    ),
+    getDirectoryHandle: jest.fn().mockImplementation((subName) =>
+      Promise.resolve(global.testUtils.createMockDirectoryHandle(subName || 'subdir'))
+    ),
     removeEntry: jest.fn().mockResolvedValue(),
     values: jest.fn().mockImplementation(async function* () {
-      yield this.createMockFileHandle();
+      yield global.testUtils.createMockFileHandle();
     })
   })
 };
